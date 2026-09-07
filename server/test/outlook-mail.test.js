@@ -63,6 +63,21 @@ test('余额邮件解析：中文变体（添加了/千分位/无空格）', () 
   assert.equal(noSpace.balance, 20);
 });
 
+test('余额邮件解析：日语、韩语、西班牙语和越南语获赠积分通知', () => {
+  const cases = [
+    ['日语', 'ご友人からの招待で ChatGPT デスクトップに参加し、初めてのメッセージを送信しました。お二人それぞれのアカウントに 500 クレジットを追加しました。', 20],
+    ['韩语', '친구의 초대로 ChatGPT 데스크톱 앱에 가입하고 첫 메시지를 보냈습니다. 두 분의 계정에 각각 1000 크레딧을 추가했습니다.', 40],
+    ['西班牙语', 'Te uniste a ChatGPT Escritorio con la invitación de tu amigo y enviaste tu primer mensaje. Agregamos 500 créditos a la cuenta de cada uno.', 20],
+    ['越南语', 'Bạn đã tham gia ChatGPT Desktop qua lời mời của bạn bè và gửi tin nhắn đầu tiên. Chúng tôi đã cộng 250 credit vào mỗi tài khoản của hai bạn.', 10],
+  ];
+
+  for (const [language, body, balance] of cases) {
+    const result = extractBalanceFromMessages([message('Credits', body)]);
+    assert.equal(result.hasBalance, true, language);
+    assert.equal(result.balance, balance, language);
+  }
+});
+
 test('余额邮件解析：无关键字的中文邮件不误判', () => {
   const result = extractBalanceFromMessages([message('验证码', '您的验证码是 1000，请在 5 分钟内输入。')]);
   assert.equal(result.hasBalance, false);

@@ -286,15 +286,19 @@ function sortMessagesByTime(messages) {
   });
 }
 
-/** 余额邮件关键词。英文 "We've added X credits"、中文「已添加 X 额度」（会按账号语言本地化），balance = 数值 / 25。 */
+/** 余额邮件关键词。匹配各语言的获赠积分通知，balance = 数值 / 25。 */
 const BALANCE_KEYWORDS = [
   /we[\s']*ve\s+added\s+([\d,]+(?:\.\d+)?)\s+credits\b/i,
   /添加(?:了)?\s*([\d,]+(?:\.\d+)?)\s*(?:个)?\s*额度/i,
+  /([\d,]+(?:\.\d+)?)\s*クレジットを追加しました/,
+  /([\d,]+(?:\.\d+)?)\s*크레딧을 추가했습니다/,
+  /agregamos\s+([\d,]+(?:\.\d+)?)\s+créditos\b/i,
+  /(?:đã\s+)?cộng\s+([\d,]+(?:\.\d+)?)\s+credit\b/i,
 ];
 
 /**
  * 从邮件列表提取余额信息。
- * 匹配 "We've added X credits" / 中文「账户添加 X 额度」邮件，balance = credits / 25。
+ * 匹配多语言的获赠积分邮件，balance = credits / 25。
  * 取最近一封匹配邮件的数值。
  * @param {Array} messages
  * @returns {{balance:number,hasBalance:true}|{hasBalance:false}}
