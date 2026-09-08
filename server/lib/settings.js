@@ -57,22 +57,6 @@ export const DEFAULT_SETTINGS = {
       rate_limit_patterns: ['429', 'rate limit', 'too many requests'],
     },
   },
-  // 代理自动巡检：定时测活本机代理 → 死 IP 自动清理 → 可用数低于阈值时经服务商 API 自动提取
-  'proxies.patrol': {
-    enabled: false,
-    interval_seconds: 60,
-    // 连续 N 轮探测不活（dead / cf_challenge）自动删除本机代理，0=不自动删除
-    remove_dead_after: 2,
-    // 服务商 API 自动提取（模板链接里的 num 参数在提取时动态覆盖）
-    auto_extract: false,
-    provider_api_url: '',
-    min_alive: 3,
-    // 提取到的新 IP 双写协议：sub2api 侧与本机代理列表侧
-    extract_protocol_sub2api: 'socks5',
-    extract_protocol_local: 'socks5h',
-    // 死 IP 同步 sub2api：把绑在死代理上的账号改绑到可用/新代理，并删除死代理
-    sync_sub2api: true,
-  },
   'sms.providers': {
     active: 'custom',
     luban: {},

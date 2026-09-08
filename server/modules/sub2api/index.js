@@ -55,8 +55,6 @@ export function createSub2apiModule({ engine, logger }) {
     app.decorate('sub2apiMonitor', monitor);
 
     const replaceProxies = createProxyReplacer({ client, logger });
-    // 供 proxies 模块的合并版「一键更换 IP」入口复用（同一实现，行为一致）
-    app.decorate('sub2apiProxyReplace', replaceProxies);
 
     // 余额查询选路注入：号已上传 sub2api 时优先用其在远端绑定的代理（未上传仍走本机代理/直连）
     engine.setBalanceProxyResolver?.((accountId) => remoteSync.resolveSub2apiProxy(accountId));

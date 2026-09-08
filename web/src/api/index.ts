@@ -6,12 +6,10 @@ import type {
   Job,
   MainAccount,
   MainBalanceEstimate,
-  MergedProxyReplaceResult,
   Paged,
   Pool,
   Proxy,
   ProxyImportResult,
-  ProxyPatrolView,
   ReserveAccount,
   DiscardAccount,
   SessionInfo,
@@ -61,18 +59,6 @@ export const proxiesApi = {
   updateLabel: (id: number, label: string) => api<Proxy>(`/proxies/${id}`, { method: 'PATCH', json: { label } }),
   remove: (id: number) => api<{ ok: boolean }>(`/proxies/${id}`, { method: 'DELETE' }),
   batchRemove: (ids: number[]) => api<{ deleted: number }>('/proxies/batch-delete', { json: { ids } }),
-  // 一键更换 IP（合并入口）：sub2api 替换 + 本机导入换批
-  replaceIps: (body: {
-    text: string;
-    sub2api_protocol?: string;
-    local_protocol?: string;
-    delete_old?: boolean;
-    sync_sub2api?: boolean;
-    delete_old_local?: boolean;
-  }) => api<MergedProxyReplaceResult>('/proxies/replace', { json: body }),
-  patrol: () => api<ProxyPatrolView>('/proxies/patrol'),
-  updatePatrol: (body: Record<string, unknown>) => api<ProxyPatrolView>('/proxies/patrol', { json: body }),
-  patrolCheck: () => api<{ ok: boolean; patrol: ProxyPatrolView }>('/proxies/patrol/check', { json: {} }),
 };
 
 // ---------- accounts ----------

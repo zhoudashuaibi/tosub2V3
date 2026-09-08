@@ -95,10 +95,9 @@ await app.register(fp(createSettingsModule({ logger }), { name: 'settings' }));
 await app.register(fp(createDashboardModule(), { name: 'dashboard' }));
 await app.register(fp(createStaticModule({ config, logger }), { name: 'static' }));
 
-// 启动任务引擎调度循环 + sub2api 监控与代理巡检（若启用）
+// 启动任务引擎调度循环 + sub2api 监控（若启用）
 jobsEngine.start();
 app.sub2apiMonitor?.startIfEnabled?.();
-app.proxyPatrol?.startIfEnabled?.();
 
 // 优雅关闭：停调度 → 杀子进程 → running 任务回 queued → 停监控 → 关库
 let shuttingDown = false;
@@ -109,7 +108,6 @@ async function shutdown(signal) {
   try {
     await jobsEngine.shutdown();
     app.sub2apiMonitor?.stop?.();
-    app.proxyPatrol?.stop?.();
     await app.close();
   } catch (error) {
     logger.error({ err: error }, 'shutdown error');
