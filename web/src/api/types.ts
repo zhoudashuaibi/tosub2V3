@@ -144,6 +144,8 @@ export interface ImportResult {
   duplicates_in_main: string[];
   duplicates_in_discard: { email: string; reason: string }[];
   duplicates_remote: string[];
+  /** adopt_remote 收编进主号池的远端账号（直接关联远端，不重新登录） */
+  adopted_remote?: string[];
   invalid_lines: { line: number; reason: string }[];
   twofa_bound?: number;
   twofa_unmatched?: string[];

@@ -35,8 +35,8 @@ export function ReservePoolPage() {
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [importOpen, setImportOpen] = useState(false);
   const [importResult, setImportResult] = useState<ImportResult | null>(null);
-  const [forceDiscard, setForceDiscard] = useState(false);
-  const [forceRemote, setForceRemote] = useState(false);
+  // 「查看详情」重开导入框时还原上次导入文本，保证收编/强制重提交可用
+  const [lastImportText, setLastImportText] = useState('');
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [editAccount, setEditAccount] = useState<ReserveAccount | null>(null);
   const [joinOrder, setJoinOrder] = useOrderPreference('pools.reserveJoinOrder');
@@ -64,18 +64,23 @@ export function ReservePoolPage() {
   };
 
   const importMutation = useMutation({
-    mutationFn: (text: string) =>
-      accountsApi.import(text, { force_discard: forceDiscard, force_remote: forceRemote }),
+    // force/收编标记走 mutate 变量而非组件状态：避免 setState 后立即 mutate 读到旧值的竞态
+    mutationFn: (vars: { text: string; forceDiscard?: boolean; forceRemote?: boolean; adoptRemote?: boolean }) =>
+      accountsApi.import(vars.text, {
+        force_discard: vars.forceDiscard,
+        force_remote: vars.forceRemote,
+        adopt_remote: vars.adoptRemote,
+      }),
     onSuccess: (result) => {
       setImportResult(result);
-      if (result.created > 0) {
-        const mainCount = result.main_created ?? 0;
-        const reserveCount = result.created - mainCount;
-        const parts = [];
-        if (mainCount > 0) parts.push(`${mainCount} 个账号直入主号池（含登录 tokens）`);
-        if (reserveCount > 0) parts.push(`${reserveCount} 个账号已开始邮件初始化`);
-        toast.success(parts.join('，'));
-      }
+      const adoptedCount = result.adopted_remote?.length ?? 0;
+      const directMainCount = (result.main_created ?? 0) - adoptedCount;
+      const reserveCount = result.created - (result.main_created ?? 0);
+      const parts = [];
+      if (directMainCount > 0) parts.push(`${directMainCount} 个账号直入主号池（含登录 tokens）`);
+      if (adoptedCount > 0) parts.push(`${adoptedCount} 个远端账号已收编进主号池（不重新登录）`);
+      if (reserveCount > 0) parts.push(`${reserveCount} 个账号已开始邮件初始化`);
+      if (parts.length) toast.success(parts.join('，'));
       invalidate();
     },
     onError: (error) => toast.error(errorMessage(error)),
@@ -220,7 +225,7 @@ export function ReservePoolPage() {
           <Download />
           {selected.size > 0 ? `导出所选 (${selected.size})` : '导出账号'}
         </Button>
-        <Button size="sm" onClick={() => { setImportResult(null); setForceDiscard(false); setForceRemote(false); setImportOpen(true); }}>
+        <Button size="sm" onClick={() => { setImportResult(null); setImportOpen(true); }}>
           <Upload />
           导入账号
         </Button>
@@ -392,20 +397,33 @@ export function ReservePoolPage() {
           'notes.two_factor.enabled + secret → 两步验证',
           'credentials 里的 OAuth tokens 忽略：加入主号池走本系统登录授权',
         ].join('\n')}
+        initialText={lastImportText}
         result={importResult}
         busy={importMutation.isPending}
         onSubmit={(text) => {
-          if (importResult) {
-            // 已有结果 → 点导入 = 带 force 重提交
-            setForceDiscard(true);
-            setForceRemote(true);
-          }
-          importMutation.mutate(text);
+          setLastImportText(text);
+          // 已有结果 → 点导入 = 带 force 重提交（强制入备用池）
+          importMutation.mutate(importResult ? { text, forceDiscard: true, forceRemote: true } : { text });
         }}
+        extraAction={
+          (importResult?.duplicates_remote?.length ?? 0) > 0
+            ? {
+                label: '收编进主号池',
+                onSubmit: (text) => {
+                  setLastImportText(text);
+                  importMutation.mutate({ text, adoptRemote: true });
+                },
+              }
+            : undefined
+        }
       />
       {importResult && (importResult.duplicates_in_discard.length > 0 || importResult.duplicates_remote.length > 0) && (
         <div className="flex items-center gap-3 rounded-md border border-[var(--warning)]/40 bg-[var(--warning)]/10 p-3 text-sm">
-          <span className="flex-1">存在废弃池/远端重复账号，点击「导入」按钮将强制重新导入这些账号。</span>
+          <span className="flex-1">
+            {importResult.duplicates_remote.length > 0 &&
+              `${importResult.duplicates_remote.length} 个账号已在远端 sub2api：可在导入详情中「收编进主号池」（直接关联远端，不重新登录）。`}
+            {importResult.duplicates_in_discard.length > 0 && ' 废弃池重复账号可在详情中再次点「导入」强制重新导入。'}
+          </span>
           <Button size="sm" variant="outline" onClick={() => setImportOpen(true)}>
             查看详情
           </Button>

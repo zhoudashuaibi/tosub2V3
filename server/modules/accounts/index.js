@@ -464,6 +464,9 @@ export function createAccountsModule({ engine, logger }) {
               passwords_text: { type: 'string', maxLength: 2_000_000 },
               force_discard: { type: 'boolean' },
               force_remote: { type: 'boolean' },
+              // 远端已有账号收编进主号池：直接关联远端账号（不登录、不上传），
+              // 供多台机器共用同一 sub2api 但本地号池不同步的场景对齐主号池视图
+              adopt_remote: { type: 'boolean' },
             },
           },
         },
@@ -475,6 +478,7 @@ export function createAccountsModule({ engine, logger }) {
           passwords_text = '',
           force_discard = false,
           force_remote = false,
+          adopt_remote = false,
         } = request.body;
         if (!String(text).trim() && !String(twofa_text).trim() && !String(passwords_text).trim()) {
           throw errors.validation('导入内容不能为空');
@@ -531,19 +535,31 @@ export function createAccountsModule({ engine, logger }) {
         const duplicatesInMain = [];
         const duplicatesInDiscard = [];
         const duplicatesRemote = [];
+        const adoptedRemote = [];
         const created = [];
 
-        // 远端 sub2api 查重（已配置且可连通才检查）
-        let remoteEmails = null;
+        // 远端 sub2api 查重（已配置且可连通才检查）：email → 远端账号，
+        // adopt_remote 收编主号池时直接回填 sub2api_account_id / 镜像 status
+        let remoteByEmail = null;
         const sub2apiConfig = app.settings.get('sub2api.config');
         if (sub2apiConfig?.base_url && sub2apiConfig?.admin_key && app.sub2apiClient) {
           try {
             const accounts = await app.sub2apiClient.listAllOpenAiAccounts();
-            remoteEmails = new Set(accounts.map((a) => app.sub2apiClient.accountEmail(a)).filter(Boolean));
+            remoteByEmail = new Map();
+            for (const account of accounts) {
+              const email = app.sub2apiClient.accountEmail(account);
+              if (email && !remoteByEmail.has(email)) remoteByEmail.set(email, account);
+            }
           } catch (error) {
             logger.warn({ err: sanitizeText(String(error.message)) }, 'remote dedup check failed');
           }
         }
+        const remoteAccountFor = (email) => {
+          const account = remoteByEmail?.get(email);
+          if (!account) return null;
+          const remoteId = Number(account.id);
+          return Number.isSafeInteger(remoteId) && remoteId > 0 ? { id: remoteId, status: String(account.status || 'unknown') } : null;
+        };
 
         // 主号池条目（tosubV2 文件带 OAuth tokens）入库：新号直插 main，
         // 已有号刷新 tokens/凭据；备用池号升级进主号池（joining 中除外）
@@ -652,6 +668,45 @@ export function createAccountsModule({ engine, logger }) {
             }
             if (existing) {
               if (existing.pool === 'reserve') {
+                // 备用池号已在远端 sub2api 且选择收编：升级进主号池并直接关联远端账号，
+                // 绝不重新登录（auto_repair_blocked=1，巡检只观察不修复）；
+                // initial_balance/has_balance 保留，joining 中的号退化回刷新凭据
+                if (adopt_remote) {
+                  const remote = remoteAccountFor(entry.email);
+                  if (remote) {
+                    const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(existing.id);
+                    const now = new Date().toISOString();
+                    const cas = db
+                      .prepare(
+                        `UPDATE accounts SET pool='main', status='active', credentials_enc=?,
+                           sub2api_account_id=?, sub2api_status=?, sub2api_uploaded_at=?, sub2api_synced_at=?,
+                           auto_repair_blocked=1, repair_fail_count=0,
+                           mail_error=NULL, updated_at=?
+                         WHERE id=? AND pool='reserve' AND status != 'joining'`,
+                      )
+                      .run(
+                        crypto.encryptJson(
+                          { ...decryptCredentials(account), ...credentialsForImport(entry) },
+                          'accounts.credentials_enc',
+                        ),
+                        remote.id,
+                        remote.status,
+                        now,
+                        now,
+                        now,
+                        existing.id,
+                      );
+                    if (cas.changes > 0) {
+                      pools.recordEvent(existing.id, 'imported', { source: 'adopt_remote', from: 'reserve', to: 'main' });
+                      pools.recordEvent(existing.id, 'sub2api_linked', { remote_id: remote.id, source: 'import_adopt' });
+                      created.push({ id: existing.id, email: entry.email, status: 'active', pool: 'main' });
+                      adoptedRemote.push(entry.email);
+                      if (entry.pickupCode) twofaByEmail.delete(entry.email);
+                      if (entry.chatgptPassword) passwordByEmail.delete(entry.email);
+                      continue;
+                    }
+                  }
+                }
                 duplicatesInReserve.push(entry.email);
                 // 更新凭据（同 v1 语义：重复导入即刷新凭据）
                 const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(existing.id);
@@ -706,7 +761,43 @@ export function createAccountsModule({ engine, logger }) {
                 continue;
               }
             }
-            if (remoteEmails?.has(entry.email) && !force_remote) {
+            const remote = remoteAccountFor(entry.email);
+            if (remote && adopt_remote && !force_remote) {
+              // 本地无记录但远端已有：收编进主号池并关联远端账号，绝不重新登录——
+              // auto_repair_blocked=1 让巡检对收编号只观察不修复（远端正常时本就无动作），
+              // 需要重授权时由用户手动发起；无本地 tokens，余额刷新/上传管线本就跳过
+              const now = new Date().toISOString();
+              const result = db
+                .prepare(
+                  `INSERT INTO accounts(email, pool, status, note, credentials_enc,
+                     sub2api_account_id, sub2api_status, sub2api_uploaded_at, sub2api_synced_at,
+                     auto_repair_blocked, created_at, updated_at)
+                   VALUES(?, 'main', 'active', ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                   ON CONFLICT(email) DO NOTHING`,
+                )
+                .run(
+                  entry.email,
+                  entry.note || null,
+                  crypto.encryptJson(credentialsForImport(entry), 'accounts.credentials_enc'),
+                  remote.id,
+                  remote.status,
+                  now,
+                  now,
+                  now,
+                  now,
+                );
+              if (result.changes === 0) continue;
+              const id = Number(result.lastInsertRowid);
+              pools.recordEvent(id, 'imported', { source: 'adopt_remote', pool: 'main', no_relogin: true });
+              pools.recordEvent(id, 'sub2api_linked', { remote_id: remote.id, source: 'import_adopt' });
+              created.push({ id, email: entry.email, status: 'active', pool: 'main' });
+              adoptedRemote.push(entry.email);
+              if (entry.pickupCode) twofaByEmail.delete(entry.email);
+              if (entry.chatgptPassword) passwordByEmail.delete(entry.email);
+              continue;
+            }
+            if (remoteByEmail?.has(entry.email) && !force_remote) {
+              // 远端已有：未选择收编（或远端 id 异常无法安全关联）时仅提示重复
               duplicatesRemote.push(entry.email);
               continue;
             }
@@ -771,6 +862,7 @@ export function createAccountsModule({ engine, logger }) {
           duplicates_in_main: duplicatesInMain,
           duplicates_in_discard: duplicatesInDiscard,
           duplicates_remote: duplicatesRemote,
+          adopted_remote: adoptedRemote,
           invalid_lines: invalidLines,
           twofa_bound: twofaTotal - twofaUnmatched.length,
           twofa_unmatched: twofaUnmatched,
