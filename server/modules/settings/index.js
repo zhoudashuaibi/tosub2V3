@@ -6,13 +6,12 @@ export function createSettingsModule({ logger }) {
     const db = app.db;
 
     function view() {
-      const outlook = app.settings.get('outlook.fetch');
       const twofa = app.settings.get('twofa.fetch') || {};
       const engineConfig = app.settings.get('engine.config');
       const sms = app.settings.get('sms.providers') || {};
       const sub2api = app.settings.get('sub2api.config') || {};
       return {
-        outlook_fetch_endpoint: outlook.endpoint,
+        outlook_fetch_mode: 'microsoft_direct',
         twofa_fetch_template: twofa.template || 'https://2fa.show/2fa/{code}',
         max_concurrent_jobs: engineConfig.max_concurrent_jobs,
         job_timeout_minutes: engineConfig.job_timeout_minutes,
@@ -46,19 +45,7 @@ export function createSettingsModule({ logger }) {
     app.put('/api/v1/settings', async (request) => {
       const body = request.body || {};
       if (body.outlook_fetch_endpoint !== undefined) {
-        const endpoint = String(body.outlook_fetch_endpoint || '').trim();
-        if (endpoint) {
-          try {
-            const parsed = new URL(endpoint);
-            if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('bad');
-          } catch {
-            throw Object.assign(new Error('取件端点必须是有效的 HTTP/HTTPS 地址'), {
-              status: 422,
-              code: 'VALIDATION',
-            });
-          }
-        }
-        app.settings.set('outlook.fetch', { endpoint: endpoint || 'https://8t92.cc/api/fetch-mails' });
+        throw errors.validation('Outlook 已改为微软官方直连，不再支持自定义取件地址');
       }
       if (body.twofa_fetch_template !== undefined) {
         const template = String(body.twofa_fetch_template || '').trim();

@@ -6,7 +6,6 @@
 const SECRET_KEYS = new Set(['console.password', 'sub2api.config', 'sms.providers']);
 
 export const DEFAULT_SETTINGS = {
-  'outlook.fetch': { endpoint: 'https://8t92.cc/api/fetch-mails' },
   // 2FA 在线取件（2fa.show 风格）：{code} 占位符替换为账号取件码
   'twofa.fetch': { template: 'https://2fa.show/2fa/{code}' },
   'engine.config': {

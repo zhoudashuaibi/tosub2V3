@@ -49,7 +49,6 @@ export function SettingsPage() {
   });
 
   // 邮箱取件 / 引擎
-  const [endpoint, setEndpoint] = useState('');
   const [twofaTemplate, setTwofaTemplate] = useState('');
   const [maxJobs, setMaxJobs] = useState('');
   const [timeoutMin, setTimeoutMin] = useState('');
@@ -57,7 +56,6 @@ export function SettingsPage() {
   const [strictProxy, setStrictProxy] = useState(true);
   useEffect(() => {
     if (settings) {
-      setEndpoint(settings.outlook_fetch_endpoint);
       setTwofaTemplate(settings.twofa_fetch_template);
       setMaxJobs(String(settings.max_concurrent_jobs));
       setTimeoutMin(String(settings.job_timeout_minutes));
@@ -69,7 +67,6 @@ export function SettingsPage() {
   const saveSettings = useMutation({
     mutationFn: () =>
       settingsApi.update({
-        outlook_fetch_endpoint: endpoint,
         twofa_fetch_template: twofaTemplate,
         max_concurrent_jobs: Number(maxJobs),
         job_timeout_minutes: Number(timeoutMin),
@@ -178,8 +175,8 @@ export function SettingsPage() {
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="space-y-1.5">
-            <Label>Outlook 取件中转地址</Label>
-            <Input value={endpoint} onChange={(e) => setEndpoint(e.target.value)} placeholder="https://8t92.cc/api/fetch-mails" />
+            <Label>Outlook 取件方式</Label>
+            <div className="text-sm">微软官方直连</div>
           </div>
           <div className="space-y-1.5">
             <Label>2FA 取码地址模板</Label>

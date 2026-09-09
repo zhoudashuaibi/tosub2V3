@@ -11,7 +11,7 @@ import {
 
 const CONCURRENCY = 3;
 
-export function createMailInit({ db, getEndpoint, decryptCredentials, logger }) {
+export function createMailInit({ db, decryptCredentials, logger }) {
   const queue = [];
   let active = 0;
 
@@ -50,11 +50,9 @@ export function createMailInit({ db, getEndpoint, decryptCredentials, logger }) 
     }
     try {
       const messages = await fetchReserveAccountMessages({
-        endpoint: getEndpoint(),
         email: account.email,
         clientId: outlook.client_id,
         refreshToken: outlook.refresh_token,
-        password: outlook.password || '',
       });
       const balanceInfo = extractBalanceFromMessages(messages);
       const banInfo = isAccountBannedFromMessages(messages);

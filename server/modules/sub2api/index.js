@@ -46,7 +46,6 @@ export function createSub2apiModule({ engine, logger }) {
       remoteSync,
       banMailCheck: createBanMailCheck({
         db,
-        getEndpoint: () => app.settings.get('outlook.fetch').endpoint,
         decryptCredentials: (account) => app.crypto.tryDecryptJson(account?.credentials_enc, 'accounts.credentials_enc'),
         logger,
       }),

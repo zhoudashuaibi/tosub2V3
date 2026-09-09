@@ -102,9 +102,19 @@ function mockDb(row) {
   return db;
 }
 
-async function withFetchMock(payload, fn) {
+async function withFetchMock(messages, fn) {
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => ({ ok: true, json: async () => payload });
+  globalThis.fetch = async (url) => ({
+    ok: true,
+    json: async () => String(url).includes('/token')
+      ? { access_token: 'test-access-token' }
+      : { value: messages.map((item) => ({
+          Subject: item.subject,
+          BodyPreview: item.bodyPreview,
+          Body: { Content: item.body.content },
+          ReceivedDateTime: item.receivedDateTime,
+        })) },
+  });
   try {
     await fn();
   } finally {
@@ -116,16 +126,11 @@ test('ban-mail-check：命中封禁邮件 → banned 标记 + confirmed 事件',
   const db = mockDb({ id: 1, email: 'a@b.com', credentials_enc: 'enc' });
   const banCheck = createBanMailCheck({
     db,
-    getEndpoint: () => 'https://example.test/api/fetch-mails',
     decryptCredentials: () => ({ outlook: { client_id: 'x', refresh_token: 'y' } }),
     logger: null,
   });
   await withFetchMock(
-    {
-      results: [
-        { ok: true, email: 'a@b.com', messages: [message('您的账户', '您的账户已被停用。')] },
-      ],
-    },
+    [message('您的账户', '您的账户已被停用。')],
     () => banCheck.check(1, { source: 'test' }),
   );
   assert.equal(db._events.length, 1);
@@ -137,12 +142,11 @@ test('ban-mail-check：无封禁邮件 → not_found 事件，不改 banned', as
   const db = mockDb({ id: 2, email: 'c@d.com', credentials_enc: 'enc' });
   const banCheck = createBanMailCheck({
     db,
-    getEndpoint: () => 'https://example.test/api/fetch-mails',
     decryptCredentials: () => ({ outlook: { client_id: 'x', refresh_token: 'y' } }),
     logger: null,
   });
   await withFetchMock(
-    { results: [{ ok: true, email: 'c@d.com', messages: [message('Your code', 'code 123456')] }] },
+    [message('Your code', 'code 123456')],
     () => banCheck.check(2, { source: 'test' }),
   );
   assert.equal(db._events.length, 1);
@@ -154,7 +158,6 @@ test('ban-mail-check：缺少 Outlook 凭据 → skipped 事件', async () => {
   const db = mockDb({ id: 3, email: 'e@f.com', credentials_enc: 'enc' });
   const banCheck = createBanMailCheck({
     db,
-    getEndpoint: () => 'https://example.test/api/fetch-mails',
     decryptCredentials: () => ({}),
     logger: null,
   });

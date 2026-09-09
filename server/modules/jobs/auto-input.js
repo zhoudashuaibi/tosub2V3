@@ -112,11 +112,9 @@ export function createAutoInput({ config, logger }) {
       let candidates = [];
       if (credentials.outlook?.refresh_token) {
         candidates = await fetchOutlookOtpCandidates({
-          endpoint: getOutlookEndpoint(),
           email: account.email,
           clientId: credentials.outlook.client_id,
           refreshToken: credentials.outlook.refresh_token,
-          password: credentials.outlook.password || '',
         }, { baselineTime });
       } else if (credentials.mail_api_url) {
         const raw = await fetchMailboxOtpCandidates(credentials.mail_api_url);
@@ -222,11 +220,6 @@ export function createAutoInput({ config, logger }) {
       sessions.set(jobId, session);
     }
     return session;
-  }
-
-  function getOutlookEndpoint() {
-    const settings = config.settingsGet?.('outlook.fetch') || {};
-    return settings.endpoint || 'https://8t92.cc/api/fetch-mails';
   }
 
   return { attempt, reset, invalidateSmsProvider, getSmsProviderState };

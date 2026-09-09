@@ -138,13 +138,11 @@ export function createAccountsModule({ engine, logger }) {
     const pools = createPools(db, crypto);
     const mailInit = createMailInit({
       db,
-      getEndpoint: () => app.settings.get('outlook.fetch').endpoint,
       decryptCredentials: (account) => crypto.tryDecryptJson(account.credentials_enc, 'accounts.credentials_enc'),
       logger,
     });
     const banMailCheck = createBanMailCheck({
       db,
-      getEndpoint: () => app.settings.get('outlook.fetch').endpoint,
       decryptCredentials: (account) => crypto.tryDecryptJson(account?.credentials_enc, 'accounts.credentials_enc'),
       logger,
     });

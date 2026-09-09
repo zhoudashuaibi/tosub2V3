@@ -427,7 +427,7 @@ export interface TeamConfigView {
 }
 
 export interface SettingsView {
-  outlook_fetch_endpoint: string;
+  outlook_fetch_mode: 'microsoft_direct';
   twofa_fetch_template: string;
   max_concurrent_jobs: number;
   job_timeout_minutes: number;

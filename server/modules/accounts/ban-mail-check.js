@@ -9,7 +9,7 @@ import {
  * 结果写 account_events（ban_mail_check），命中时补 banned 标记；
  * 返回 { confirmed, result, reason } 供调用方决策（confirmed 才算封禁实锤）。
  */
-export function createBanMailCheck({ db, getEndpoint, decryptCredentials, logger }) {
+export function createBanMailCheck({ db, decryptCredentials, logger }) {
   function record(accountId, detail) {
     try {
       db.prepare('INSERT INTO account_events(account_id, type, detail, created_at) VALUES(?,?,?,?)').run(
@@ -36,11 +36,9 @@ export function createBanMailCheck({ db, getEndpoint, decryptCredentials, logger
     }
     try {
       const messages = await fetchReserveAccountMessages({
-        endpoint: getEndpoint(),
         email: account.email,
         clientId: outlook.client_id,
         refreshToken: outlook.refresh_token,
-        password: outlook.password || '',
       });
       const banInfo = isAccountBannedFromMessages(messages);
       if (banInfo.banned) {

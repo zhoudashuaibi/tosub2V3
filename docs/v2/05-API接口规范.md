@@ -340,7 +340,7 @@
 ### GET /api/v1/settings
 
 ```jsonc
-{ "outlook_fetch_endpoint": "https://8t92.cc/api/fetch-mails",
+{ "outlook_fetch_mode": "microsoft_direct",
   "max_concurrent_jobs": 20, "job_timeout_minutes": 30, "proxy_fail_threshold": 3,
   "sms": { "active": "smsbower",
            "providers": { "luban": { "configured": true }, "smsbower": { "configured": true },
@@ -348,6 +348,8 @@
 ```
 
 ### PUT /api/v1/settings — 同结构请求（未包含的键不动）→ `200` 脱敏视图
+
+`outlook_fetch_mode` 为只读固定值。旧 `outlook_fetch_endpoint` 已移除，提交该字段返回 `422 VALIDATION`；数据库中遗留的 `outlook.fetch` 配置不会用于取件。
 
 ### POST /api/v1/settings/sms-provider — 保存接码平台配置（api_key 服务端加密，响应回 masked）
 

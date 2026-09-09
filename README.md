@@ -17,6 +17,14 @@ ChatGPT 账号池管理系统（模块化重写版）：代理池 + 三级号池
 | sub2api | 连接配置加密存储、监控巡检（分类正则可配）、自动重登修复、自动补号 |
 | 安全 | 凭据/token/代理 URL AES-256-GCM 入库、日志脱敏、敏感字段只写不读 |
 
+## Outlook 原生取件
+
+邮箱验证码、备用号池余额初始化和封禁邮件检查均直接访问微软官方接口：先通过 `login.microsoftonline.com/consumers/oauth2/v2.0/token` 换取访问令牌，再从 `outlook.office.com/api/v2.0/me/messages` 读取邮件。
+
+沿用已导入的 Outlook `client_id` 和 `refresh_token`，邮箱密码不参与取件请求。授权范围与参考取件项目一致，为 Outlook `IMAP.AccessAsUser.All`、`Mail.ReadWrite` 和 `offline_access`。登录收码读取最近 5 封，余额和封禁检查默认读取最近 10 封。
+
+设置页取件方式固定为“微软官方直连”。旧 `outlook.fetch` 中转地址不再生效，提交 `outlook_fetch_endpoint` 会返回 422；已有账号无须重新导入。授权失效或微软接口失败会明确报错，不回退第三方取件。2FA 取码模板属于独立功能，保持原有行为。
+
 ## 快速开始
 
 ### Docker（推荐）

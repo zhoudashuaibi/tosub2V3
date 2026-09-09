@@ -1,6 +1,9 @@
 import { extractMailboxOtpCandidates } from "./mail-otp.mjs";
 
-export const DEFAULT_OUTLOOK_ENDPOINT = "https://8t92.cc/api/fetch-mails";
+export const OUTLOOK_TOKEN_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token";
+export const OUTLOOK_MESSAGES_URL = "https://outlook.office.com/api/v2.0/me/messages";
+// 与现有邮箱凭据授权保持一致；仅 IMAP scope 的令牌可能无法读取 REST 邮件。
+export const OUTLOOK_SCOPE = "https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/Mail.ReadWrite offline_access";
 
 // 与 ChatGPT/OpenAI 登录相关的发件域。只有这些域的邮件才会被提取验证码，
 // 避免把邮箱里其他服务的验证码误当作 ChatGPT 登录码提交。
@@ -16,21 +19,6 @@ const DEFAULT_TIMEOUT_MS = 60_000;
 const MAX_MESSAGES = 5;
 const RESERVE_MAIL_MAX_MESSAGES = 10;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-export function validateOutlookEndpoint(value) {
-  try {
-    const parsed = new URL(String(value || "").trim());
-    return parsed.protocol === "http:" || parsed.protocol === "https:";
-  } catch {
-    return false;
-  }
-}
-
-export function normalizeOutlookEndpoint(value) {
-  const endpoint = String(value || "").trim() || DEFAULT_OUTLOOK_ENDPOINT;
-  if (!validateOutlookEndpoint(endpoint)) return DEFAULT_OUTLOOK_ENDPOINT;
-  return endpoint;
-}
 
 function isOutlookClientId(value) {
   return UUID_PATTERN.test(String(value || "").trim());
@@ -74,84 +62,111 @@ export function parseOutlookEntries(text) {
 }
 
 /**
- * 调用 8t92 风格的 fetch-mails 接口，提取目标邮箱的验证码候选。
- *
- * @param {object} params - { endpoint, email, clientId, refreshToken, password }
- * @param {object} options - { fetchImpl, timeoutMs, baselineTime, senderFilter }
- *   - baselineTime: 毫秒时间戳；早于该时间的邮件被视为旧邮件并被过滤。
- *     baseline 阶段（记录已有旧验证码）传入 null，不做时间过滤。
- *   - senderFilter: 默认 true，只保留 OpenAI 发件域邮件。
- * @returns {Promise<Array<{code,score,key,receivedAt}>>}
+ * 微软官方直连取件。固定官方端点，不使用旧的 endpoint 或邮箱密码。
+ * 返回与验证码、余额、封禁检查共用的 camelCase 邮件结构。
  */
-export async function fetchOutlookOtpCandidates(params, options = {}) {
-  const endpoint = normalizeOutlookEndpoint(params?.endpoint);
+export async function fetchOutlookMessages(params, options = {}) {
   const email = String(params?.email || "").trim().toLowerCase();
   const clientId = String(params?.clientId || "").trim();
   const refreshToken = String(params?.refreshToken || "").trim();
-  const password = String(params?.password || "").trim();
-  if (!email) throw new Error("Outlook 收码缺少邮箱");
-  if (!clientId) throw new Error("Outlook 收码缺少 clientId");
-  if (!refreshToken) throw new Error("Outlook 收码缺少 refresh_token");
+  if (!email) throw new Error("Outlook 取件缺少邮箱");
+  if (!clientId) throw new Error("Outlook 取件缺少 clientId");
+  if (!refreshToken) throw new Error("Outlook 取件缺少 refresh_token");
 
   const fetchImpl = options.fetchImpl || fetch;
+  const requested = Number(options.maxMessages);
+  const maxMessages = Number.isFinite(requested) && requested > 0
+    ? Math.min(50, Math.max(1, Math.floor(requested)))
+    : RESERVE_MAIL_MAX_MESSAGES;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), options.timeoutMs || DEFAULT_TIMEOUT_MS);
-  let response;
+  let stage = "微软授权";
   try {
-    const body = {
-      lines: `${email}----${password}----${clientId}----${refreshToken}`,
-      options: {
-        tokenKind: "refresh_token",
-        redirectUri: "",
-        folderScope: "inbox",
-        maxMessages: MAX_MESSAGES,
-        bodyContent: "html",
-        includeBody: true,
-        includeHeaders: false,
-      },
-    };
-    response = await fetchImpl(endpoint, {
+    const tokenResponse = await fetchImpl(OUTLOOK_TOKEN_URL, {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        accept: "application/json",
-        "user-agent": "Mozilla/5.0 ChatGPT-Onboarding-Console/1.0",
-      },
-      body: JSON.stringify(body),
-      redirect: "follow",
+      headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        client_id: clientId,
+        refresh_token: refreshToken,
+        scope: OUTLOOK_SCOPE,
+      }).toString(),
+      redirect: "error",
       signal: controller.signal,
     });
-    if (!response.ok) throw new Error(`Outlook 取件接口返回 HTTP ${response.status}`);
+    if (!tokenResponse.ok) {
+      const error = await tokenResponse.json().catch(() => null);
+      // 不把上游响应正文带入日志，避免凭据或邮件内容被回显。
+      const code = typeof error?.error === "string" && /^[a-z_]{1,64}$/.test(error.error) ? error.error : "";
+      throw new Error(`HTTP ${tokenResponse.status}${code ? `（${code}）` : ""}`);
+    }
+    const token = await tokenResponse.json();
+    if (typeof token?.access_token !== "string" || !token.access_token.trim()) {
+      throw new Error("响应缺少 access_token");
+    }
+
+    stage = "Outlook 邮件读取";
+    const url = new URL(OUTLOOK_MESSAGES_URL);
+    url.search = new URLSearchParams({
+      $top: String(maxMessages),
+      $orderby: "ReceivedDateTime desc",
+      $select: "Id,Subject,From,ReceivedDateTime,BodyPreview,Body,IsRead",
+    }).toString();
+    const response = await fetchImpl(url.toString(), {
+      method: "GET",
+      headers: {
+        authorization: `Bearer ${token.access_token}`,
+        accept: "application/json",
+        Prefer: "outlook.body-content-type=html",
+      },
+      redirect: "error",
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const payload = await response.json();
-    const messages = pickTargetMessages(payload, email);
-    const baselineTime = options.baselineTime ?? null;
-    const useSenderFilter = options.senderFilter !== false;
-    return extractCandidatesFromMessages(messages, { baselineTime, useSenderFilter });
+    if (!Array.isArray(payload?.value)) throw new Error("响应缺少邮件列表");
+    return payload.value.map((message) => {
+      const sender = message?.From?.EmailAddress;
+      return {
+        id: message?.Id,
+        subject: message?.Subject,
+        bodyPreview: message?.BodyPreview,
+        isRead: message?.IsRead,
+        receivedDateTime: message?.ReceivedDateTime,
+        from: { emailAddress: sender ? { name: sender.Name, address: sender.Address } : null },
+        body: {
+          content: message?.Body?.Content,
+          contentType: String(message?.Body?.ContentType || "").toLowerCase(),
+        },
+      };
+    });
   } catch (error) {
-    if (error?.name === "AbortError") throw new Error("Outlook 取件接口请求超时");
-    throw error;
+    if (controller.signal.aborted || error?.name === "AbortError") {
+      throw new Error(`${stage}请求超时`);
+    }
+    // 网络异常及 JSON 解析错误可能含响应片段，只返回固定错误类别。
+    let detail = "请求失败";
+    if (/^(HTTP \d{3}(（[a-z_]+）)?|响应缺少 access_token|响应缺少邮件列表)$/.test(error?.message)) {
+      detail = error.message;
+    } else if (error instanceof SyntaxError) {
+      detail = "响应不是有效 JSON";
+    }
+    throw new Error(`${stage}失败：${detail}`);
   } finally {
     clearTimeout(timeout);
   }
 }
 
-function pickTargetMessages(payload, targetEmail) {
-  if (!payload || typeof payload !== "object") return [];
-  const results = Array.isArray(payload.results)
-    ? payload.results
-    : Array.isArray(payload.accounts)
-      ? payload.accounts
-      : Array.isArray(payload.value)
-        ? payload.value
-        : [];
-  const normalizedTarget = String(targetEmail).toLowerCase();
-  const matched = results.find((item) => {
-    if (!item || typeof item !== "object") return false;
-    if (item.ok === false) return false;
-    return String(item.email || "").toLowerCase() === normalizedTarget;
+/**
+ * 提取登录验证码候选；baselineTime 之前的邮件和非 OpenAI 发件人保持过滤。
+ * baselineTime=null 用于记录已有旧验证码，senderFilter=false 可关闭发件人过滤。
+ */
+export async function fetchOutlookOtpCandidates(params, options = {}) {
+  const messages = await fetchOutlookMessages(params, { ...options, maxMessages: MAX_MESSAGES });
+  return extractCandidatesFromMessages(messages, {
+    baselineTime: options.baselineTime ?? null,
+    useSenderFilter: options.senderFilter !== false,
   });
-  if (!matched) return [];
-  return Array.isArray(matched.messages) ? matched.messages : [];
 }
 
 function isOpenAiSender(message) {
@@ -212,58 +227,12 @@ function extractCandidatesFromMessages(messages, { baselineTime, useSenderFilter
 // ---------------------------------------------------------------------------
 
 /**
- * 拉取某个 Outlook 邮箱最近的邮件列表（原始 message 对象），用于备用号池的余额/封禁判断。
- * @param {{endpoint:string,email:string,clientId:string,refreshToken:string,password:string}} params
+ * 拉取最近邮件用于备用号池余额及封禁检查，不做发件人过滤。
+ * @param {{email:string,clientId:string,refreshToken:string}} params
  * @param {{fetchImpl?:Function,timeoutMs?:number,maxMessages?:number}} [options]
- * @returns {Promise<Array>} messages 数组（Graph 风格）
  */
 export async function fetchReserveAccountMessages(params, options = {}) {
-  const endpoint = normalizeOutlookEndpoint(params?.endpoint);
-  const email = String(params?.email || "").trim().toLowerCase();
-  const clientId = String(params?.clientId || "").trim();
-  const refreshToken = String(params?.refreshToken || "").trim();
-  const password = String(params?.password || "").trim();
-  if (!email) throw new Error("备用号池拉取邮件缺少邮箱");
-  if (!clientId) throw new Error("备用号池拉取邮件缺少 clientId");
-  if (!refreshToken) throw new Error("备用号池拉取邮件缺少 refresh_token");
-
-  const fetchImpl = options.fetchImpl || fetch;
-  const maxMessages = Number(options.maxMessages) || RESERVE_MAIL_MAX_MESSAGES;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), options.timeoutMs || DEFAULT_TIMEOUT_MS);
-  try {
-    const body = {
-      lines: `${email}----${password}----${clientId}----${refreshToken}`,
-      options: {
-        tokenKind: "refresh_token",
-        redirectUri: "",
-        folderScope: "inbox",
-        maxMessages,
-        bodyContent: "html",
-        includeBody: true,
-        includeHeaders: false,
-      },
-    };
-    const response = await fetchImpl(endpoint, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        accept: "application/json",
-        "user-agent": "Mozilla/5.0 ChatGPT-Onboarding-Console/1.0",
-      },
-      body: JSON.stringify(body),
-      redirect: "follow",
-      signal: controller.signal,
-    });
-    if (!response.ok) throw new Error(`Outlook 取件接口返回 HTTP ${response.status}`);
-    const payload = await response.json();
-    return pickTargetMessages(payload, email);
-  } catch (error) {
-    if (error?.name === "AbortError") throw new Error("Outlook 取件接口请求超时");
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-  }
+  return fetchOutlookMessages(params, options);
 }
 
 /** 将 message 拍平为纯文本（去 HTML 标签、合并空白）。 */
