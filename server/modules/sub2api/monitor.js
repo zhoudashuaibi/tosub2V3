@@ -205,12 +205,26 @@ export function createMonitor({ db, crypto, client, getConfig, pools, engine, up
       const localAccounts = db.prepare(`SELECT * FROM accounts WHERE pool IN ('main','reserve')`).all();
       const localByEmail = new Map(localAccounts.map((row) => [row.email.toLowerCase(), row]));
       const tracked = [];
+      const trackedIdxByEmail = new Map();
       for (const remote of accounts) {
         if (String(remote.type || 'oauth') !== 'oauth') continue;
         if (!inMonitoredGroups(remote, groupIds)) continue;
         const email = client.accountEmail(remote);
         const local = email ? localByEmail.get(email.toLowerCase()) : null;
-        if (local) tracked.push({ remote, local, email });
+        if (!local) continue;
+        // 远端同邮箱重复条目（历史上传重复）只跟踪一条，避免 error 计数虚高、
+        // 同一本地号每轮重复处理：优先本地已关联的远端 ID，未关联时取首个
+        const key = email.toLowerCase();
+        const existingIdx = trackedIdxByEmail.get(key);
+        if (existingIdx != null) {
+          const linkedId = Number(local.sub2api_account_id);
+          if (Number(remote.id) === linkedId && Number(tracked[existingIdx].remote.id) !== linkedId) {
+            tracked[existingIdx] = { remote, local, email };
+          }
+          continue;
+        }
+        trackedIdxByEmail.set(key, tracked.length);
+        tracked.push({ remote, local, email });
       }
       result.scanned = tracked.length;
       const errorMonitored = tracked.filter(({ remote }) => String(remote.status || '') === 'error');
@@ -429,6 +443,9 @@ export function createMonitor({ db, crypto, client, getConfig, pools, engine, up
   async function tryAutoRepair(local, monitor, remote = null) {
     if (local.auto_repair_blocked) return false;
     if (local.pool !== 'main') return false;
+    // 收编保险门：远端健康的收编号绝不自动登录（自动修复本就只对 error 号触发，双保险）；
+    // 远端 error（如 token 撤销 401）时收编号照常修复——无本地 tokens 直接走完整登录
+    if (local.adopted_remote && remote && String(remote.status || '') !== 'error') return false;
     const active = db
       .prepare(`SELECT id FROM jobs WHERE account_id=? AND status IN ('queued','running','awaiting_input')`)
       .get(local.id);

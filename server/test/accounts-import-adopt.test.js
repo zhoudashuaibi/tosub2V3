@@ -100,7 +100,8 @@ test('adopt_remote：本地无记录的远端账号收编进主号池，不登�
   assert.equal(adopted.status, 'active');
   assert.equal(adopted.sub2api_account_id, 101);
   assert.equal(adopted.sub2api_status, 'active');
-  assert.equal(adopted.auto_repair_blocked, 1);
+  assert.equal(adopted.adopted_remote, 1);
+  assert.equal(adopted.auto_repair_blocked, 0);
   assert.equal(adopted.tokens_enc, null);
 
   // 不在远端的账号照旧进备用池
@@ -134,7 +135,7 @@ test('adopt_remote：备用池已有且远端也存在 → 升级进主号池，
   assert.equal(upgraded.pool, 'main');
   assert.equal(upgraded.status, 'active');
   assert.equal(upgraded.sub2api_account_id, 101);
-  assert.equal(upgraded.auto_repair_blocked, 1);
+  assert.equal(upgraded.adopted_remote, 1);
   assert.equal(upgraded.initial_balance, 5);
   assert.equal(upgraded.has_balance, 1);
 });

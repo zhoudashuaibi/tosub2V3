@@ -464,8 +464,9 @@ export function createAccountsModule({ engine, logger }) {
               passwords_text: { type: 'string', maxLength: 2_000_000 },
               force_discard: { type: 'boolean' },
               force_remote: { type: 'boolean' },
-              // 远端已有账号收编进主号池：直接关联远端账号（不登录、不上传），
-              // 供多台机器共用同一 sub2api 但本地号池不同步的场景对齐主号池视图
+              // 远端已有账号收编进主号池：直接关联远端账号（导入时不登录、不上传），
+              // 供多台机器共用同一 sub2api 但本地号池不同步的场景对齐主号池视图；
+              // 远端健康时巡检零动作，远端 error 时照常自动修复（见 monitor.tryAutoRepair）
               adopt_remote: { type: 'boolean' },
             },
           },
@@ -669,7 +670,7 @@ export function createAccountsModule({ engine, logger }) {
             if (existing) {
               if (existing.pool === 'reserve') {
                 // 备用池号已在远端 sub2api 且选择收编：升级进主号池并直接关联远端账号，
-                // 绝不重新登录（auto_repair_blocked=1，巡检只观察不修复）；
+                // 导入时不登录（adopted_remote=1，远端健康零动作、error 才自动修复）；
                 // initial_balance/has_balance 保留，joining 中的号退化回刷新凭据
                 if (adopt_remote) {
                   const remote = remoteAccountFor(entry.email);
@@ -680,7 +681,7 @@ export function createAccountsModule({ engine, logger }) {
                       .prepare(
                         `UPDATE accounts SET pool='main', status='active', credentials_enc=?,
                            sub2api_account_id=?, sub2api_status=?, sub2api_uploaded_at=?, sub2api_synced_at=?,
-                           auto_repair_blocked=1, repair_fail_count=0,
+                           adopted_remote=1, repair_fail_count=0,
                            mail_error=NULL, updated_at=?
                          WHERE id=? AND pool='reserve' AND status != 'joining'`,
                       )
@@ -763,15 +764,15 @@ export function createAccountsModule({ engine, logger }) {
             }
             const remote = remoteAccountFor(entry.email);
             if (remote && adopt_remote && !force_remote) {
-              // 本地无记录但远端已有：收编进主号池并关联远端账号，绝不重新登录——
-              // auto_repair_blocked=1 让巡检对收编号只观察不修复（远端正常时本就无动作），
-              // 需要重授权时由用户手动发起；无本地 tokens，余额刷新/上传管线本就跳过
+              // 本地无记录但远端已有：收编进主号池并关联远端账号，导入时不登录不上传。
+              // adopted_remote=1：远端健康时巡检零动作（修复只对 error 号触发，再加保险门）；
+              // 远端 401/error 时正常自动修复（无本地 tokens → 完整登录重授权）
               const now = new Date().toISOString();
               const result = db
                 .prepare(
                   `INSERT INTO accounts(email, pool, status, note, credentials_enc,
                      sub2api_account_id, sub2api_status, sub2api_uploaded_at, sub2api_synced_at,
-                     auto_repair_blocked, created_at, updated_at)
+                     adopted_remote, created_at, updated_at)
                    VALUES(?, 'main', 'active', ?, ?, ?, ?, ?, ?, 1, ?, ?)
                    ON CONFLICT(email) DO NOTHING`,
                 )
@@ -788,7 +789,7 @@ export function createAccountsModule({ engine, logger }) {
                 );
               if (result.changes === 0) continue;
               const id = Number(result.lastInsertRowid);
-              pools.recordEvent(id, 'imported', { source: 'adopt_remote', pool: 'main', no_relogin: true });
+              pools.recordEvent(id, 'imported', { source: 'adopt_remote', pool: 'main', no_relogin_while_healthy: true });
               pools.recordEvent(id, 'sub2api_linked', { remote_id: remote.id, source: 'import_adopt' });
               created.push({ id, email: entry.email, status: 'active', pool: 'main' });
               adoptedRemote.push(entry.email);

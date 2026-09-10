@@ -842,3 +842,40 @@ test('巡检余额刷新：距上次查询不足间隔的号跳过，0=每轮都
   assert.equal(view2.last_result.balance_queued, 1);
   assert.equal(view2.last_result.balance_skipped_fresh, 0);
 });
+
+test('收编号：远端 error 触发完整登录修复，远端健康零动作', async () => {
+  const adoptedOk = insertAccount(ctx.db, ctx.crypto, { email: 'adopt-ok@test.local' });
+  const adoptedErr = insertAccount(ctx.db, ctx.crypto, { email: 'adopt-err@test.local', credentials: { outlook: { refresh_token: 'rt' } } });
+  ctx.db.prepare(`UPDATE accounts SET sub2api_account_id=901, adopted_remote=1 WHERE id=?`).run(adoptedOk);
+  ctx.db.prepare(`UPDATE accounts SET sub2api_account_id=902, adopted_remote=1 WHERE id=?`).run(adoptedErr);
+  const monitor = buildMonitor({
+    autoRepair: true,
+    remoteAccounts: [
+      remoteAccount({ id: 901, email: 'adopt-ok@test.local' }),
+      remoteAccount({ id: 902, email: 'adopt-err@test.local', status: 'error', errorMessage: 'Token revoked: invalidated oauth token' }),
+    ],
+  });
+
+  const view = await monitor.runCheck();
+
+  assert.equal(view.last_result.error_accounts, 1);
+  assert.equal(view.last_result.repairing, 1);
+  assert.equal(ctx.submitted.length, 1);
+  assert.equal(ctx.submitted[0].type, 'login');
+  assert.equal(ctx.submitted[0].accountId, adoptedErr);
+});
+
+test('远端同邮箱重复条目只跟踪一条（优先本地关联 ID），error 计数不虚高', async () => {
+  const id = insertAccount(ctx.db, ctx.crypto, { email: 'dup@test.local', tokens: { refresh_token: 'rt' } });
+  ctx.db.prepare(`UPDATE accounts SET sub2api_account_id=5 WHERE id=?`).run(id);
+  const monitor = buildMonitor({
+    remoteAccounts: [
+      remoteAccount({ id: 9, email: 'dup@test.local' }),
+      remoteAccount({ id: 5, email: 'dup@test.local' }),
+    ],
+  });
+
+  const view = await monitor.runCheck();
+
+  assert.equal(view.last_result.scanned, 1);
+});

@@ -1159,7 +1159,10 @@ async function completeTotpMfaIfNeeded(client, { authBase, rl, payload, totpSecr
       console.log("[ok] 2FA verification accepted");
       return data;
     } catch (error) {
-      if (!/HTTP (400|401)|invalid.*(?:totp|code)|incorrect.*code/i.test(String(error?.message || ""))) throw error;
+      const message = String(error?.message || "");
+      // 429 限流：把限流当"错码"继续重试只会加剧限流，直接失败（任务层稍后可重试）
+      if (/HTTP 429/.test(message)) throw error;
+      if (!/HTTP (400|401)|invalid.*(?:totp|code)|incorrect.*code/i.test(message)) throw error;
       if (codeSource === "pickup" && pickupRetries < 3) {
         // 被拒通常意味着取到的码已过窗口：等下一个 30s 窗口换新码重试
         pickupRetries += 1;

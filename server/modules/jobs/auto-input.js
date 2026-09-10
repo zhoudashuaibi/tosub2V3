@@ -22,6 +22,9 @@ import {
 
 const OTP_POLL_INTERVAL_MS = 2500;
 const OTP_POLL_MAX_MS = 10 * 60 * 1000;
+// 同一任务 2FA（mfa_otp/totp_setup_otp）自动作答次数上限：被拒后无限秒答会形成
+// verify 风暴（连打 OpenAI 直至 403/429），超限停止自动答、转 awaiting_input 等人工
+const MFA_AUTO_SUBMIT_MAX = 5;
 
 export function createAutoInput({ config, logger }) {
   const sessions = new Map(); // jobId -> session state
@@ -47,12 +50,14 @@ export function createAutoInput({ config, logger }) {
     }
 
     if (kind === 'mfa_otp' || kind === 'totp_setup_otp') {
+      if ((session.mfaSubmits || 0) >= MFA_AUTO_SUBMIT_MAX) return { wait: true };
       if (credentials.totp_secret) {
         try {
           // 含失败重试一次的时钟偏移容错：先当前窗口，被拒后引擎重触发时换下一候选
           const candidates = [0, -30_000, 30_000];
           const offset = candidates[session.totpTryIndex % candidates.length];
           session.totpTryIndex = (session.totpTryIndex || 0) + 1;
+          session.mfaSubmits = (session.mfaSubmits || 0) + 1;
           return { submit: { action: 'input', value: generateTotp(credentials.totp_secret, Date.now() + offset) } };
         } catch (error) {
           logger?.warn?.({ jobId: job.id, err: error.message }, 'TOTP 生成失败');
@@ -61,7 +66,9 @@ export function createAutoInput({ config, logger }) {
       }
       // 兜底：子进程内取件失败转人工输入时，引擎侧再试在线取件（2fa.show 等）
       if (kind === 'mfa_otp' && credentials.totp_pickup_code) {
-        return pickupTotp(job, session, credentials.totp_pickup_code);
+        const result = await pickupTotp(job, session, credentials.totp_pickup_code);
+        if (result.submit) session.mfaSubmits = (session.mfaSubmits || 0) + 1;
+        return result;
       }
       return { wait: true };
     }
