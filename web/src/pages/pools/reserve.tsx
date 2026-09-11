@@ -400,6 +400,15 @@ export function ReservePoolPage() {
         </Button>
         <Button
           size="sm"
+          variant="outline"
+          onClick={() => refreshMailMutation.mutate(selection.selectedIds)}
+          disabled={refreshMailMutation.isPending}
+        >
+          {refreshMailMutation.isPending ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+          重新检查
+        </Button>
+        <Button
+          size="sm"
           variant="destructive"
           onClick={() => {
             setRowTargets([]);
