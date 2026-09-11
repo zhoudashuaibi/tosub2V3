@@ -170,7 +170,6 @@ export function createAccountsModule({ engine, logger }) {
   return async function accountsModule(app) {
     const db = app.db;
     const crypto = app.crypto;
-    const pools = createPools(db, crypto);
     // 废弃号用量快照：sub2api 模块可能晚于本模块注册，用 getClient 惰性取。
     // buildFilterWhere 注入列表筛选器（buildAccountFilters），使「未选中时同步当前筛选」
     // 与列表/徽章同一口径 —— 传进来的 query 里没有 pool，这里固定补成 discard。
@@ -180,9 +179,14 @@ export function createAccountsModule({ engine, logger }) {
       logger,
       buildFilterWhere: (query) => buildAccountFilters({ ...query, pool: 'discard' }),
     });
-    // 让 sub2api 监控的自动废弃路径也能复用同一条快照通道
-    // （monitor 在 sub2api 模块里创建、本模块更早注册，因此用全局引用反向传递）
-    globalThis.__tosub2DiscardUsage = discardUsage;
+    // 废弃入口有多条（手动批量、401/429 巡检、登录终局失败、永久封禁），
+    // 统一挂在 pools 的池流转上，避免再漏掉某条路径导致那批号永远「未同步」。
+    const pools = createPools(db, crypto, {
+      onDiscarded: (accountId) => {
+        if (!sub2apiConfigured()) return null;
+        return discardUsage.snapshotAfterDiscard(accountId);
+      },
+    });
     const mailInit = createMailInit({
       db,
       decryptCredentials: (account) => crypto.tryDecryptJson(account.credentials_enc, 'accounts.credentials_enc'),
@@ -267,6 +271,7 @@ export function createAccountsModule({ engine, logger }) {
     engine.hooks.onPermanentFailure = (job, runtime, message) => {
       if (!job?.account_id) return;
       try {
+        // 转池成功后由 pools 的 onDiscarded 钩子自动抓用量快照（异步、不阻塞这里）
         pools.moveToDiscard(job.account_id, 'login_failed', message, { fromPools: ['reserve', 'main'] });
       } catch (error) {
         logger.warn({ err: error.message }, 'onPermanentFailure hook failed');
@@ -1399,37 +1404,21 @@ export function createAccountsModule({ engine, logger }) {
       },
       async (request) => {
         let discarded = 0;
-        const discardedIds = [];
         for (const id of request.body.ids) {
           try {
+            // 用量快照由 pools 的 onDiscarded 钩子在流转成功后自动触发（异步、不阻塞响应）：
+            // sub2api 不提供历史时点查询，错过此刻就只能拿到「当前累计」了
             pools.moveToDiscard(id, 'manual', request.body.detail || '手动废弃', { fromPools: ['main', 'reserve'] });
             discarded += 1;
-            discardedIds.push(id);
           } catch (error) {
             logger.debug({ accountId: id }, `discard skipped: ${error.message}`);
           }
         }
-        // 废弃当下抓一次用量快照（异步、不阻塞响应）：sub2api 不提供历史时点查询，
-        // 错过此刻就只能拿到「当前累计」了
-        void snapshotDiscardedUsage(discardedIds);
         return { discarded };
       },
     );
 
     // ---------------- 废弃池「已用额度」----------------
-    /**
-     * 抓取刚被废弃账号的用量快照。best-effort：不 await、不动响应，
-     * 与 banMailCheck.check 的「异步、不阻塞终态流转」模式一致。
-     */
-    async function snapshotDiscardedUsage(ids) {
-      if (!ids.length) return;
-      if (!sub2apiConfigured()) return;
-      for (const id of ids) {
-        // 串行即可：废弃是低频手动动作，且每条内部已吞异常
-        await discardUsage.snapshotAfterDiscard(id);
-      }
-    }
-
     function sub2apiConfigured() {
       const config = app.settings?.get?.('sub2api.config');
       return Boolean(config?.base_url && config?.admin_key);

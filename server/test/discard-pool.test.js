@@ -94,6 +94,16 @@ const fakeEngine = () => ({ hooks: {} });
 
 const silentLogger = { debug() {}, warn() {}, info() {}, error() {} };
 
+/** 轮询等待异步的 best-effort 快照落库（不 await 调用方，所以测试只能等） */
+async function waitFor(predicate, { timeout = 2000, step = 5 } = {}) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, step));
+  }
+  return predicate();
+}
+
 async function setup(t) {
   const db = new Database(':memory:');
   db.pragma('foreign_keys = ON');
@@ -107,13 +117,14 @@ async function setup(t) {
   app.decorate('config', { dataDir: process.cwd() });
   app.decorate('sub2apiClient', fakeSub2apiClient());
   registerErrorHandler(app);
-  await createAccountsModule({ engine: fakeEngine(), logger: silentLogger })(app);
+  const engine = fakeEngine();
+  await createAccountsModule({ engine, logger: silentLogger })(app);
   await app.ready();
   t.after(async () => {
     await app.close();
     db.close();
   });
-  return { app, db };
+  return { app, db, engine };
 }
 
 async function listDiscard(app, query = '') {
@@ -479,6 +490,44 @@ test('同步端点：显式 ids 优先于 filters，选中项就是范围', asyn
   assert.equal(response.json().items[0].id, 2);
   const untouched = db.prepare('SELECT discard_used_amount_at FROM accounts WHERE id=1').get();
   assert.equal(untouched.discard_used_amount_at, OLD_SYNC_AT);
+});
+
+test('登录终局失败废弃：移入废弃池时自动抓一次用量快照（不再要求手动同步）', async (t) => {
+  const { db, engine } = await setup(t);
+  // 1 号在主号池、关联远端 101（/stats 返回 12.5）
+  db.prepare("UPDATE accounts SET pool='main', status='active' WHERE id=1").run();
+
+  const row = () => db.prepare('SELECT pool, discard_reason, discard_used_amount FROM accounts WHERE id=1').get();
+  // 登录永久失败 → 废弃（hook 只同步流转，快照是异步 best-effort）
+  engine.hooks.onPermanentFailure({ account_id: 1 }, {}, 'login_failed_permanent');
+
+  assert.equal(row().pool, 'discard');
+  assert.equal(row().discard_reason, 'login_failed');
+  // 1 号种子里已有旧快照（3.5），废弃当下的自动快照要把它刷成远端当前累计值
+  assert.ok(
+    await waitFor(() => row().discard_used_amount === 12.5),
+    '废弃后应自动写入用量快照',
+  );
+  assert.equal(row().discard_used_amount, 12.5);
+});
+
+test('手动批量废弃：流转成功的号自动快照，跳过的号不受影响', async (t) => {
+  const { app, db } = await setup(t);
+  // 1 号挪回主号池（可废弃），2 号仍在废弃池（会被跳过）
+  db.prepare("UPDATE accounts SET pool='main', status='active' WHERE id=1").run();
+
+  const response = await app.inject({
+    method: 'POST',
+    url: '/api/v1/accounts/batch-discard',
+    payload: { ids: [1, 2] },
+  });
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.json().discarded, 1);
+
+  const used = (id) => db.prepare('SELECT discard_used_amount FROM accounts WHERE id=?').get(id).discard_used_amount;
+  assert.ok(await waitFor(() => used(1) !== null), '废弃成功的号应自动快照');
+  assert.equal(used(1), 12.5);
+  assert.equal(used(2), null, '不存在流转的号不该被写快照');
 });
 
 test('统计：已用额度合计 / 已知数 / 待同步数', async (t) => {

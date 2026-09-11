@@ -340,15 +340,25 @@ export function createDiscardUsage({
    * 废弃当下的自动快照：单个账号，best-effort。
    * 调用点不做 await（与 banMailCheck.check 的「异步、不阻塞终态流转」模式一致），
    * 因此这里必须自己吞掉所有异常。
+   *
+   * 走一条串行队列：批量废弃一次可能几百个号，若每个都并发打远端（每个 1~2 个请求）
+   * 会把 sub2api 打爆；串行与早先「逐条 await」的语义一致，只是不再阻塞调用方。
    */
-  async function snapshotAfterDiscard(accountId) {
-    try {
-      const result = await sync({ ids: [accountId], concurrency: 1, quiet: true });
-      return result.items[0] ?? null;
-    } catch (error) {
-      logger?.warn?.({ accountId, err: error.message }, 'discard usage snapshot failed');
-      return null;
-    }
+  let discardSnapshotQueue = Promise.resolve();
+
+  function snapshotAfterDiscard(accountId) {
+    const run = async () => {
+      try {
+        const result = await sync({ ids: [accountId], concurrency: 1, quiet: true });
+        return result.items[0] ?? null;
+      } catch (error) {
+        logger?.warn?.({ accountId, err: error.message }, 'discard usage snapshot failed');
+        return null;
+      }
+    };
+    // 前一个失败也不能断链（run 内部已吞异常，这里再兜一层）
+    discardSnapshotQueue = discardSnapshotQueue.then(run, run);
+    return discardSnapshotQueue;
   }
 
   return { sync, snapshotAfterDiscard, selectTargets };

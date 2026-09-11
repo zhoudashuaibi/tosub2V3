@@ -379,15 +379,12 @@ export function createMonitor({ db, crypto, client, getConfig, pools, engine, up
 
   async function discardLocal(local, reason, detail, remote, monitor) {
     try {
+      // 用量快照不在这里做：pools.moveToDiscard 落库后会统一触发 onDiscarded 钩子，
+      // 所有废弃入口（手动/巡检/登录终局失败）走同一条 best-effort 通道
       pools.moveToDiscard(local.id, reason, detail);
     } catch (error) {
       logger.debug({ accountId: local.id }, `monitor discard skipped: ${error.message}`);
       return;
-    }
-    // 废弃当下的用量快照：sub2api 不提供历史时点查询，错过此刻就只剩「当前累计」值。
-    // 这里与手动废弃走同一条 best-effort 通道（不 await、不阻塞巡检）。
-    if (typeof globalThis.__tosub2DiscardUsage?.snapshotAfterDiscard === 'function') {
-      void globalThis.__tosub2DiscardUsage.snapshotAfterDiscard(local.id);
     }
     if (monitor.pause_on_discard !== false && Number.isInteger(Number(remote?.id))) {
       try {

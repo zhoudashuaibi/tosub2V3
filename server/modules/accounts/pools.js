@@ -4,9 +4,16 @@ import { errors } from '../../lib/http-errors.js';
  * 三级号池状态机与池流转事务（docs 04-04）。
  * 所有 pool 变更必须走这里的函数：单事务「改 accounts + 写 account_events」，
  * WHERE pool=... 乐观锁，受影响行数=0 报冲突。
+ *
+ * @param {object} db
+ * @param {object} crypto
+ * @param {{ onDiscarded?: (accountId: number) => unknown }} [hooks]
+ *   onDiscarded：账号**成功**进入废弃池后的回调（快照用量等）。放在这里是因为
+ *   废弃入口有多条（手动批量、401/429 巡检、登录终局失败、永久封禁），散在各调用点
+ *   会漏 —— 漏掉的那条路径上的号就永远是「未同步」。best-effort：不 await、吞异常，
+ *   绝不影响转池事务的结果。
  */
-
-export function createPools(db, crypto) {
+export function createPools(db, crypto, { onDiscarded = null } = {}) {
   function recordEvent(accountId, type, detail) {
     db.prepare('INSERT INTO account_events(account_id, type, detail, created_at) VALUES(?,?,?,?)').run(
       accountId,
@@ -14,6 +21,19 @@ export function createPools(db, crypto) {
       JSON.stringify(detail ?? {}),
       new Date().toISOString(),
     );
+  }
+
+  /**
+   * 事务提交后触发废弃钩子。必须在 tx() 成功之后调用，否则回滚的流转也会抓快照；
+   * 同步抛错同样要吞掉：快照失败不能把已经成功的废弃变成报错。
+   */
+  function notifyDiscarded(accountId) {
+    if (typeof onDiscarded !== 'function') return;
+    try {
+      Promise.resolve(onDiscarded(accountId)).catch(() => {});
+    } catch {
+      /* ignore：best-effort */
+    }
   }
 
   /** reserve → main：登录成功 + tokens/余额入库。 */
@@ -89,7 +109,10 @@ export function createPools(db, crypto) {
       recordEvent(accountId, 'join_failed', { error: String(error || '').slice(0, 500), job_id: jobId });
       return { pool: 'reserve', status: 'mail_failed' };
     });
-    return tx();
+    const result = tx();
+    // 永久封禁直接进废弃池：与 moveToDiscard 一样，落库后立刻抓一次用量快照
+    if (result?.pool === 'discard') notifyDiscarded(accountId);
+    return result;
   }
 
   /** main → discard。reason ∈ banned_401 | rate_limited_429 | repair_failed | login_failed | manual */
@@ -106,7 +129,11 @@ export function createPools(db, crypto) {
       recordEvent(accountId, 'moved_to_discard', { reason, detail: String(detail || '').slice(0, 500) });
       return { pool: 'discard', reason };
     });
-    return tx();
+    const result = tx();
+    // 废弃当下抓一次用量快照：sub2api 只有「当前累计」、没有历史时点查询，
+    // 错过此刻之后再补也只能拿到当前值
+    notifyDiscarded(accountId);
+    return result;
   }
 
   /** discard → main（needs_reauth）。 */
