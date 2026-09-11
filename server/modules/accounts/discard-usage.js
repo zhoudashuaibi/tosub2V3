@@ -60,25 +60,40 @@ export function resolveRemoteAccount(row, index) {
 }
 
 /**
- * 把「本地废弃行 + 远端账号」映射为用量解析结果（纯函数，重点单测对象）。
+ * 把「本地废弃行 + 远端账号 + 取到的用量」映射为同步结果（纯函数，重点单测对象）。
  *
- * @returns {{ used_amount: number|null, used_amount_source: string|null, remote_account_id: number|null, reason: string|null }}
+ * reason 词表与 buildMainBalanceEstimate 的未知原因保持同一口径：
+ *   not_linked                  从未关联远端
+ *   remote_account_not_found    关联过 / 有邮箱，但远端查不到
+ *   remote_used_amount_unknown  远端存在但拿不到用量字段
+ *   fetch_failed                查询过程出错（结论不可信，需要重试）
  */
-export function resolveDiscardUsage(row, remote, accountUsedAmount) {
+export function classifyDiscardUsage({ row, remote, used, lookupError = null }) {
   if (!remote) {
     return {
       used_amount: null,
       used_amount_source: null,
       remote_account_id: null,
-      reason: row.sub2api_account_id == null ? 'not_linked' : 'remote_account_not_found',
+      reason: row.sub2api_account_id == null ? 'not_linked' : lookupError ? 'fetch_failed' : 'remote_account_not_found',
+      detail: lookupError,
     };
   }
-  const used = accountUsedAmount ? accountUsedAmount(remote) : null;
+  const remoteId = Number.isSafeInteger(Number(remote.id)) ? Number(remote.id) : null;
+  if (!used) {
+    return {
+      used_amount: null,
+      used_amount_source: null,
+      remote_account_id: remoteId,
+      reason: 'remote_used_amount_unknown',
+      detail: null,
+    };
+  }
   return {
-    used_amount: used?.amount ?? null,
-    used_amount_source: used?.source ?? null,
-    remote_account_id: Number.isSafeInteger(Number(remote.id)) ? Number(remote.id) : null,
-    reason: used ? null : 'remote_used_amount_unknown',
+    used_amount: used.amount,
+    used_amount_source: used.source,
+    remote_account_id: remoteId,
+    reason: null,
+    detail: null,
   };
 }
 
@@ -144,6 +159,36 @@ export function createDiscardUsage({
     }
     return { remote: null, lookupError: null };
   }
+
+  /**
+   * 取一个远端账号的累计已用额度。
+   *
+   * **必须显式查 /stats 接口**：账号对象（无论来自列表还是单账号接口）通常不含费用字段，
+   * 累计消费在 `/api/v1/admin/accounts/{id}/stats?days=N` 的 summary.total_cost 里。
+   * 这里与「主号池预估剩余余额」用完全相同的手法：拉 stats → 合并成 usage_stats →
+   * 再交给 client.accountUsedAmount() 按同一张候选表取值。
+   * 少了这一步会一律得到「远端未提供用量字段」。
+   */
+  async function fetchUsedAmount(api, remote) {
+    const pick = (account) => (api.accountUsedAmount ? api.accountUsedAmount(account) : null);
+
+    // 少数账号对象可能自带用量字段，命中就不必再打一次统计接口
+    const direct = pick(remote);
+    if (direct) return { used: direct };
+
+    if (typeof api.getAccountStats !== 'function' || remote?.id == null) return { used: null };
+
+    try {
+      const payload = await api.getAccountStats(remote.id, 90);
+      const stats = payload?.data && typeof payload.data === 'object' ? payload.data : payload;
+      // 与「主号池预估剩余余额」完全一致：合并成 usage_stats 后再走同一张候选表
+      return { used: pick({ ...remote, usage_stats: stats }) };
+    } catch (error) {
+      // 统计接口失败不阻断：没合并到就是没取到，按「远端未提供用量字段」归类
+      logger?.debug?.({ remoteId: remote.id, err: error.message }, 'discard usage: getAccountStats failed');
+      return { used: null };
+    }
+  }
   /** 需要同步的废弃号：显式 ids，或按陈旧度/force 筛全部废弃号。 */
   function selectTargets({ ids = null, force = false } = {}) {
     if (Array.isArray(ids) && ids.length > 0) {
@@ -208,25 +253,20 @@ export function createDiscardUsage({
           // 单个账号的任何异常都不能中断整批：否则一条坏数据会让用户看到「全部失败」
           try {
             const { remote, lookupError } = await resolveTargetRemote(api, row);
-            const resolved = resolveDiscardUsage(row, remote, (account) => api.accountUsedAmount(account));
+            // 远端已定位到才需要查统计接口；没定位到直接归类
+            const used = remote ? (await fetchUsedAmount(api, remote)).used : null;
+            const resolved = classifyDiscardUsage({ row, remote, used, lookupError });
 
-            if (resolved.reason) {
-              // 远端确实存在但没给用量字段 → 保持原 reason；
-              // 「查不到」只在解析过程真的出错时才归为查询失败，并带上原始原因
-              const reason =
-                resolved.reason === 'remote_account_not_found' && lookupError ? 'fetch_failed' : resolved.reason;
-              return { row, resolved: { ...resolved, reason, detail: lookupError ?? null }, written: false };
-            }
+            if (resolved.reason) return { row, resolved, written: false };
 
-            const used = {
+            const at = writeSnapshot(row.id, {
               used_amount: resolved.used_amount,
               used_amount_source: resolved.used_amount_source,
-            };
-            const at = writeSnapshot(row.id, used);
+            });
             if (!quiet) {
               recordEvent(row.id, 'discard_usage_synced', {
-                used_amount: used.used_amount,
-                source: used.used_amount_source,
+                used_amount: resolved.used_amount,
+                source: resolved.used_amount_source,
                 remote_id: resolved.remote_account_id,
               });
             }

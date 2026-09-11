@@ -42,13 +42,18 @@ function seed(db) {
 }
 
 const remoteAccounts = [
-  { id: 101, credentials: { email: 'joined@test.local' }, used_amount: 12.5 },
+  // 真实 sub2api 的账号对象不含累计消费，费用只在 /stats 的 summary.total_cost 里，
+  // 因此这里刻意不给 used_amount —— 任何忘记查 stats 的实现都会拿不到值
+  { id: 101, credentials: { email: 'joined@test.local' } },
   // 103 故意不存在：模拟远端账号已被删除
   // 2 号从未上传，也没有远端账号
 ];
 
+/** 远端账号 id → /stats 返回的累计费用（-1 表示统计接口也查不到） */
+const remoteStats = { 101: { summary: { total_cost: 12.5 } } };
+
 /**
- * 假客户端：只实现「按需解析」所需的两个方法。
+ * 假客户端：与真实 createSub2apiClient 保持同样的能力与响应形状。
  *
  * **刻意让 listAllOpenAiAccounts 抛错** —— 早期实现依赖它建全量 email 索引，
  * 在账号量大的实例上会翻几十页后撞上 120s 超时，表现为「所有账号都失败」。
@@ -67,11 +72,18 @@ function fakeSub2apiClient(overrides = {}) {
       if (!hit) throw new Error('sub2api 返回 HTTP 404：账号不存在');
       return { data: hit };
     },
+    getAccountStats: async (id) => {
+      const stats = remoteStats[String(id)];
+      if (!stats) throw new Error('sub2api 返回 HTTP 404：统计数据不存在');
+      return { data: stats };
+    },
     findAccountByEmail: async (email) => byEmail.get(String(email).toLowerCase()) ?? null,
     accountEmail: (account) => account?.credentials?.email || null,
     accountUsedAmount: (account) => {
-      const amount = Number(account?.used_amount);
-      return Number.isFinite(amount) && amount >= 0 ? { amount, source: 'used_amount' } : null;
+      const amount = Number(account?.usage_stats?.summary?.total_cost);
+      return Number.isFinite(amount) && amount >= 0
+        ? { amount, source: 'usage_stats.summary.total_cost' }
+        : null;
     },
     ...overrides,
   };
@@ -192,7 +204,8 @@ test('同步端点：分类统计（更新 / 远端无此号 / 未关联）并�
     .prepare('SELECT discard_used_amount, discard_used_amount_at, discard_used_amount_source FROM accounts WHERE id=1')
     .get();
   assert.equal(updated.discard_used_amount, 12.5);
-  assert.equal(updated.discard_used_amount_source, 'used_amount');
+  // 来源要记成实际取值字段：账号对象没有费用字段，值来自统计接口
+  assert.equal(updated.discard_used_amount_source, 'usage_stats.summary.total_cost');
   assert.ok(Date.parse(updated.discard_used_amount_at) > Date.parse(OLD_SYNC_AT));
 
   // 未取到用量的号不应被写成 0
@@ -292,8 +305,9 @@ test('同步端点：查询异常归为查询失败并带上具体原因', async
 test('同步端点：远端存在但没用用量字段 → remote_used_amount_unknown', async (t) => {
   const { app } = await setup(t);
   app.sub2apiClient = fakeSub2apiClient({
-    // 有账号记录，但没有任何用量字段
+    // 有账号记录，统计接口也答得上，但两边都没有累计消费字段
     getAccount: async (id) => ({ data: { id: Number(id), credentials: { email: 'joined@test.local' } } }),
+    getAccountStats: async () => ({ data: { summary: {} } }),
     findAccountByEmail: async () => null,
   });
 
@@ -305,7 +319,31 @@ test('同步端点：远端存在但没用用量字段 → remote_used_amount_un
   assert.equal(body.items[0].used_amount, null, '取不到用量时不能写成 0');
 });
 
-test('同步端点：未配置 sub2api 返回 422 VALIDATION 而不是 500', async (t) => {  const db = new Database(':memory:');
+test('同步端点：统计接口故障时退回账号对象自带的用量字段', async (t) => {
+  const { app } = await setup(t);
+  // 两边都要给出同一个对象，否则 id 查找失败后会回退到邮箱拿到另一份
+  const account = {
+    id: 101,
+    credentials: { email: 'joined@test.local' },
+    usage_stats: { summary: { total_cost: 7 } },
+  };
+  app.sub2apiClient = fakeSub2apiClient({
+    getAccount: async () => ({ data: account }),
+    findAccountByEmail: async () => account,
+    getAccountStats: async () => {
+      throw new Error('sub2api 请求超时（120s）');
+    },
+  });
+
+  const response = await app.inject({ method: 'POST', url: '/api/v1/accounts/discard-usage-sync', payload: { ids: [1] } });
+  const body = response.json();
+  assert.equal(body.summary.updated, 1, '统计接口失败时应退回账号对象取值');
+  assert.equal(body.items[0].used_amount, 7);
+  assert.equal(body.items[0].used_amount_source, 'usage_stats.summary.total_cost');
+});
+
+test('同步端点：未配置 sub2api 返回 422 VALIDATION 而不是 500', async (t) => {
+  const db = new Database(':memory:');
   for (const migration of listMigrations()) db.exec(migration.sql);
 
   const bare = Fastify();
