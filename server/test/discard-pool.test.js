@@ -47,14 +47,33 @@ const remoteAccounts = [
   // 2 号从未上传，也没有远端账号
 ];
 
-function fakeSub2apiClient() {
+/**
+ * 假客户端：只实现「按需解析」所需的两个方法。
+ *
+ * **刻意让 listAllOpenAiAccounts 抛错** —— 早期实现依赖它建全量 email 索引，
+ * 在账号量大的实例上会翻几十页后撞上 120s 超时，表现为「所有账号都失败」。
+ * 任何回退到全量列表的代码都会在这里立刻暴露。
+ */
+function fakeSub2apiClient(overrides = {}) {
+  const byId = new Map(remoteAccounts.map((account) => [String(account.id), account]));
+  const byEmail = new Map(remoteAccounts.map((account) => [account.credentials.email.toLowerCase(), account]));
   return {
-    listAllOpenAiAccounts: async () => remoteAccounts,
+    listAllOpenAiAccounts: async () => {
+      throw new Error('不应调用全量列表接口（会在大号池实例上超时）');
+    },
+    getAccount: async (id) => {
+      const hit = byId.get(String(id));
+      // 远端已删除 → sub2api 返回 404，客户端据此抛错
+      if (!hit) throw new Error('sub2api 返回 HTTP 404：账号不存在');
+      return { data: hit };
+    },
+    findAccountByEmail: async (email) => byEmail.get(String(email).toLowerCase()) ?? null,
     accountEmail: (account) => account?.credentials?.email || null,
     accountUsedAmount: (account) => {
       const amount = Number(account?.used_amount);
       return Number.isFinite(amount) && amount >= 0 ? { amount, source: 'used_amount' } : null;
     },
+    ...overrides,
   };
 }
 
@@ -211,8 +230,82 @@ test('同步端点：写入审计事件（便于追溯数字来源）', async (t
   assert.equal(JSON.parse(events[0].detail).used_amount, 12.5);
 });
 
-test('同步端点：未配置 sub2api 返回 422 VALIDATION 而不是 500', async (t) => {
-  const db = new Database(':memory:');
+test('同步端点：不调用全量账号列表，只按目标账号解析（回归：大号池超时）', async (t) => {
+  const calls = { getAccount: 0, byEmail: 0 };
+  const { app } = await setup(t);
+  // 换成一个会记账的客户端：fakeSub2apiClient 的 listAllOpenAiAccounts 本来就会抛错
+  const counting = fakeSub2apiClient({
+    getAccount: async (id) => {
+      calls.getAccount += 1;
+      const hit = remoteAccounts.find((account) => String(account.id) === String(id));
+      if (!hit) throw new Error('sub2api 返回 HTTP 404：账号不存在');
+      return { data: hit };
+    },
+    findAccountByEmail: async (email) => {
+      calls.byEmail += 1;
+      return remoteAccounts.find((account) => account.credentials.email.toLowerCase() === String(email).toLowerCase()) ?? null;
+    },
+  });
+  app.sub2apiClient = counting;
+
+  const response = await app.inject({
+    method: 'POST',
+    url: '/api/v1/accounts/discard-usage-sync',
+    payload: { force: true },
+  });
+  assert.equal(response.statusCode, 200, '整批不应因为一条记录失败而 5xx');
+
+  // 1 号有 sub2api_account_id → 走单账号接口，不需要邮箱查找
+  // 3 号关联 id 已失效 → 单账号接口 404 后回退邮箱查找
+  // 2 号没有关联 → 直接邮箱查找
+  assert.equal(calls.getAccount, 2, `getAccount 调用次数应等于「有远端 id 的账号数」，实际 ${calls.getAccount}`);
+  assert.equal(calls.byEmail, 2, `邮箱查找只用于没有命中 id 的账号，实际 ${calls.byEmail}`);
+});
+
+test('同步端点：查询异常归为查询失败并带上具体原因', async (t) => {
+  const { app } = await setup(t);
+  app.sub2apiClient = fakeSub2apiClient({
+    getAccount: async () => {
+      throw new Error('sub2api 请求超时（120s）');
+    },
+    findAccountByEmail: async () => {
+      throw new Error('sub2api 请求超时（120s）');
+    },
+  });
+
+  const response = await app.inject({ method: 'POST', url: '/api/v1/accounts/discard-usage-sync', payload: { force: true } });
+  assert.equal(response.statusCode, 200);
+  const body = response.json();
+
+  // 2 号从未上传 → not_linked（确定事实，与「查询失败」区分开）
+  assert.equal(body.summary.not_linked, 1);
+  // 1、3 号查询异常 → fetch_failed
+  assert.equal(body.summary.fetch_failed, 2);
+  assert.equal(body.summary.updated, 0);
+
+  const failedItem = body.items.find((item) => item.id === 1);
+  assert.equal(failedItem.reason, 'fetch_failed');
+  assert.match(failedItem.detail, /超时/, '失败明细要带上服务端原因，便于区分连接问题与账号不存在');
+  assert.equal(failedItem.ok, false);
+});
+
+test('同步端点：远端存在但没用用量字段 → remote_used_amount_unknown', async (t) => {
+  const { app } = await setup(t);
+  app.sub2apiClient = fakeSub2apiClient({
+    // 有账号记录，但没有任何用量字段
+    getAccount: async (id) => ({ data: { id: Number(id), credentials: { email: 'joined@test.local' } } }),
+    findAccountByEmail: async () => null,
+  });
+
+  const response = await app.inject({ method: 'POST', url: '/api/v1/accounts/discard-usage-sync', payload: { ids: [1] } });
+  const body = response.json();
+  assert.equal(body.summary.remote_used_amount_unknown, 1);
+  assert.equal(body.items[0].reason, 'remote_used_amount_unknown');
+  assert.equal(body.items[0].remote_account_id, 101, '仍要带回远端 id 便于排查');
+  assert.equal(body.items[0].used_amount, null, '取不到用量时不能写成 0');
+});
+
+test('同步端点：未配置 sub2api 返回 422 VALIDATION 而不是 500', async (t) => {  const db = new Database(':memory:');
   for (const migration of listMigrations()) db.exec(migration.sql);
 
   const bare = Fastify();

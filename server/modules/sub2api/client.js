@@ -87,6 +87,31 @@ export function createSub2apiClient(getConfig) {
     return accounts;
   }
 
+  /**
+   * 按邮箱查找单个远端账号。
+   *
+   * 与 listAllOpenAiAccounts 的区别：这里按页扫描并在命中时**立即返回**，
+   * 不会把远端全部账号拉完。上限 maxAccounts 兜住最坏情况（邮箱不存在时），
+   * 一旦超过就当作「找不到」而不是继续翻页——
+   * 否则在账号量大的实例上会退化成全量遍历并撞上请求超时。
+   */
+  async function findAccountByEmail(email, { maxAccounts = 2000, configOverride = null } = {}) {
+    const target = String(email || '').trim().toLowerCase();
+    if (!target) return null;
+    const pageSize = 100;
+    const maxPages = Math.max(1, Math.ceil(maxAccounts / pageSize));
+    for (let page = 1; page <= maxPages; page += 1) {
+      const query = new URLSearchParams({ page: String(page), page_size: String(pageSize), platform: 'openai' });
+      const payload = await request(`/api/v1/admin/accounts?${query}`, {}, configOverride);
+      const data = payload?.data && typeof payload.data === 'object' ? payload.data : payload;
+      const items = Array.isArray(data?.items) ? data.items : Array.isArray(data) ? data : [];
+      const hit = items.find((account) => accountEmail(account) === target);
+      if (hit) return hit;
+      if (items.length < pageSize) return null;
+    }
+    return null;
+  }
+
   function getAccount(id) {
     return request(`/api/v1/admin/accounts/${id}`);
   }
@@ -201,6 +226,7 @@ export function createSub2apiClient(getConfig) {
     updateAccount,
     clearError,
     setSchedulable,
+    findAccountByEmail,
     accountEmail,
     accountUsedAmount,
     accountErrorMessage,

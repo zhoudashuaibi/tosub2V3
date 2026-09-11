@@ -258,15 +258,20 @@ export function DiscardPoolPage() {
               variant={staleCount > 0 ? 'default' : 'outline'}
               disabled={syncMutation.isPending}
               onClick={() => {
-                // 显式确认：逐个账号查远端用量统计，几百个号可能要数十秒
-                const scope = selection.count > 0 ? `已选的 ${selection.count} 个` : `当前筛选下待同步的 ${staleCount || total} 个`;
-                const ok = window.confirm(`将对${scope}账号查询 sub2api 用量统计（90 天），可能需要数秒。是否继续？`);
-                if (!ok) return;
-                syncMutation.mutate(
-                  selection.count > 0 && !selection.isAllMode
-                    ? { ids: selection.selectedIds, force: true }
-                    : { force: true },
+                // 有选中 → 只同步选中的；未选中 → 同步当前筛选下待同步的账号。
+                // force 只对「已选中的明确目标」使用：未选中时若全量重算，
+                // 会把早已被远端删除的老号一起重扫，结果列表里全是「远端无此号」。
+                const selected = selection.count > 0;
+                const scope = selected ? `已选的 ${selection.count} 个` : `待同步的 ${staleCount} 个`;
+                if (!selected && staleCount === 0) {
+                  toast.info('当前筛选下没有待同步的账号');
+                  return;
+                }
+                const ok = window.confirm(
+                  `将对${scope}账号逐个查询 sub2api 用量统计（90 天），可能需要数秒。是否继续？`,
                 );
+                if (!ok) return;
+                syncMutation.mutate(selected ? { ids: selection.selectedIds, force: true } : {});
               }}
             >
               {syncMutation.isPending ? '同步中…' : '同步远端用量'}
@@ -278,7 +283,8 @@ export function DiscardPoolPage() {
             </Button>
           </TooltipTrigger>
           <TooltipContent>
-            读取 sub2api 管理端账号的累计已用额度并保存快照；账号被废弃时已自动抓取过一次
+            读取 sub2api 管理端账号的累计已用额度并保存快照；账号被废弃时已自动抓取过一次。
+            默认只同步没有快照或快照超过 24 小时的账号
           </TooltipContent>
         </Tooltip>
         <RefreshButton isRefreshing={isRefreshing} onRefresh={refresh} />
@@ -519,16 +525,24 @@ function buildSyncResult(result: DiscardUsageSyncResult): BatchResult {
   const notes: string[] = [];
   const failed = result.items
     .filter((item) => item.reason)
-    .map((item) => ({
-      id: item.id,
-      label: item.email,
-      reason: DISCARD_USAGE_REASON_LABELS[item.reason as keyof typeof DISCARD_USAGE_REASON_LABELS] ?? String(item.reason),
-    }));
+    .map((item) => {
+      const label =
+        DISCARD_USAGE_REASON_LABELS[item.reason as keyof typeof DISCARD_USAGE_REASON_LABELS] ?? String(item.reason);
+      // 只有「重试可能改变结果」的原因才带 id（带 id 的项会出现在「仅重试失败项」里）：
+      // not_linked / remote_account_not_found 重试一百次也是同样结论
+      const retryable = item.reason === 'fetch_failed' || item.reason === 'remote_used_amount_unknown';
+      return {
+        id: retryable ? item.id : undefined,
+        label: item.email,
+        // 查询失败时带上服务端返回的具体原因，便于区分「远端没有」与「sub2api 连不上」
+        reason: item.detail ? `${label}：${item.detail}` : label,
+      };
+    });
 
   if (summary.not_linked) notes.push(`${summary.not_linked} 个账号从未上传 sub2api，无远端用量可查`);
   if (summary.remote_account_not_found) notes.push(`${summary.remote_account_not_found} 个账号在 sub2api 中已不存在`);
   if (summary.remote_used_amount_unknown) notes.push(`${summary.remote_used_amount_unknown} 个账号远端未提供用量字段`);
-  if (summary.failed) notes.push(`${summary.failed} 个账号查询失败`);
+  if (summary.fetch_failed) notes.push(`${summary.fetch_failed} 个账号查询 sub2api 失败（详情见下方失败列表）`);
 
   return {
     action: '同步远端已用额度',

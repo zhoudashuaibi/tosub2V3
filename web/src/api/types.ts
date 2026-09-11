@@ -134,7 +134,11 @@ export interface DiscardAccount {
 }
 
 /** 废弃池用量同步的分类结果（reason 词表与主池预估保持一致） */
-export type DiscardUsageReason = 'not_linked' | 'remote_account_not_found' | 'remote_used_amount_unknown';
+export type DiscardUsageReason =
+  | 'not_linked'
+  | 'remote_account_not_found'
+  | 'remote_used_amount_unknown'
+  | 'fetch_failed';
 
 export interface DiscardUsageItem {
   id: number;
@@ -144,6 +148,8 @@ export interface DiscardUsageItem {
   used_amount_at: string | null;
   remote_account_id: number | null;
   reason: DiscardUsageReason | null;
+  /** 失败的具体原因（仅查询失败时有值）：用于区分「账号不在远端」与「sub2api 连不上」 */
+  detail: string | null;
   ok: boolean;
 }
 
@@ -155,6 +161,7 @@ export interface DiscardUsageSyncResult {
     not_linked: number;
     remote_account_not_found: number;
     remote_used_amount_unknown: number;
+    fetch_failed: number;
     failed: number;
   };
   items: DiscardUsageItem[];
@@ -495,6 +502,7 @@ export const DISCARD_USAGE_REASON_LABELS: Record<DiscardUsageReason, string> = {
   not_linked: '未上传 sub2api',
   remote_account_not_found: 'sub2api 中已无此账号',
   remote_used_amount_unknown: 'sub2api 未提供用量字段',
+  fetch_failed: '查询 sub2api 失败',
 };
 
 export const STAGE_LABELS: Record<string, string> = {

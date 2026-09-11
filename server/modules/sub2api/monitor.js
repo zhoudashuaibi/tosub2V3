@@ -384,6 +384,11 @@ export function createMonitor({ db, crypto, client, getConfig, pools, engine, up
       logger.debug({ accountId: local.id }, `monitor discard skipped: ${error.message}`);
       return;
     }
+    // 废弃当下的用量快照：sub2api 不提供历史时点查询，错过此刻就只剩「当前累计」值。
+    // 这里与手动废弃走同一条 best-effort 通道（不 await、不阻塞巡检）。
+    if (typeof globalThis.__tosub2DiscardUsage?.snapshotAfterDiscard === 'function') {
+      void globalThis.__tosub2DiscardUsage.snapshotAfterDiscard(local.id);
+    }
     if (monitor.pause_on_discard !== false && Number.isInteger(Number(remote?.id))) {
       try {
         await client.setSchedulable(Number(remote.id), false);

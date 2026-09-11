@@ -171,6 +171,9 @@ export function createAccountsModule({ engine, logger }) {
     const pools = createPools(db, crypto);
     // 废弃号用量快照：sub2api 模块可能晚于本模块注册，用 getClient 惰性取
     const discardUsage = createDiscardUsage({ db, getClient: () => app.sub2apiClient, logger });
+    // 让 sub2api 监控的自动废弃路径也能复用同一条快照通道
+    // （monitor 在 sub2api 模块里创建、本模块更早注册，因此用全局引用反向传递）
+    globalThis.__tosub2DiscardUsage = discardUsage;
     const mailInit = createMailInit({
       db,
       decryptCredentials: (account) => crypto.tryDecryptJson(account.credentials_enc, 'accounts.credentials_enc'),
