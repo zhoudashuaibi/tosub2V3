@@ -110,14 +110,18 @@ export function classifyDiscardUsage({ row, remote, used, lookupError = null }) 
  *   - 没有 ID → 才走邮箱查找，且带条数上限
  * 请求量只与实际要同步的账号数成正比，与远端总量无关。
  *
- * @param {{ db: object, client?: object, getClient?: () => object, logger?: object }} deps
+ * @param {{ db: object, client?: object, getClient?: () => object, logger?: object,
+ *           buildFilterWhere?: (query: object) => { where: string, params: any[] } }} deps
  *   client 与 getClient 二选一：getClient 用于「sub2api 模块晚于本模块注册」的场景。
+ *   buildFilterWhere：账号模块注入的列表筛选器（buildAccountFilters），
+ *   让「未选中时同步当前筛选」与列表/徽章口径完全一致。
  */
 export function createDiscardUsage({
   db,
   client = null,
   getClient = null,
   logger = null,
+  buildFilterWhere = null,
   /** 走邮箱查找时最多查几个远端账号（超过即判定找不到，避免退化成全量遍历） */
   emailLookupMaxAccounts = 2000,
 }) {
@@ -189,17 +193,34 @@ export function createDiscardUsage({
       return { used: null };
     }
   }
-  /** 需要同步的废弃号：显式 ids，或按陈旧度/force 筛全部废弃号。 */
-  function selectTargets({ ids = null, force = false } = {}) {
+  /**
+   * 需要同步的废弃号：显式 ids，或按当前筛选/陈旧度筛全部废弃号。
+   *
+   * @param {object} options
+   * @param {number[]|null} options.ids 明确目标（选中项），给了就只同步这些
+   * @param {boolean} options.force 忽略快照新旧全量重算
+   * @param {object|null} options.filters 当前列表筛选（q / reason / 废弃日期区间）。
+   *   没选中的同步必须与按钮上的「待同步 N」同一口径，否则按钮写 20、实际扫全池 1498。
+   */
+  function selectTargets({ ids = null, force = false, filters = null } = {}) {
     if (Array.isArray(ids) && ids.length > 0) {
       const placeholders = ids.map(() => '?').join(',');
       return db
         .prepare(`SELECT id, email, sub2api_account_id, discard_used_amount_at FROM accounts WHERE pool='discard' AND id IN (${placeholders}) ORDER BY id`)
         .all(...ids);
     }
-    const rows = db
-      .prepare(`SELECT id, email, sub2api_account_id, discard_used_amount_at FROM accounts WHERE pool='discard' ORDER BY id`)
-      .all();
+    // 筛选条件由账号模块注入（与列表 buildAccountFilters 完全同源），保证「徽章数字 =
+    // 同步范围」；没有注入器时退化为全池，保持旧行为。
+    const scoped = typeof buildFilterWhere === 'function' && filters ? buildFilterWhere(filters) : null;
+    const rows = scoped
+      ? db
+          .prepare(
+            `SELECT id, email, sub2api_account_id, discard_used_amount_at FROM accounts ${scoped.where} ORDER BY id`,
+          )
+          .all(...scoped.params)
+      : db
+          .prepare(`SELECT id, email, sub2api_account_id, discard_used_amount_at FROM accounts WHERE pool='discard' ORDER BY id`)
+          .all();
     if (force) return rows;
     // 默认只补没快照或快照过期的：一次几百个远端请求代价高，不能每次点都全量跑
     return rows.filter((row) => isStale(row.discard_used_amount_at));
@@ -225,10 +246,11 @@ export function createDiscardUsage({
 
   /**
    * 同步废弃号用量。
-   * @param {{ ids?: number[]|null, force?: boolean, concurrency?: number, quiet?: boolean }} options
+   * @param {{ ids?: number[]|null, force?: boolean, filters?: object|null,
+   *           concurrency?: number, quiet?: boolean }} options
    *   quiet=true 时不写审计事件（用于废弃当下的自动快照，避免与 moved_to_discard 事件重复）
    */
-  async function sync({ ids = null, force = false, concurrency = 6, quiet = false } = {}) {
+  async function sync({ ids = null, force = false, filters = null, concurrency = 6, quiet = false } = {}) {
     const summary = {
       scanned: 0,
       updated: 0,
@@ -240,7 +262,7 @@ export function createDiscardUsage({
     };
     const items = [];
 
-    const targets = selectTargets({ ids, force });
+    const targets = selectTargets({ ids, force, filters });
     summary.scanned = targets.length;
     if (targets.length === 0) return { summary, items };
 

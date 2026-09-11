@@ -378,12 +378,138 @@ test('同步端点：ids 超过 500 条被 schema 拒绝', async (t) => {
   assert.equal(response.json().error.code, 'VALIDATION');
 });
 
+test('同步端点：未选中时按当前筛选收敛范围（与「待同步 N」同口径）', async (t) => {
+  const { app } = await setup(t);
+
+  // 日期窗口不覆盖任何记录 → 一个都不扫（旧行为会把全池 3 个都拉一遍远端）
+  const empty = await app.inject({
+    method: 'POST',
+    url: '/api/v1/accounts/discard-usage-sync',
+    payload: {
+      filters: { discarded_from: '2026-09-06T00:00:00.000Z', discarded_to: '2026-09-07T00:00:00.000Z' },
+    },
+  });
+  assert.equal(empty.statusCode, 200);
+  assert.equal(empty.json().summary.scanned, 0);
+  assert.deepEqual(empty.json().items, []);
+});
+
+test('同步端点：筛选窗口内仍按陈旧度跳过新鲜快照', async (t) => {
+  const { app } = await setup(t);
+
+  // 窗口覆盖三条：1 号旧快照、2 号无快照 → 待同步；3 号快照新鲜 → 跳过
+  const inDay = await app.inject({
+    method: 'POST',
+    url: '/api/v1/accounts/discard-usage-sync',
+    payload: {
+      filters: { discarded_from: '2026-09-05T00:00:00.000Z', discarded_to: '2026-09-06T00:00:00.000Z' },
+    },
+  });
+  assert.equal(inDay.json().summary.scanned, 2, '新鲜的 3 号不该被重扫');
+  assert.deepEqual(
+    inDay.json().items.map((item) => item.id),
+    [1, 2],
+  );
+
+  // 不带 filters 时保持旧行为：全池待同步（同样只有 1、2）
+  const noFilter = await app.inject({
+    method: 'POST',
+    url: '/api/v1/accounts/discard-usage-sync',
+    payload: {},
+  });
+  assert.equal(noFilter.json().summary.scanned, 1, '1 号已被上一批刷新成新鲜快照');
+});
+
+test('同步端点：搜索词与原因同样收敛范围，且与列表口径一致', async (t) => {
+  const { app } = await setup(t);
+
+  const searched = await app.inject({
+    method: 'POST',
+    url: '/api/v1/accounts/discard-usage-sync',
+    payload: { filters: { q: 'joined' } },
+  });
+  assert.equal(searched.json().summary.scanned, 1);
+  assert.equal(searched.json().items[0].id, 1);
+  assert.equal(searched.json().items[0].used_amount, 12.5);
+  assert.equal(searched.json().items[0].used_amount_source, 'usage_stats.summary.total_cost');
+
+  // 原因筛选同理：只有 2 号是 login_failed，且它没有远端账号
+  const byReason = await app.inject({
+    method: 'POST',
+    url: '/api/v1/accounts/discard-usage-sync',
+    payload: { filters: { reason: 'login_failed' } },
+  });
+  assert.equal(byReason.json().summary.scanned, 1);
+  assert.equal(byReason.json().items[0].id, 2);
+  assert.equal(byReason.json().items[0].reason, 'not_linked');
+});
+
+test('同步端点：显式 ids 优先于 filters，选中项就是范围', async (t) => {
+  const { app, db } = await setup(t);
+
+  const response = await app.inject({
+    method: 'POST',
+    url: '/api/v1/accounts/discard-usage-sync',
+    payload: {
+      ids: [2],
+      // 该筛选指向 1 号；给了 ids 就该忽略它，否则会把 1 号也刷了
+      filters: { q: 'joined' },
+    },
+  });
+  assert.equal(response.json().summary.scanned, 1);
+  assert.equal(response.json().items[0].id, 2);
+  const untouched = db.prepare('SELECT discard_used_amount_at FROM accounts WHERE id=1').get();
+  assert.equal(untouched.discard_used_amount_at, OLD_SYNC_AT);
+});
+
 test('统计：已用额度合计 / 已知数 / 待同步数', async (t) => {
   const { app } = await setup(t);
   const body = await listDiscard(app);
   assert.equal(body.stats.used_amount_total, 4.75);
   assert.equal(body.stats.used_amount_known, 2);
   assert.equal(body.stats.used_amount_stale, 2, '1 号旧快照 + 2 号无快照');
+});
+
+test('统计：徽章与额度合计跟随搜索词/废弃日期，但不被 reason 自身清零', async (t) => {
+  const { app } = await setup(t);
+
+  // 日期窗口覆盖三条记录 → 与全量口径一致
+  const inDay = await listDiscard(
+    app,
+    'discarded_from=2026-09-05T00:00:00.000Z&discarded_to=2026-09-06T00:00:00.000Z',
+  );
+  assert.equal(inDay.total, 3);
+  assert.equal(inDay.stats.banned_401, 1);
+  assert.equal(inDay.stats.login_failed, 1);
+  assert.equal(inDay.stats.manual, 1);
+  assert.equal(inDay.stats.used_amount_total, 4.75);
+  assert.equal(inDay.stats.used_amount_known, 2);
+
+  // 别的日期：徽章必须跟着归零，而不是继续显示全库总量
+  const otherDay = await listDiscard(
+    app,
+    'discarded_from=2026-09-06T00:00:00.000Z&discarded_to=2026-09-07T00:00:00.000Z',
+  );
+  assert.equal(otherDay.total, 0);
+  assert.equal(otherDay.stats.banned_401 ?? 0, 0);
+  assert.equal(otherDay.stats.login_failed ?? 0, 0);
+  assert.equal(otherDay.stats.used_amount_total, 0);
+  assert.equal(otherDay.stats.used_amount_known ?? 0, 0);
+  assert.equal(otherDay.stats.used_amount_stale ?? 0, 0);
+
+  // 搜索词同样作用于统计
+  const searched = await listDiscard(app, 'q=fresh');
+  assert.equal(searched.stats.manual, 1);
+  assert.equal(searched.stats.banned_401 ?? 0, 0);
+  assert.equal(searched.stats.used_amount_total, 1.25);
+
+  // reason 是分面维度自身：选中某个原因后，其它徽章仍要给出可切换的数量
+  const byReason = await listDiscard(app, 'reason=banned_401');
+  assert.equal(byReason.total, 1);
+  assert.equal(byReason.stats.banned_401, 1);
+  assert.equal(byReason.stats.login_failed, 1, '其它原因徽章不能被清成 0，否则再也切不回去');
+  assert.equal(byReason.stats.manual, 1);
+  assert.equal(byReason.stats.used_amount_total, 4.75, '额度合计不属于 reason 维度，仍按日期+搜索口径');
 });
 
 test('批量移回主号池：一次请求处理多条，跳过不在废弃池的 id', async (t) => {

@@ -124,10 +124,14 @@ export const accountsApi = {
   // ---------- 废弃池「已用额度」 ----------
   /**
    * 从 sub2api 拉取废弃号的累计已用额度并落库。
-   * 省略 ids 时按筛选/陈旧度同步；force=true 全量重算。
+   *  - 给了 ids：只同步这些账号（选中项）；
+   *  - 只给 filters：同步当前筛选下待同步的账号（与按钮上的「待同步 N」同一口径）；
+   *  - 都不给：全池待同步。
+   * force=true 时忽略快照新旧全量重算。
    */
-  syncDiscardUsage: (body: { ids?: number[]; force?: boolean } = {}) =>
-    api<DiscardUsageSyncResult>('/accounts/discard-usage-sync', { json: body }),
+  syncDiscardUsage: (
+    body: { ids?: number[]; force?: boolean; filters?: Pick<AccountFilter, 'q' | 'reason' | 'discarded_from' | 'discarded_to'> } = {},
+  ) => api<DiscardUsageSyncResult>('/accounts/discard-usage-sync', { json: body }),
 
   /** 导出（GET 下载，带 Cookie） */
   exportUrl: (params: { ids?: number[]; pool?: Pool; format: AccountExportFormat }) =>

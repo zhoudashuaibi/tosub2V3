@@ -21,7 +21,7 @@ import { ListShell, ListToolbar, ToolbarChip, ToolbarSearch, ToolbarSpacer, Refr
 import { useListUrlState, useSearchParam } from '@/hooks/use-list-url-state';
 import { useLiveList } from '@/hooks/use-live-list';
 import { useRowSelection } from '@/hooks/use-row-selection';
-import { runChunked } from '@/lib/batch';
+import { batchCount, runChunked } from '@/lib/batch';
 import { formatRelativeTime, formatDateTime } from '@/lib/utils';
 
 const REASON_LABELS: Record<string, string> = {
@@ -145,9 +145,20 @@ export function DiscardPoolPage() {
     onError: (error) => toast.error(errorMessage(error)),
   });
 
-  /** 同步 sub2api 用量：有选中只同步选中，否则按当前筛选的全部待同步项 */
+  /** 同步 sub2api 用量：有选中只同步选中，否则同步当前筛选下待同步的账号 */
   const syncMutation = useMutation({
-    mutationFn: (vars: { ids?: number[]; force?: boolean }) => accountsApi.syncDiscardUsage(vars),
+    // 服务端 ids 上限 500（maxItems）。「选中全部 N 条」可能几千个，一次提交会被
+    // 422 校验挡下（表现为「多选不能同步」，只剩不选中的全量路径可用），故按批提交并合并结果。
+    mutationFn: (vars: {
+      ids?: number[];
+      force?: boolean;
+      filters?: { q?: string; reason?: string; discarded_from?: string; discarded_to?: string };
+    }) =>
+      vars.ids?.length
+        ? runChunked(vars.ids, 'accounts.discardUsageSync', (chunk) =>
+            accountsApi.syncDiscardUsage({ ids: chunk, force: vars.force }),
+          )
+        : accountsApi.syncDiscardUsage(vars),
     onSuccess: (result: DiscardUsageSyncResult) => {
       setBatchResult(buildSyncResult(result));
       invalidate();
@@ -166,6 +177,19 @@ export function DiscardPoolPage() {
       sort: sort ? `${sort.key}:${sort.dir}` : undefined,
     }),
     [values.q, reason, discardedRange, sort],
+  );
+
+  /**
+   * 未选中时同步的范围＝当前列表筛选（q / 原因 / 废弃日期窗口）。
+   * 必须与徽章、按钮上那个「待同步 N」同一口径，否则按钮写 20、实际扫全池 1498。
+   */
+  const syncFilters = useMemo(
+    () => ({
+      q: String(values.q || '') || undefined,
+      reason: reason || undefined,
+      ...discardedRange,
+    }),
+    [values.q, reason, discardedRange],
   );
 
   /** 「选中全部 N 条」：批量接口只收 id，先取回全部 id 再按接口上限分片提交 */
@@ -263,15 +287,19 @@ export function DiscardPoolPage() {
                 // 会把早已被远端删除的老号一起重扫，结果列表里全是「远端无此号」。
                 const selected = selection.count > 0;
                 const scope = selected ? `已选的 ${selection.count} 个` : `待同步的 ${staleCount} 个`;
+                // 选中量超过单批上限时后端要分几批（提示用，实际分片在 mutationFn 里做）
+                const batches = selected ? batchCount(selection.selectedIds, 'accounts.discardUsageSync') : 1;
                 if (!selected && staleCount === 0) {
                   toast.info('当前筛选下没有待同步的账号');
                   return;
                 }
                 const ok = window.confirm(
-                  `将对${scope}账号逐个查询 sub2api 用量统计（90 天），可能需要数秒。是否继续？`,
+                  `将对${scope}账号逐个查询 sub2api 用量统计（90 天），可能需要数秒${
+                    batches > 1 ? `，共分 ${batches} 批提交` : ''
+                  }。是否继续？`,
                 );
                 if (!ok) return;
-                syncMutation.mutate(selected ? { ids: selection.selectedIds, force: true } : {});
+                syncMutation.mutate(selected ? { ids: selection.selectedIds, force: true } : { filters: syncFilters });
               }}
             >
               {syncMutation.isPending ? '同步中…' : '同步远端用量'}

@@ -169,8 +169,15 @@ export function createAccountsModule({ engine, logger }) {
     const db = app.db;
     const crypto = app.crypto;
     const pools = createPools(db, crypto);
-    // 废弃号用量快照：sub2api 模块可能晚于本模块注册，用 getClient 惰性取
-    const discardUsage = createDiscardUsage({ db, getClient: () => app.sub2apiClient, logger });
+    // 废弃号用量快照：sub2api 模块可能晚于本模块注册，用 getClient 惰性取。
+    // buildFilterWhere 注入列表筛选器（buildAccountFilters），使「未选中时同步当前筛选」
+    // 与列表/徽章同一口径 —— 传进来的 query 里没有 pool，这里固定补成 discard。
+    const discardUsage = createDiscardUsage({
+      db,
+      getClient: () => app.sub2apiClient,
+      logger,
+      buildFilterWhere: (query) => buildAccountFilters({ ...query, pool: 'discard' }),
+    });
     // 让 sub2api 监控的自动废弃路径也能复用同一条快照通道
     // （monitor 在 sub2api 模块里创建、本模块更早注册，因此用全局引用反向传递）
     globalThis.__tosub2DiscardUsage = discardUsage;
@@ -403,7 +410,7 @@ export function createAccountsModule({ engine, logger }) {
         total,
         page,
         page_size: pageSize,
-        stats: poolStats(pool),
+        stats: poolStats(pool, request.query),
       };
     });
 
@@ -466,7 +473,13 @@ export function createAccountsModule({ engine, logger }) {
       };
     }
 
-    function poolStats(pool) {
+    /**
+     * 各池徽章/汇总统计。
+     * @param {string} pool
+     * @param {object} [query] 列表接口的原始查询参数：discard 池的统计会跟随其中的
+     *   搜索词与废弃日期（但剔除 reason 维度自身），使徽章数字与当前列表口径一致。
+     */
+    function poolStats(pool, query = {}) {
       if (pool === 'reserve') {
         const rows = db
           .prepare(
@@ -509,9 +522,14 @@ export function createAccountsModule({ engine, logger }) {
         stats.uploaded = Number(aggregate.uploaded || 0);
         return stats;
       }
+      // 统计口径跟随当前筛选（搜索词 + 废弃日期 + 其它非分面条件），否则用户筛了日期，
+      // 徽章仍显示全库总量，看起来就是「今天没那么多，为什么写 845」。
+      // 唯一剔除的是「原因」维度自身：把 reason 也算进去的话，选中某个原因后其它徽章
+      // 全部变 0，用户就再也切不到别的原因了（分面统计的标准做法）。
+      const { where, params } = buildAccountFilters({ ...query, reason: undefined });
       const rows = db
-        .prepare(`SELECT discard_reason, COUNT(*) AS n FROM accounts WHERE pool='discard' GROUP BY discard_reason`)
-        .all();
+        .prepare(`SELECT discard_reason, COUNT(*) AS n FROM accounts ${where} GROUP BY discard_reason`)
+        .all(...params);
       const stats = {};
       for (const row of rows) stats[row.discard_reason || 'manual'] = row.n;
       // 已用额度汇总：已知用量的号参与求和、未知单独计数（口径同备用池 total_balance/with_balance）。
@@ -522,9 +540,9 @@ export function createAccountsModule({ engine, logger }) {
           `SELECT COALESCE(SUM(discard_used_amount),0) AS used_amount_total,
                   SUM(CASE WHEN discard_used_amount IS NOT NULL THEN 1 ELSE 0 END) AS used_amount_known,
                   SUM(CASE WHEN discard_used_amount_at IS NULL OR discard_used_amount_at < ? THEN 1 ELSE 0 END) AS used_amount_stale
-             FROM accounts WHERE pool='discard'`,
+             FROM accounts ${where}`,
         )
-        .get(cutoff);
+        .get(cutoff, ...params);
       stats.used_amount_total = Number(usage.used_amount_total || 0);
       stats.used_amount_known = Number(usage.used_amount_known || 0);
       stats.used_amount_stale = Number(usage.used_amount_stale || 0);
@@ -1413,8 +1431,11 @@ export function createAccountsModule({ engine, logger }) {
     }
 
     /**
-     * 同步废弃池「已用额度」。默认只补没有快照或快照过期（>24h）的号；
-     * force=true 时全量重算。逐个查询远端用量统计，故需要显式触发。
+     * 同步废弃池「已用额度」。
+     * 三种范围：给 ids → 只同步这些；不给 ids 但给 filters → 只同步当前筛选下待同步的
+     * （按钮上的「待同步 N」就是这个数）；两者都没有 → 全池待同步项。
+     * 默认只补没有快照或快照过期（>24h）的号；force=true 时忽略新旧全量重算。
+     * 逐个查询远端用量统计，故需要显式触发。
      */
     app.post(
       '/api/v1/accounts/discard-usage-sync',
@@ -1426,6 +1447,17 @@ export function createAccountsModule({ engine, logger }) {
             properties: {
               ids: { type: 'array', items: { type: 'integer' }, maxItems: 500 },
               force: { type: 'boolean' },
+              // 当前列表筛选：与 buildAccountFilters 同字段（pool 由服务端固定为 discard）
+              filters: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  q: { type: 'string', maxLength: 200 },
+                  reason: { type: 'string', maxLength: 40 },
+                  discarded_from: { type: 'string', maxLength: 40 },
+                  discarded_to: { type: 'string', maxLength: 40 },
+                },
+              },
             },
           },
         },
@@ -1434,8 +1466,13 @@ export function createAccountsModule({ engine, logger }) {
         if (!sub2apiConfigured()) {
           throw errors.validation('请先配置 sub2api 管理员密钥和后端地址');
         }
-        const { ids, force } = request.body ?? {};
-        const result = await discardUsage.sync({ ids: ids ?? null, force: Boolean(force) });
+        const { ids, force, filters } = request.body ?? {};
+        const result = await discardUsage.sync({
+          ids: ids ?? null,
+          force: Boolean(force),
+          // 有明确 ids 时忽略筛选：选中项就是范围
+          filters: ids?.length ? null : filters ?? null,
+        });
         return { ok: true, ...result };
       },
     );
