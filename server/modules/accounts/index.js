@@ -9,9 +9,30 @@ import { buildExportFromTokens } from '../sub2api/upload.js';
 import { createMailInit } from './mail-init.js';
 import { createBanMailCheck } from './ban-mail-check.js';
 import { sanitizeText } from '../../lib/sanitize.js';
-import { UPLOAD_ORDERS, uploadOrderExpr } from '../../lib/upload-order.js';
+import { UPLOAD_ORDERS, uploadOrderExpr, joinedMainPoolAtExpr } from '../../lib/upload-order.js';
+import { createDiscardUsage } from './discard-usage.js';
 
 const POOLS = ['reserve', 'main', 'discard'];
+
+/**
+ * 废弃池时间线派生列：
+ *  - reserve_joined_at：加入备用号池时间（与 upload-order 同口径：imported_at 优先）
+ *  - joined_main_at：「加入主号池时间」唯一口径，见 lib/upload-order.js joinedMainPoolAtExpr
+ * 两者都只依赖已有字段与审计事件，不新增数据库列。
+ */
+const DISCARD_TIMELINE_COLUMNS = `COALESCE(accounts.imported_at, accounts.created_at) AS reserve_joined_at,
+      ${joinedMainPoolAtExpr('accounts')} AS joined_main_at`;
+
+/** 废弃池「已用额度」快照超过该时长即视为待同步（UI 会高亮同步入口）。 */
+const DISCARD_USAGE_STALE_MS = 24 * 3600 * 1000;
+
+/** 无快照或快照过期 → 待同步。 */
+function isDiscardUsageStale(at) {
+  if (!at) return true;
+  const ms = Date.parse(at);
+  if (!Number.isFinite(ms)) return true;
+  return Date.now() - ms > DISCARD_USAGE_STALE_MS;
+}
 
 function initialBalanceFromSub2apiName(name) {
   const match = String(name || '').match(/---(\d+)$/);
@@ -103,7 +124,19 @@ const SORT_WHITELIST = {
     last_login_at: 'last_login_at',
     sub2api_uploaded_at: 'sub2api_uploaded_at',
   },
-  discard: { created_at: 'created_at', email: 'email', discarded_at: 'discarded_at' },
+  discard: {
+    created_at: 'created_at',
+    email: 'email',
+    discarded_at: 'discarded_at',
+    // 时间线列：SELECT 里的派生别名，SQLite 允许 ORDER BY 引用它
+    reserve_joined_at: 'reserve_joined_at',
+    joined_main_at: 'joined_main_at',
+    // 未知用量的号要沉底：ASC 下 NULL 会顶到最前。
+    // 不能用 COALESCE(v, -1) —— 该列被输出别名遮蔽，表达式里的标识符会解析成别名本身，
+    // 于是 COALESCE 永远拿到非 NULL 的别名，兜底形同虚设（实测两个方向都排在最后才失败）。
+    // 显式两段排序：先按「是否为空」分组，再按值排序，ASC/DESC 都稳定。
+    discard_used_amount: 'CASE WHEN accounts.discard_used_amount IS NULL THEN 1 ELSE 0 END, accounts.discard_used_amount',
+  },
 };
 
 export function parseDiscardedAtRange(query = {}) {
@@ -136,6 +169,8 @@ export function createAccountsModule({ engine, logger }) {
     const db = app.db;
     const crypto = app.crypto;
     const pools = createPools(db, crypto);
+    // 废弃号用量快照：sub2api 模块可能晚于本模块注册，用 getClient 惰性取
+    const discardUsage = createDiscardUsage({ db, getClient: () => app.sub2apiClient, logger });
     const mailInit = createMailInit({
       db,
       decryptCredentials: (account) => crypto.tryDecryptJson(account.credentials_enc, 'accounts.credentials_enc'),
@@ -266,31 +301,34 @@ export function createAccountsModule({ engine, logger }) {
     });
 
     // ---------------- 列表 ----------------
-    app.get('/api/v1/accounts', async (request) => {
-      const pool = String(request.query.pool || '');
+    /**
+     * 把 query 翻译成 WHERE 子句（列表、按筛选导出、按筛选全选共用同一套口径）。
+     * 放在 handler 外层：多个路由要复用，避免「列表过滤」与「导出过滤」两套实现漂移。
+     */
+    function buildAccountFilters(query) {
+      const pool = String(query.pool || '');
       if (!POOLS.includes(pool)) throw errors.validation('pool 必须是 reserve / main / discard');
-      const { page, pageSize, offset } = parsePagination(request.query);
       const filters = ['pool = ?'];
       const params = [pool];
-      if (request.query.q) {
+      if (query.q) {
         filters.push('email LIKE ?');
-        params.push(`%${String(request.query.q)}%`);
+        params.push(`%${String(query.q)}%`);
       }
-      if (request.query.status) {
+      if (query.status) {
         filters.push('status = ?');
-        params.push(String(request.query.status));
+        params.push(String(query.status));
       }
-      if (request.query.banned === 'true' || request.query.banned === '1') filters.push('banned = 1');
-      if (request.query.banned === 'false' || request.query.banned === '0') filters.push('banned = 0');
-      if (request.query.has_balance === 'true') filters.push('has_balance = 1');
-      if (request.query.has_balance === 'false' || request.query.has_balance === '0') filters.push('has_balance = 0');
+      if (query.banned === 'true' || query.banned === '1') filters.push('banned = 1');
+      if (query.banned === 'false' || query.banned === '0') filters.push('banned = 0');
+      if (query.has_balance === 'true') filters.push('has_balance = 1');
+      if (query.has_balance === 'false' || query.has_balance === '0') filters.push('has_balance = 0');
       // 备用池快捷筛选「可用」：未封禁、不在加入流程且有已知余额，与 poolStats / dashboard 口径一致
-      if (pool === 'reserve' && request.query.available === 'true') {
+      if (pool === 'reserve' && query.available === 'true') {
         filters.push("banned = 0 AND status != 'joining' AND has_balance = 1");
       }
       if (pool === 'discard') {
-        if (request.query.reason) {
-          const reason = String(request.query.reason);
+        if (query.reason) {
+          const reason = String(query.reason);
           // 历史 NULL 归入 manual，与 poolStats 统计口径一致
           if (reason === 'manual') filters.push("(discard_reason = 'manual' OR discard_reason IS NULL)");
           else {
@@ -298,32 +336,64 @@ export function createAccountsModule({ engine, logger }) {
             params.push(reason);
           }
         }
-        appendDiscardedAtFilters(filters, params, request.query);
+        appendDiscardedAtFilters(filters, params, query);
       }
-      if (pool === 'main' && (request.query.uploaded === 'true' || request.query.uploaded === 'false')) {
-        filters.push(request.query.uploaded === 'true' ? 'sub2api_account_id IS NOT NULL' : 'sub2api_account_id IS NULL');
+      if (pool === 'main' && (query.uploaded === 'true' || query.uploaded === 'false')) {
+        filters.push(query.uploaded === 'true' ? 'sub2api_account_id IS NOT NULL' : 'sub2api_account_id IS NULL');
       }
       // 远端状态筛选与列表展示口径一致：远端镜像 status 优先，未同步回退本地登录状态
-      if (pool === 'main' && request.query.remote_status) {
-        const remoteStatus = String(request.query.remote_status);
+      if (pool === 'main' && query.remote_status) {
+        const remoteStatus = String(query.remote_status);
         if (remoteStatus === 'not_uploaded') filters.push('sub2api_account_id IS NULL');
         else if (remoteStatus === 'active')
           filters.push("sub2api_account_id IS NOT NULL AND COALESCE(sub2api_status, status) = 'active'");
         else if (remoteStatus === 'abnormal')
           filters.push("sub2api_account_id IS NOT NULL AND COALESCE(sub2api_status, status) != 'active'");
       }
+      return { pool, where: `WHERE ${filters.join(' AND ')}`, params };
+    }
 
-      // 废弃号池默认按废弃时间倒序（最新废弃在前）；其余池默认创建时间正序
+    /** 解析 sort 参数为 ORDER BY 片段（白名单内的列 + 稳定 tiebreaker）。 */
+    function resolveAccountSort(query, pool) {
       const defaultSort = pool === 'discard' ? 'discarded_at:desc' : 'created_at';
-      const sortParam = String(request.query.sort || defaultSort);
+      const sortParam = String(query.sort || defaultSort);
       const sortKey = sortParam.replace(/:(asc|desc)$/i, '');
       const sortDir = /:desc$/i.test(sortParam) ? 'DESC' : 'ASC';
       const sortColumn = SORT_WHITELIST[pool][sortKey] || defaultSort.replace(/:(asc|desc)$/i, '');
+      return { sortColumn, sortDir };
+    }
 
-      const where = `WHERE ${filters.join(' AND ')}`;
+    /**
+     * 按筛选取出全部 id（上限保护）。
+     *
+     * 用途：前端「选中全部 N 条筛选结果」后要执行批量操作，而批量接口只收 id 列表。
+     * 这里让服务端用与列表完全相同的口径解析行集合，前端拿到 id 后再按接口 maxItems 分片。
+     * 上限同时兜住两件事：生成的 id 列表长度，以及每个分片 SQL 的绑定变量数量。
+     */
+    function selectAllMatchingAccountIds(query, limit) {
+      const { where, params } = buildAccountFilters(query);
+      const { sortColumn, sortDir } = resolveAccountSort(query, query.pool);
       const total = db.prepare(`SELECT COUNT(*) AS n FROM accounts ${where}`).get(...params).n;
       const rows = db
-        .prepare(`SELECT * FROM accounts ${where} ORDER BY ${sortColumn} ${sortDir}, id DESC LIMIT ? OFFSET ?`)
+        .prepare(`SELECT id FROM accounts ${where} ORDER BY ${sortColumn} ${sortDir}, id DESC`)
+        .all(...params);
+      return {
+        ids: rows.map((row) => row.id).slice(0, limit),
+        total,
+        truncated: rows.length > limit,
+      };
+    }
+
+    app.get('/api/v1/accounts', async (request) => {
+      const { page, pageSize, offset } = parsePagination(request.query);
+      const { pool, where, params } = buildAccountFilters(request.query);
+      const { sortColumn, sortDir } = resolveAccountSort(request.query, pool);
+
+      const total = db.prepare(`SELECT COUNT(*) AS n FROM accounts ${where}`).get(...params).n;
+      // 时间线派生列只对当页 ≤200 行计算，成本可忽略
+      const extraColumns = pool === 'discard' ? `, ${DISCARD_TIMELINE_COLUMNS}` : '';
+      const rows = db
+        .prepare(`SELECT accounts.*${extraColumns} FROM accounts ${where} ORDER BY ${sortColumn} ${sortDir}, id DESC LIMIT ? OFFSET ?`)
         .all(...params, pageSize, offset);
       return {
         items: rows.map((row) => accountView(row, pool)),
@@ -378,9 +448,18 @@ export function createAccountsModule({ engine, logger }) {
         ...base,
         discard_reason: row.discard_reason,
         discard_detail: row.discard_detail ? sanitizeText(row.discard_detail) : null,
+        // balance 保留给导出与既有调用方；UI 不再把它当作「废弃时余额」展示
         balance: row.balance,
         banned: Boolean(row.banned),
         discarded_at: row.discarded_at,
+        // ---- 时间线 ----
+        reserve_joined_at: row.reserve_joined_at ?? row.imported_at ?? row.created_at ?? null,
+        joined_main_at: row.joined_main_at ?? null,
+        // ---- 已用额度（sub2api 用量口径，与「主池预估剩余余额」同源）----
+        used_amount: row.discard_used_amount ?? null,
+        used_amount_at: row.discard_used_amount_at ?? null,
+        used_amount_source: row.discard_used_amount_source ?? null,
+        used_amount_stale: isDiscardUsageStale(row.discard_used_amount_at),
       };
     }
 
@@ -432,6 +511,20 @@ export function createAccountsModule({ engine, logger }) {
         .all();
       const stats = {};
       for (const row of rows) stats[row.discard_reason || 'manual'] = row.n;
+      // 已用额度汇总：已知用量的号参与求和、未知单独计数（口径同备用池 total_balance/with_balance）。
+      // 时间戳是 ISO 字符串，字典序即时间序，直接用 cutoff 字符串比较，避免 SQL 里做时间函数转换。
+      const cutoff = new Date(Date.now() - DISCARD_USAGE_STALE_MS).toISOString();
+      const usage = db
+        .prepare(
+          `SELECT COALESCE(SUM(discard_used_amount),0) AS used_amount_total,
+                  SUM(CASE WHEN discard_used_amount IS NOT NULL THEN 1 ELSE 0 END) AS used_amount_known,
+                  SUM(CASE WHEN discard_used_amount_at IS NULL OR discard_used_amount_at < ? THEN 1 ELSE 0 END) AS used_amount_stale
+             FROM accounts WHERE pool='discard'`,
+        )
+        .get(cutoff);
+      stats.used_amount_total = Number(usage.used_amount_total || 0);
+      stats.used_amount_known = Number(usage.used_amount_known || 0);
+      stats.used_amount_stale = Number(usage.used_amount_stale || 0);
       return stats;
     }
 
@@ -1280,15 +1373,67 @@ export function createAccountsModule({ engine, logger }) {
       },
       async (request) => {
         let discarded = 0;
+        const discardedIds = [];
         for (const id of request.body.ids) {
           try {
             pools.moveToDiscard(id, 'manual', request.body.detail || '手动废弃', { fromPools: ['main', 'reserve'] });
             discarded += 1;
+            discardedIds.push(id);
           } catch (error) {
             logger.debug({ accountId: id }, `discard skipped: ${error.message}`);
           }
         }
+        // 废弃当下抓一次用量快照（异步、不阻塞响应）：sub2api 不提供历史时点查询，
+        // 错过此刻就只能拿到「当前累计」了
+        void snapshotDiscardedUsage(discardedIds);
         return { discarded };
+      },
+    );
+
+    // ---------------- 废弃池「已用额度」----------------
+    /**
+     * 抓取刚被废弃账号的用量快照。best-effort：不 await、不动响应，
+     * 与 banMailCheck.check 的「异步、不阻塞终态流转」模式一致。
+     */
+    async function snapshotDiscardedUsage(ids) {
+      if (!ids.length) return;
+      if (!sub2apiConfigured()) return;
+      for (const id of ids) {
+        // 串行即可：废弃是低频手动动作，且每条内部已吞异常
+        await discardUsage.snapshotAfterDiscard(id);
+      }
+    }
+
+    function sub2apiConfigured() {
+      const config = app.settings?.get?.('sub2api.config');
+      return Boolean(config?.base_url && config?.admin_key);
+    }
+
+    /**
+     * 同步废弃池「已用额度」。默认只补没有快照或快照过期（>24h）的号；
+     * force=true 时全量重算。逐个查询远端用量统计，故需要显式触发。
+     */
+    app.post(
+      '/api/v1/accounts/discard-usage-sync',
+      {
+        schema: {
+          body: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              ids: { type: 'array', items: { type: 'integer' }, maxItems: 500 },
+              force: { type: 'boolean' },
+            },
+          },
+        },
+      },
+      async (request) => {
+        if (!sub2apiConfigured()) {
+          throw errors.validation('请先配置 sub2api 管理员密钥和后端地址');
+        }
+        const { ids, force } = request.body ?? {};
+        const result = await discardUsage.sync({ ids: ids ?? null, force: Boolean(force) });
+        return { ok: true, ...result };
       },
     );
 
@@ -1301,6 +1446,37 @@ export function createAccountsModule({ engine, logger }) {
         throw errors.poolTransferConflict('账号不在废弃号池');
       }
     });
+
+    /**
+     * 批量移回主号池。
+     * 前端原先是 N 次串行单条 /restore 请求（选 200 条就是 200 个请求），
+     * 这里在同一个事务里走 pools.restore，逐条失败只跳过不中断。
+     */
+    app.post(
+      '/api/v1/accounts/batch-restore',
+      {
+        schema: {
+          body: {
+            type: 'object',
+            required: ['ids'],
+            additionalProperties: false,
+            properties: { ids: { type: 'array', items: { type: 'integer' }, maxItems: 500 } },
+          },
+        },
+      },
+      async (request) => {
+        let restored = 0;
+        for (const id of request.body.ids) {
+          try {
+            pools.restore(id);
+            restored += 1;
+          } catch (error) {
+            logger.debug({ accountId: id }, `restore skipped: ${error.message}`);
+          }
+        }
+        return { restored, skipped: request.body.ids.length - restored };
+      },
+    );
 
     app.post(
       '/api/v1/accounts/batch-delete',
@@ -1335,25 +1511,18 @@ export function createAccountsModule({ engine, logger }) {
       },
     );
 
-    // ---------------- export ----------------
-    app.get('/api/v1/accounts/export', async (request, reply) => {
-      const format = String(request.query.format || 'sub2api');
-      const ids = String(request.query.ids || '')
-        .split(',')
-        .map((v) => Number(v.trim()))
-        .filter((v) => Number.isInteger(v) && v > 0);
-      let rows;
-      if (ids.length) {
-        const placeholders = ids.map(() => '?').join(',');
-        rows = db.prepare(`SELECT * FROM accounts WHERE id IN (${placeholders})`).all(...ids);
-      } else if (['reserve', 'main'].includes(String(request.query.pool || ''))) {
-        // 整池导出（tosub2 跨实例迁移）
-        const pool = String(request.query.pool);
-        rows = db.prepare(`SELECT * FROM accounts WHERE pool=? ORDER BY id`).all(pool);
-      } else {
-        throw errors.validation('ids 不能为空');
-      }
+    /**
+     * 「选中全部筛选结果」用：按当前筛选返回全部 id（默认上限 5000）。
+     * 前端据此执行批量操作，避免只选中当前页。
+     */
+    app.get('/api/v1/accounts/ids', async (request) => {
+      const limit = Math.min(10_000, Math.max(1, Number.parseInt(request.query.limit || '5000', 10) || 5000));
+      return selectAllMatchingAccountIds(request.query, limit);
+    });
 
+    // ---------------- export ----------------
+    /** 把一批账号行渲染成指定导出格式（`ids` / `pool` / 按筛选三个入口共用）。 */
+    function renderAccountExport(rows, format, reply) {
       if (format === 'tosub2') {
         const payload = buildTosub2ExportPayload({
           rows,
@@ -1402,6 +1571,41 @@ export function createAccountsModule({ engine, logger }) {
       reply.header('content-type', 'application/json');
       reply.header('content-disposition', 'attachment; filename="sub2api-import.json"');
       return payload;
+    }
+
+    app.get('/api/v1/accounts/export', async (request, reply) => {
+      const format = String(request.query.format || 'sub2api');
+      const ids = String(request.query.ids || '')
+        .split(',')
+        .map((v) => Number(v.trim()))
+        .filter((v) => Number.isInteger(v) && v > 0);
+      let rows;
+      if (ids.length) {
+        const placeholders = ids.map(() => '?').join(',');
+        rows = db.prepare(`SELECT * FROM accounts WHERE id IN (${placeholders})`).all(...ids);
+      } else if (['reserve', 'main'].includes(String(request.query.pool || ''))) {
+        // 整池导出（tosub2 跨实例迁移）
+        const pool = String(request.query.pool);
+        rows = db.prepare(`SELECT * FROM accounts WHERE pool=? ORDER BY id`).all(pool);
+      } else {
+        throw errors.validation('ids 不能为空');
+      }
+      return renderAccountExport(rows, format, reply);
+    });
+
+    /**
+     * 按当前筛选导出：勾选「全部 N 条」后导出时用。
+     * 走 GET /accounts/export?ids=... 会把几千个 id 塞进 query string（长度与 URL 双重限制），
+     * 这里改为传筛选条件，行集合由服务端按与列表完全相同的口径解析。
+     */
+    app.get('/api/v1/accounts/export-by-filter', async (request, reply) => {
+      const format = String(request.query.format || 'tosub2');
+      const { where, params } = buildAccountFilters(request.query);
+      const { sortColumn, sortDir } = resolveAccountSort(request.query, request.query.pool);
+      const rows = db
+        .prepare(`SELECT * FROM accounts ${where} ORDER BY ${sortColumn} ${sortDir}, id DESC`)
+        .all(...params);
+      return renderAccountExport(rows, format, reply);
     });
 
     // ---------------- events ----------------

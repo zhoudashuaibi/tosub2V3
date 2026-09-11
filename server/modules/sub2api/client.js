@@ -1,4 +1,4 @@
-import { AppError } from '../../lib/http-errors.js';
+import { AppError, errors } from '../../lib/http-errors.js';
 import { sanitizeText } from '../../lib/sanitize.js';
 
 /**
@@ -11,7 +11,7 @@ const REQUEST_TIMEOUT_MS = 120_000;
 export function createSub2apiClient(getConfig) {
   async function request(endpoint, options = {}, configOverride = null) {
     const config = configOverride || getConfig();
-    if (!config?.base_url) throw new AppError(400, 'SUB2API_NOT_CONFIGURED', '请先配置 sub2api 后端地址');
+    if (!config?.base_url) throw errors.sub2apiNotConfigured('请先配置 sub2api 后端地址');
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     try {

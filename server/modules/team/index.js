@@ -151,8 +151,12 @@ export function createTeamModule({ logger }) {
         where.push('a.health_status = ?');
         params.push(status);
       }
-      if (uploaded === '1' || uploaded === '0') {
-        where.push(uploaded === '1' ? 'a.sub2api_account_id IS NOT NULL' : 'a.sub2api_account_id IS NULL');
+      // 同时接受 '1'/'0' 与 'true'/'false'：号池接口用的是后者，
+      // 前端两处可共用同一个筛选控件，差异在服务端抹平而不是让调用方记住。
+      if (['1', 'true'].includes(uploaded)) {
+        where.push('a.sub2api_account_id IS NOT NULL');
+      } else if (['0', 'false'].includes(uploaded)) {
+        where.push('a.sub2api_account_id IS NULL');
       }
       if (Number.isSafeInteger(cardId) && cardId > 0) {
         where.push('a.card_id = ?');

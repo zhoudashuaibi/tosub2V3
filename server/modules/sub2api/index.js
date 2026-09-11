@@ -255,7 +255,7 @@ export function createSub2apiModule({ engine, logger }) {
     app.post('/api/v1/sub2api/sync-remote', async (request, reply) => {
       const config = app.settings.get(CONFIG_KEY);
       if (!config?.base_url || !config?.admin_key) {
-        throw Object.assign(new Error('请先配置 sub2api'), { status: 422, code: 'SUB2API_NOT_CONFIGURED' });
+        throw errors.sub2apiNotConfigured('请先配置 sub2api');
       }
       const result = await remoteSync.syncRemoteStatus();
       reply.code(200);

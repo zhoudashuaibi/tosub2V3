@@ -1,4 +1,5 @@
 import { sanitizeText } from '../../lib/sanitize.js';
+import { errors } from '../../lib/http-errors.js';
 import { uploadOrderExpr } from '../../lib/upload-order.js';
 
 /**
@@ -169,7 +170,7 @@ export function createMonitor({ db, crypto, client, getConfig, pools, engine, up
     if (state.running) return view();
     const config = getConfig();
     if (!config?.base_url || !config?.admin_key) {
-      throw Object.assign(new Error('请先配置 sub2api'), { status: 422, code: 'SUB2API_NOT_CONFIGURED' });
+      throw errors.sub2apiNotConfigured('请先配置 sub2api');
     }
     state.running = true;
     const logId = startLog(source);

@@ -1,12 +1,14 @@
 import fs from 'node:fs';
 import Fastify from 'fastify';
 import fp from 'fastify-plugin';
+import compress from '@fastify/compress';
 import { loadConfig } from './lib/config.js';
 import { openDatabase } from './lib/db.js';
 import { createCrypto } from './lib/crypto.js';
 import { createLogger } from './lib/logger.js';
 import { createSettingsService } from './lib/settings.js';
 import { registerErrorHandler } from './lib/http-errors.js';
+import { createCacheHeaders } from './lib/cache-headers.js';
 import { createAuthModule } from './modules/auth/index.js';
 import { createProxiesModule } from './modules/proxies/index.js';
 import { createJobsEngine } from './modules/jobs/engine.js';
@@ -56,6 +58,16 @@ app.decorate('settings', settings);
 app.decorate('jobsEngine', jobsEngine);
 
 registerErrorHandler(app);
+
+// 压缩与 ETag：轮询列表的主要成本是重复传输未变的 JSON。
+// 顺序有意义：
+//  1. compress 必须**早于所有路由**注册 —— 它是在 onRoute 里逐个路由挂压缩钩子的，
+//     晚于路由注册的模块不会压缩（实测：register 在路由之后时 content-encoding 恒为空）。
+//  2. compress 的 onSend 后执行，ETag 因此基于「未压缩」内容，与传输编码无关
+//     （弱 ETag 语义），304 判定不受 br/gzip 差异影响。
+await app.register(compress, { global: true, threshold: 1024, encodings: ['br', 'gzip', 'deflate'] });
+// 直接调用：缓存的 onSend 钩子必须挂在根实例上，才能覆盖所有模块注册的路由
+await createCacheHeaders({ logger })(app);
 
 app.get('/api/v1/health', async () => ({
   ok: true,

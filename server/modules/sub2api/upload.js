@@ -1,6 +1,7 @@
 import nodeCrypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { errors } from '../../lib/http-errors.js';
 
 /**
  * 上传管线：查重索引 → 新增/替换分流 → 最少绑定代理分配 → 余额后缀 → 回填。
@@ -18,7 +19,7 @@ export function createUploader({ db, crypto, client, getConfig, settingsGet, dat
   async function uploadAccounts(accountIds, optionsOverride = {}) {
     const config = getConfig();
     if (!config?.base_url || !config?.admin_key) {
-      throw Object.assign(new Error('请先配置 sub2api 后端地址与管理员密钥'), { status: 422, code: 'SUB2API_NOT_CONFIGURED' });
+      throw errors.sub2apiNotConfigured('请先配置 sub2api 后端地址与管理员密钥');
     }
     // 默认分组取顶层 group_ids（与监控分组同源）；调用方显式传 group_ids 时以覆盖为准
     const options = mergeUploadOptions(

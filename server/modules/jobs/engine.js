@@ -7,7 +7,7 @@ import { createAutoInput, readSub2apiExport } from './auto-input.js';
 import { fetchChatgptCredits } from '../../core/chatgpt-credits.mjs';
 import { fetchWithTls } from '../../lib/openai-fetch.js';
 import { sanitizeText } from '../../lib/sanitize.js';
-import { AppError, errors } from '../../lib/http-errors.js';
+import { errors } from '../../lib/http-errors.js';
 
 const ACTIVE_STATUSES = ['queued', 'running', 'awaiting_input'];
 const MAX_PROXY_SESSIONS = 10;
@@ -223,7 +223,7 @@ export function createJobsEngine({ config, db, logger }) {
     for (let attempt = 1; ; attempt += 1) {
       const proxy = selectProxyForJob(job, credentials, excludeIds);
       if (!proxy.url && strictProxyEnabled()) {
-        throw Object.assign(new Error('无可用代理（已开启禁止直连）'), { code: 'NO_ALIVE_PROXY' });
+        throw errors.conflict('无可用代理（已开启禁止直连）', 'NO_ALIVE_PROXY');
       }
       // 重试等场景可能残留 sub2api 标签：本机选路一律覆盖为空
       patchJob(job.id, { proxy_id: proxy.id, proxy_label: null });

@@ -93,7 +93,7 @@ export function createSettingsModule({ logger }) {
       const body = request.body || {};
       const providerId = String(body.id || '').trim();
       if (!['luban', 'smsbower', 'custom'].includes(providerId)) {
-        throw Object.assign(new Error('不支持的接码平台'), { status: 422, code: 'VALIDATION' });
+        throw errors.validation('不支持的接码平台');
       }
       const current = app.settings.get('sms.providers') || {};
       const next = { ...current, active: body.active !== undefined ? String(body.active) : current.active };

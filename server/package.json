@@ -11,6 +11,7 @@
     "test": "node --test test/*.test.js"
   },
   "dependencies": {
+    "@fastify/compress": "^9.2.0",
     "@fastify/static": "^8.0.3",
     "better-sqlite3": "^11.8.1",
     "fastify": "^5.2.1",

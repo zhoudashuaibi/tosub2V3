@@ -19,11 +19,29 @@ export const errors = {
     new AppError(429, 'RATE_LIMITED', '尝试次数过多，已锁定', { retry_after_seconds: retryAfterSeconds }),
   upstream: (message, code = 'UPSTREAM_ERROR') => new AppError(502, code, message),
   sub2apiUnavailable: (message) => new AppError(502, 'SUB2API_UNAVAILABLE', message),
+  sub2apiNotConfigured: (message = '请先配置 sub2api 后端地址与管理员密钥') =>
+    new AppError(422, 'SUB2API_NOT_CONFIGURED', message),
   accountState: (message) => new AppError(409, 'ACCOUNT_STATE_INVALID', message),
   jobNotCancelable: () => new AppError(409, 'JOB_NOT_CANCELABLE', '任务已结束，无法取消'),
   jobNotAwaitingInput: () => new AppError(409, 'JOB_NOT_AWAITING_INPUT', '任务当前不在等待输入状态'),
   poolTransferConflict: (message = '账号状态已变化，操作冲突') => new AppError(409, 'POOL_TRANSFER_CONFLICT', message),
 };
+
+/**
+ * 归一化「非 AppError 但自带 4xx 状态」的错误。
+ *
+ * 历史代码里有 `throw Object.assign(new Error(msg), { status: 422, code: 'X' })` 的写法，
+ * 它既不是 AppError，也不会被 Fastify 特殊处理，最终统一落到 500 INTERNAL ——
+ * 前端据此写的友好文案（如 SUB2API_NOT_CONFIGURED）永远不可达。
+ * 这里把它按声明的 4xx 状态原样暴露；5xx 与无状态错误仍然视为内部错误。
+ */
+function normalizeHttpError(error) {
+  if (error instanceof AppError) return error;
+  const status = Number(error?.status ?? error?.statusCode);
+  if (!Number.isInteger(status) || status < 400 || status >= 500) return null;
+  const code = typeof error.code === 'string' && /^[A-Z][A-Z0-9_]*$/.test(error.code) ? error.code : 'VALIDATION';
+  return new AppError(status, code, error.message || '请求失败', error.extra ?? {});
+}
 
 export function registerErrorHandler(app) {
   app.setErrorHandler((error, request, reply) => {
@@ -42,9 +60,10 @@ export function registerErrorHandler(app) {
         error: { code: 'BODY_TOO_LARGE', message: '请求内容过大，超出大小限制，请分批导入' },
       });
     }
-    if (error instanceof AppError) {
-      return reply.status(error.status).send({
-        error: { code: error.code, message: error.message, ...error.extra },
+    const normalized = normalizeHttpError(error);
+    if (normalized) {
+      return reply.status(normalized.status).send({
+        error: { code: normalized.code, message: normalized.message, ...normalized.extra },
       });
     }
     request.log.error({ err: error }, 'unhandled error');

@@ -1,4 +1,5 @@
 import nodeCrypto from 'node:crypto';
+import { errors } from '../../lib/http-errors.js';
 import { mergeUploadOptions } from '../sub2api/upload.js';
 import { allocateShortName, extractAccountEmail } from './names.js';
 
@@ -109,10 +110,7 @@ export function createTeamUploader({ db, crypto, client, getSub2apiConfig, getTe
   async function uploadTeamAccounts(accountIds, optionsOverride = {}) {
     const sub2apiConfig = getSub2apiConfig();
     if (!sub2apiConfig?.base_url || !sub2apiConfig?.admin_key) {
-      throw Object.assign(new Error('请先在 Sub2API 页面配置后端地址与管理员密钥'), {
-        status: 422,
-        code: 'SUB2API_NOT_CONFIGURED',
-      });
+      throw errors.sub2apiNotConfigured('请先在 Sub2API 页面配置后端地址与管理员密钥');
     }
     const teamConfig = getTeamConfig() || {};
     const options = mergeUploadOptions(
