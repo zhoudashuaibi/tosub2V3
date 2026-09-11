@@ -14,7 +14,8 @@ export function formatRelativeTime(iso: string | null | undefined): string {
   if (minutes < 1) return '刚刚';
   if (minutes < 60) return `${minutes} 分钟前`;
   const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours} 小时前`;
+  // 48 小时内统一按小时显示，避免出现「1 天前」；超过 48 小时才按天显示。
+  if (hours < 48) return `${hours} 小时前`;
   const days = Math.floor(hours / 24);
   if (days < 30) return `${days} 天前`;
   return new Date(iso).toLocaleDateString('zh-CN');
