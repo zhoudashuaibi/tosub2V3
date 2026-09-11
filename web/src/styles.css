@@ -4,7 +4,7 @@
 @custom-variant dark (&:is(.dark *));
 
 :root {
-  --background: #ffffff;
+  --background: #fafafa;
   --foreground: #09090b;
   --card: #ffffff;
   --card-foreground: #09090b;
@@ -31,16 +31,21 @@
   --sidebar-accent: #f4f4f5;
   --sidebar-border: #e4e4e7;
   --surface-raised: #ffffff;
-  --shadow-surface: none;
+  --overlay: rgb(9 9 11 / 0.55);
+  /* 层次感：浅色主题用真实阴影区分「页面底色 / 卡片 / 浮层」 */
+  --elevation-1: 0 1px 2px rgb(9 9 11 / 0.05);
+  --elevation-2: 0 2px 4px -1px rgb(9 9 11 / 0.06), 0 4px 12px -2px rgb(9 9 11 / 0.08);
+  --elevation-3: 0 8px 24px -6px rgb(9 9 11 / 0.16), 0 2px 6px -2px rgb(9 9 11 / 0.1);
+  --shadow-surface: var(--elevation-1);
   --radius: 0.5rem;
 }
 
 .dark {
   --background: #09090b;
   --foreground: #fafafa;
-  --card: #09090b;
+  --card: #131316;
   --card-foreground: #fafafa;
-  --popover: #09090b;
+  --popover: #18181b;
   --popover-foreground: #fafafa;
   --primary: #fafafa;
   --primary-foreground: #18181b;
@@ -52,18 +57,23 @@
   --accent-foreground: #fafafa;
   --destructive: #f87171;
   --destructive-foreground: #450a0a;
-  --border: #27272a;
-  --input: #27272a;
+  --border: #2a2a30;
+  --input: #2a2a30;
   --ring: #d4d4d8;
   --success: #4ade80;
   --warning: #fbbf24;
   --info: #60a5fa;
-  --sidebar: #09090b;
+  --sidebar: #0d0d10;
   --sidebar-foreground: #fafafa;
-  --sidebar-accent: #27272a;
-  --sidebar-border: #27272a;
-  --surface-raised: #09090b;
-  --shadow-surface: none;
+  --sidebar-accent: #1c1c21;
+  --sidebar-border: #232329;
+  --surface-raised: #131316;
+  --overlay: rgb(0 0 0 / 0.7);
+  /* 深色下阴影几乎不可见，改用边框与内高光建立层次 */
+  --elevation-1: inset 0 1px 0 rgb(255 255 255 / 0.03);
+  --elevation-2: 0 4px 16px -4px rgb(0 0 0 / 0.5);
+  --elevation-3: 0 12px 32px -8px rgb(0 0 0 / 0.7);
+  --shadow-surface: var(--elevation-1);
 }
 
 @theme inline {
@@ -93,6 +103,7 @@
   --color-sidebar-foreground: var(--sidebar-foreground);
   --color-sidebar-accent: var(--sidebar-accent);
   --color-sidebar-border: var(--sidebar-border);
+  --color-overlay: var(--overlay);
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
@@ -139,13 +150,15 @@ select {
   isolation: isolate;
 }
 
+/* 侧栏与页面底色需要可辨识的差异，否则「内容区」没有边界感 */
 .app-sidebar {
   background: var(--sidebar);
+  border-right: 1px solid var(--sidebar-border);
   box-shadow: none;
 }
 
 .app-header {
-  background: var(--background);
+  background: var(--surface-raised);
   backdrop-filter: none;
 }
 
@@ -166,12 +179,37 @@ select {
   box-shadow: var(--shadow-surface);
 }
 
+/* 表头吸顶：长列表在 lg 断点由 main 容器滚动，表头跟随 */
+.table-shell thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--card);
+}
+
+/* 数值列对齐：余额/用量/耗时/计数用等宽数字，避免逐行抖动 */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
 .font-mono,
 pre,
 code,
 kbd {
   font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
 }
+
+/* 日志查看器：ANSI 着色（子进程输出常带转义序列） */
+.log-ansi-bold { font-weight: 600; }
+.log-ansi-dim { opacity: 0.6; }
+.log-ansi-red { color: #f87171; }
+.log-ansi-green { color: #4ade80; }
+.log-ansi-yellow { color: #fbbf24; }
+.log-ansi-blue { color: #60a5fa; }
+.log-ansi-magenta { color: #e879f9; }
+.log-ansi-cyan { color: #22d3ee; }
+.log-hit { background: var(--warning); color: var(--foreground); border-radius: 2px; }
+.log-hit-active { background: var(--primary); color: var(--primary-foreground); border-radius: 2px; }
 
 @media (prefers-reduced-motion: reduce) {
   *,

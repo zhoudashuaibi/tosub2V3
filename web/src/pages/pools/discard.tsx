@@ -1,24 +1,28 @@
-import { useMemo, useState } from 'react';
-import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Archive, RotateCcw, Trash2, X } from 'lucide-react';
+import { useCallback, useMemo, useState } from 'react';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { Archive, RotateCcw, Trash2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { accountsApi } from '@/api';
-import { errorMessage } from '@/api/client';
-import type { DiscardAccount } from '@/api/types';
+import { download, errorMessage } from '@/api/client';
+import type { DiscardAccount, DiscardUsageSyncResult } from '@/api/types';
+import { DISCARD_USAGE_REASON_LABELS } from '@/api/types';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
-import { Input } from '@/components/ui/input';
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
-import { Skeleton } from '@/components/ui/skeleton';
-import { BalanceTag } from '@/components/balance-tag';
+import { TableCell, TableHead, TableRow } from '@/components/ui/table';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { StatusBadge } from '@/components/status-badge';
 import { BatchActionBar } from '@/components/batch-action-bar';
+import { BatchResultDialog, type BatchResult } from '@/components/batch-result-dialog';
 import { ConfirmDialog } from '@/components/confirm-dialog';
-import { EmptyState } from '@/components/empty-state';
 import { SortableHead, type SortState } from '@/components/sortable-head';
-import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
-import { formatRelativeTime } from '@/lib/utils';
+import { PaginationBar } from '@/components/data/pagination-bar';
+import { ListShell, ListToolbar, ToolbarChip, ToolbarSearch, ToolbarSpacer, RefreshButton } from '@/components/data/list-shell';
+import { useListUrlState, useSearchParam } from '@/hooks/use-list-url-state';
+import { useLiveList } from '@/hooks/use-live-list';
+import { useRowSelection } from '@/hooks/use-row-selection';
+import { runChunked } from '@/lib/batch';
+import { formatRelativeTime, formatDateTime } from '@/lib/utils';
 
 const REASON_LABELS: Record<string, string> = {
   banned_401: '封禁(401)',
@@ -54,238 +58,482 @@ function dateRangeForDay(value: string) {
 
 export function DiscardPoolPage() {
   const queryClient = useQueryClient();
-  const [q, setQ] = useState('');
-  const [reason, setReason] = useState('');
-  const [discardedDate, setDiscardedDate] = useState(() => localDateValue());
-  const [sort, setSort] = useState<SortState | null>({ key: 'discarded_at', dir: 'desc' });
-  const [selected, setSelected] = useState<Set<number>>(new Set());
-  const [deleteOpen, setDeleteOpen] = useState(false);
-  const discardedRange = dateRangeForDay(discardedDate);
 
-  const { data, isLoading } = useQuery({
-    queryKey: ['accounts', 'discard', { q, reason, discardedDate, sort }],
+  const { values, set, reset, hasActiveFilters } = useListUrlState({
+    defaults: {
+      q: '',
+      reason: '',
+      discardedDate: localDateValue(),
+      sort: 'discarded_at:desc',
+      page: 1,
+      page_size: 50,
+    },
+  });
+
+  const page = Number(values.page) || 1;
+  const pageSize = Number(values.page_size) || 50;
+  const sort = useMemo<SortState | null>(() => {
+    const raw = String(values.sort || '');
+    if (!raw) return null;
+    const [key, dir] = raw.split(':');
+    return key ? { key, dir: dir === 'asc' ? 'asc' : 'desc' } : null;
+  }, [values.sort]);
+
+  const discardedDate = String(values.discardedDate || '');
+  const reason = String(values.reason || '');
+  const discardedRange = useMemo(() => dateRangeForDay(discardedDate), [discardedDate]);
+
+  const search = useSearchParam({
+    value: String(values.q || ''),
+    onChange: useCallback((next: string) => set({ q: next, page: 1 }), [set]),
+  });
+
+  const { data, isLoading, isRefreshing, refresh } = useLiveList({
+    queryKey: ['accounts', 'discard', { q: values.q, reason, discardedDate, sort, page, pageSize }],
     queryFn: () =>
       accountsApi.list<DiscardAccount>('discard', {
-        q: q || undefined,
+        q: String(values.q || '') || undefined,
         reason: reason || undefined,
         ...discardedRange,
         sort: sort ? `${sort.key}:${sort.dir}` : undefined,
-        page_size: 200,
+        page,
+        page_size: pageSize,
       }),
-    refetchInterval: 30_000,
-    placeholderData: keepPreviousData,
+    interval: 30_000,
   });
 
-  const invalidate = () => {
+  const items = data?.items ?? [];
+  const total = data?.total ?? 0;
+  const stats = data?.stats ?? {};
+
+  const resetKey = JSON.stringify({ q: values.q, reason, discardedDate, sort, page, pageSize });
+  const selection = useRowSelection({ items, total, resetKey });
+
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [batchResult, setBatchResult] = useState<BatchResult | null>(null);
+  // 单行操作的目标集合：不能用 selection，否则会把批量选择覆盖成单条
+  const [rowTargets, setRowTargets] = useState<DiscardAccount[]>([]);
+
+  const invalidate = useCallback(() => {
     queryClient.invalidateQueries({ queryKey: ['accounts', 'discard'] });
+    queryClient.invalidateQueries({ queryKey: ['accounts', 'main'] });
     queryClient.invalidateQueries({ queryKey: ['dashboard'] });
-  };
+  }, [queryClient]);
 
   const restoreMutation = useMutation({
-    mutationFn: (ids: number[]) => Promise.all(ids.map((id) => accountsApi.restore(id))),
-    onSuccess: () => {
-      toast.success('已移回主号池（待重新授权状态）');
-      setSelected(new Set());
+    mutationFn: (ids: number[]) =>
+      runChunked(ids, 'accounts.batchRestore', (chunk) => accountsApi.batchRestore(chunk)),
+    onSuccess: (result) => {
+      toast.success(`已移回主号池 ${result.restored} 个账号（待重新授权）`);
+      if (result.skipped > 0) toast.warning(`${result.skipped} 个账号不在废弃池，已跳过`);
+      selection.clear();
       invalidate();
-      queryClient.invalidateQueries({ queryKey: ['accounts', 'main'] });
     },
     onError: (error) => toast.error(errorMessage(error)),
   });
 
   const deleteMutation = useMutation({
-    mutationFn: (ids: number[]) => accountsApi.batchDelete(ids),
+    mutationFn: (ids: number[]) =>
+      runChunked(ids, 'accounts.batchDelete', (chunk) => accountsApi.batchDelete(chunk)),
     onSuccess: (result) => {
       toast.success(`已彻底删除 ${result.deleted} 个账号`);
-      setSelected(new Set());
       setDeleteOpen(false);
+      setRowTargets([]);
+      selection.clear();
       invalidate();
     },
     onError: (error) => toast.error(errorMessage(error)),
   });
 
-  const items = data?.items ?? [];
-  const selectedIds = useMemo(() => [...selected], [selected]);
-  const stats = data?.stats ?? {};
+  /** 同步 sub2api 用量：有选中只同步选中，否则按当前筛选的全部待同步项 */
+  const syncMutation = useMutation({
+    mutationFn: (vars: { ids?: number[]; force?: boolean }) => accountsApi.syncDiscardUsage(vars),
+    onSuccess: (result: DiscardUsageSyncResult) => {
+      setBatchResult(buildSyncResult(result));
+      invalidate();
+    },
+    onError: (error) => toast.error(errorMessage(error)),
+  });
+
+  const filtersActive = Boolean(String(values.q || '') || reason || discardedDate !== localDateValue());
+
+  const filterForIds = useMemo(
+    () => ({
+      pool: 'discard' as const,
+      q: String(values.q || '') || undefined,
+      reason: reason || undefined,
+      ...discardedRange,
+      sort: sort ? `${sort.key}:${sort.dir}` : undefined,
+    }),
+    [values.q, reason, discardedRange, sort],
+  );
+
+  /** 「选中全部 N 条」：批量接口只收 id，先取回全部 id 再按接口上限分片提交 */
+  const selectAllMatching = useMutation({
+    mutationFn: () => accountsApi.idsByFilter(filterForIds),
+    onSuccess: (result) => {
+      selection.replace(result.ids);
+      if (result.truncated) {
+        toast.warning(`筛选结果超过 ${result.ids.length} 条，已选中前 ${result.ids.length} 条`);
+      }
+    },
+    onError: (error) => toast.error(errorMessage(error)),
+  });
+
+  const exportUrl = accountsApi.exportByFilterUrl({
+    ...filterForIds,
+    format: 'tosub2',
+  });
+
+  const handleExport = () => {
+    download(exportUrl, 'tosub2-discard.json').catch((error) => toast.error(errorMessage(error)));
+  };
+
+  const targetCount = rowTargets.length > 0 ? rowTargets.length : selection.count;
+  const targetIds = rowTargets.length > 0 ? rowTargets.map((row) => row.id) : selection.selectedIds;
+  const staleCount = stats.used_amount_stale ?? 0;
 
   return (
     <div className="space-y-4">
       <div className="rounded-md bg-muted/60 px-4 py-2.5 text-sm text-muted-foreground">
-        移回主号池后账号为「待重新授权」状态，建议先批量授权再上传。
+        移回主号池后账号为「待重新授权」状态，建议先批量授权再上传。「已用额度」取自 sub2api 账号用量统计，
+        与主号池预估剩余余额同源。
       </div>
-      <div className="flex flex-wrap items-center gap-2">
+
+      <ListToolbar>
         {REASON_CHIPS.filter((chip) => chip.value !== 'login_failed' || (stats.login_failed ?? 0) > 0).map((chip) => (
-          <button
+          <ToolbarChip
             key={chip.value}
-            type="button"
-            aria-pressed={reason === chip.value}
-            className="cursor-pointer rounded-full focus-visible:outline-none"
-            onClick={() => setReason((prev) => (prev === chip.value ? '' : chip.value))}
-          >
-            <Badge
-              variant={chip.variant}
-              className={
-                reason === chip.value
-                  ? 'ring-2 ring-primary ring-offset-2 ring-offset-background'
-                  : 'opacity-80 hover:opacity-100'
-              }
-            >
-              {REASON_LABELS[chip.value]} {stats[chip.value] ?? 0}
-            </Badge>
-          </button>
+            label={REASON_LABELS[chip.value]}
+            count={stats[chip.value] ?? 0}
+            variant={chip.variant}
+            active={reason === chip.value}
+            onClick={() => set({ reason: reason === chip.value ? '' : chip.value, page: 1 })}
+          />
         ))}
-        <label className="flex items-center gap-2 text-sm">
-          加入时间
-          <Input
+        <ToolbarChip
+          label="已用额度合计"
+          variant="secondary"
+          title={`${stats.used_amount_known ?? 0} 个账号有同步数据`}
+        />
+        <span className="tabular-nums -ml-1 text-sm font-semibold">
+          ${Number(stats.used_amount_total ?? 0).toFixed(2)}
+        </span>
+        <span className="text-xs text-muted-foreground">（{stats.used_amount_known ?? 0} 个已知）</span>
+
+        <ToolbarSpacer />
+
+        <ToolbarSearch value={search.value} onChange={search.setValue} placeholder="搜索邮箱…" className="w-52" />
+
+        <label className="flex items-center gap-1.5 text-sm text-muted-foreground">
+          废弃日期
+          <input
             type="date"
             value={discardedDate}
-            onChange={(e) => {
-              setDiscardedDate(e.target.value);
-              setSelected(new Set());
-            }}
-            className="w-40"
+            onChange={(event) => set({ discardedDate: event.target.value, page: 1 })}
+            className="h-8 rounded-md border border-input bg-card/60 px-2 text-sm"
           />
         </label>
         {discardedDate && (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                size="icon"
-                variant="ghost"
-                aria-label="显示全部废弃号"
-                onClick={() => {
-                  setDiscardedDate('');
-                  setSelected(new Set());
-                }}
-              >
-                <X className="h-4 w-4" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>显示全部废弃号</TooltipContent>
-          </Tooltip>
+          <Button variant="ghost" size="sm" onClick={() => set({ discardedDate: '', page: 1 })}>
+            全部日期
+          </Button>
         )}
-        <div className="flex-1" />
-        <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="搜索邮箱…" className="w-56" />
-      </div>
 
-      <div className="rounded-lg border bg-card">
-        {isLoading ? (
-          <div className="space-y-2 p-4">
-            {Array.from({ length: 4 }).map((_, i) => (
-              <Skeleton key={i} className="h-10" />
-            ))}
-          </div>
-        ) : items.length === 0 ? (
-          <EmptyState
-            icon={Archive}
-            title={reason ? `没有「${REASON_LABELS[reason] ?? reason}」的账号` : '废弃号池为空'}
-            description={
-              reason
-                ? '换个原因试试，或点击当前徽章取消筛选'
-                : '被 sub2api 监控判定 401/429 或手动废弃的账号会出现在这里'
-            }
-          />
-        ) : (
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead className="w-10">
-                  <Checkbox
-                    checked={selected.size === items.length}
-                    onCheckedChange={() =>
-                      setSelected((prev) => (prev.size === items.length ? new Set() : new Set(items.map((i) => i.id))))
-                    }
-                  />
-                </TableHead>
-                <TableHead>邮箱</TableHead>
-                <TableHead>废弃原因</TableHead>
-                <TableHead>详情</TableHead>
-                <TableHead>废弃时余额</TableHead>
-                <SortableHead label="废弃时间" sortKey="discarded_at" sort={sort} onSort={setSort} firstDir="desc" />
-                <TableHead className="text-right">操作</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {items.map((account) => (
-                <TableRow key={account.id}>
-                  <TableCell>
-                    <Checkbox
-                      checked={selected.has(account.id)}
-                      onCheckedChange={() =>
-                        setSelected((prev) => {
-                          const next = new Set(prev);
-                          if (next.has(account.id)) next.delete(account.id);
-                          else next.add(account.id);
-                          return next;
-                        })
-                      }
-                    />
-                  </TableCell>
-                  <TableCell className="max-w-[220px] truncate font-mono text-xs">{account.email}</TableCell>
-                  <TableCell>
-                    <StatusBadge domain="discard" value={account.discard_reason} />
-                  </TableCell>
-                  <TableCell className="max-w-[280px]">
-                    {account.discard_detail ? (
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <span className="cursor-help truncate text-xs text-muted-foreground underline decoration-dotted">
-                            {account.discard_detail.slice(0, 60)}
-                          </span>
-                        </TooltipTrigger>
-                        <TooltipContent className="max-w-md whitespace-pre-wrap">{account.discard_detail}</TooltipContent>
-                      </Tooltip>
-                    ) : (
-                      <span className="text-xs text-muted-foreground">—</span>
-                    )}
-                  </TableCell>
-                  <TableCell>
-                    <BalanceTag value={account.balance} />
-                  </TableCell>
-                  <TableCell className="text-xs text-muted-foreground">{formatRelativeTime(account.discarded_at)}</TableCell>
-                  <TableCell className="text-right">
-                    <div className="flex justify-end gap-1">
-                      <Button size="sm" variant="outline" onClick={() => restoreMutation.mutate([account.id])}>
-                        <RotateCcw className="h-3.5 w-3.5" />
-                        移回主号池
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        className="text-destructive"
-                        onClick={() => {
-                          setSelected(new Set([account.id]));
-                          setDeleteOpen(true);
-                        }}
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </Button>
-                    </div>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => set({ reason: '', q: '', page: 1 })}
+          disabled={!filtersActive}
+        >
+          清除筛选
+        </Button>
+        <Button variant="outline" size="sm" onClick={handleExport}>
+          导出当前筛选
+        </Button>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              size="sm"
+              variant={staleCount > 0 ? 'default' : 'outline'}
+              disabled={syncMutation.isPending}
+              onClick={() => {
+                // 显式确认：逐个账号查远端用量统计，几百个号可能要数十秒
+                const scope = selection.count > 0 ? `已选的 ${selection.count} 个` : `当前筛选下待同步的 ${staleCount || total} 个`;
+                const ok = window.confirm(`将对${scope}账号查询 sub2api 用量统计（90 天），可能需要数秒。是否继续？`);
+                if (!ok) return;
+                syncMutation.mutate(
+                  selection.count > 0 && !selection.isAllMode
+                    ? { ids: selection.selectedIds, force: true }
+                    : { force: true },
+                );
+              }}
+            >
+              {syncMutation.isPending ? '同步中…' : '同步远端用量'}
+              {staleCount > 0 && !syncMutation.isPending && (
+                <Badge variant="secondary" className="tabular-nums ml-1">
+                  {staleCount}
+                </Badge>
+              )}
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>
+            读取 sub2api 管理端账号的累计已用额度并保存快照；账号被废弃时已自动抓取过一次
+          </TooltipContent>
+        </Tooltip>
+        <RefreshButton isRefreshing={isRefreshing} onRefresh={refresh} />
+      </ListToolbar>
+
+      <ListShell
+        items={items}
+        isLoading={isLoading}
+        emptyIcon={Archive}
+        emptyTitle={reason ? `没有「${REASON_LABELS[reason] ?? reason}」的账号` : '废弃号池为空'}
+        emptyDescription={
+          reason
+            ? '换个原因试试，或点击当前徽章取消筛选'
+            : '被 sub2api 监控判定 401/429 或手动废弃的账号会出现在这里'
+        }
+        filtersActive={filtersActive}
+        onClearFilters={reset}
+        header={
+          <>
+            <TableHead className="w-10">
+              <Checkbox
+                checked={selection.headerState}
+                onCheckedChange={selection.toggleAll}
+                aria-label="全选当前页"
+              />
+            </TableHead>
+            <SortableHead label="邮箱" sortKey="email" sort={sort} onSort={(next) => set({ sort: serializeSort(next), page: 1 })} />
+            <SortableHead label="废弃原因" sortKey="discard_reason" sort={sort} onSort={(next) => set({ sort: serializeSort(next), page: 1 })} />
+            <TableHead>详情</TableHead>
+            <SortableHead
+              label="加入备用池"
+              sortKey="reserve_joined_at"
+              sort={sort}
+              firstDir="desc"
+              onSort={(next) => set({ sort: serializeSort(next), page: 1 })}
+            />
+            <SortableHead
+              label="加入主号池"
+              sortKey="joined_main_at"
+              sort={sort}
+              firstDir="desc"
+              onSort={(next) => set({ sort: serializeSort(next), page: 1 })}
+            />
+            <SortableHead
+              label="已用额度"
+              sortKey="discard_used_amount"
+              sort={sort}
+              firstDir="desc"
+              onSort={(next) => set({ sort: serializeSort(next), page: 1 })}
+            />
+            <SortableHead
+              label="废弃时间"
+              sortKey="discarded_at"
+              sort={sort}
+              firstDir="desc"
+              onSort={(next) => set({ sort: serializeSort(next), page: 1 })}
+            />
+            <TableHead className="text-right">操作</TableHead>
+          </>
+        }
+      >
+        {items.map((account) => (
+          <TableRow key={account.id} data-state={selection.isSelected(account.id) ? 'selected' : undefined}>
+            <TableCell>
+              <Checkbox
+                checked={selection.isSelected(account.id)}
+                onCheckedChange={() => selection.toggle(account.id)}
+                aria-label={`选择 ${account.email}`}
+              />
+            </TableCell>
+            <TableCell className="max-w-[220px] truncate font-mono text-xs">{account.email}</TableCell>
+            <TableCell>
+              <StatusBadge domain="discard" value={account.discard_reason} />
+            </TableCell>
+            <TableCell className="max-w-[240px]">
+              {account.discard_detail ? (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <div className="truncate text-xs text-muted-foreground">{account.discard_detail}</div>
+                  </TooltipTrigger>
+                  <TooltipContent className="max-w-md">{account.discard_detail}</TooltipContent>
+                </Tooltip>
+              ) : (
+                <span className="text-xs text-muted-foreground">—</span>
+              )}
+            </TableCell>
+            <TableCell className="text-xs text-muted-foreground" title={formatDateTime(account.reserve_joined_at)}>
+              {formatRelativeTime(account.reserve_joined_at)}
+            </TableCell>
+            <TableCell className="text-xs text-muted-foreground" title={formatDateTime(account.joined_main_at)}>
+              {account.joined_main_at ? formatRelativeTime(account.joined_main_at) : '—'}
+            </TableCell>
+            <TableCell>
+              <UsedAmountTag account={account} />
+            </TableCell>
+            <TableCell className="text-xs text-muted-foreground" title={formatDateTime(account.discarded_at)}>
+              {formatRelativeTime(account.discarded_at)}
+            </TableCell>
+            <TableCell className="text-right">
+              <div className="flex justify-end gap-1">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => {
+                    setRowTargets([account]);
+                    restoreMutation.mutate([account.id]);
+                  }}
+                  disabled={restoreMutation.isPending}
+                >
+                  <RotateCcw />
+                  移回主池
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="text-destructive"
+                  onClick={() => {
+                    setRowTargets([account]);
+                    setDeleteOpen(true);
+                  }}
+                >
+                  <Trash2 />
+                  删除
+                </Button>
+              </div>
+            </TableCell>
+          </TableRow>
+        ))}
+      </ListShell>
+
+      <PaginationBar
+        page={page}
+        pageSize={pageSize}
+        total={total}
+        onPageChange={(next) => set({ page: next })}
+        onPageSizeChange={(next) => set({ page_size: next, page: 1 })}
+      />
+
+      <BatchActionBar count={selection.count} onClear={selection.clear}>
+        {selection.count > 0 && selection.count <= items.length && total > items.length && (
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => selectAllMatching.mutate()}
+            disabled={selectAllMatching.isPending}
+          >
+            {selectAllMatching.isPending ? '加载中…' : `选中全部 ${total} 条`}
+          </Button>
         )}
-      </div>
-
-      <BatchActionBar count={selected.size} onClear={() => setSelected(new Set())}>
-        <Button size="sm" onClick={() => restoreMutation.mutate(selectedIds)}>
+        {selection.count > items.length && (
+          <span className="text-xs text-muted-foreground">已选中全部 {selection.count} 条筛选结果</span>
+        )}
+        <Button
+          size="sm"
+          onClick={() => restoreMutation.mutate(selection.selectedIds)}
+          disabled={restoreMutation.isPending}
+        >
+          <RotateCcw />
           批量移回主号池
         </Button>
-        <Button size="sm" variant="destructive" onClick={() => setDeleteOpen(true)}>
-          批量彻底删除
+        <Button
+          size="sm"
+          variant="destructive"
+          onClick={() => {
+            setRowTargets([]);
+            setDeleteOpen(true);
+          }}
+        >
+          <Trash2 />
+          批量删除
         </Button>
       </BatchActionBar>
 
+      <BatchResultDialog
+        result={batchResult}
+        onOpenChange={(open) => !open && setBatchResult(null)}
+      />
+
       <ConfirmDialog
         open={deleteOpen}
-        onOpenChange={setDeleteOpen}
-        title={`彻底删除 ${selected.size} 个账号？`}
-        description="将同时删除凭据、断点与产物文件，操作不可恢复。"
-        confirmText="彻底删除"
+        onOpenChange={(open) => {
+          setDeleteOpen(open);
+          if (!open) setRowTargets([]);
+        }}
+        title={`删除 ${targetCount} 个账号？`}
+        description={
+          rowTargets.length > 0
+            ? `将删除 ${rowTargets[0].email} 的账号凭据、断点与产物文件，操作不可恢复。`
+            : '将同时删除账号凭据、断点与产物文件，操作不可恢复。'
+        }
+        confirmText="删除"
         busy={deleteMutation.isPending}
-        onConfirm={() => deleteMutation.mutate(selectedIds)}
+        onConfirm={() => deleteMutation.mutate(targetIds)}
       />
     </div>
   );
+}
+
+/** 已用额度：有快照显示金额 + 同步时间，无快照显示待同步提示。 */
+function UsedAmountTag({ account }: { account: DiscardAccount }) {
+  if (account.used_amount === null) {
+    return (
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="cursor-help text-xs text-muted-foreground underline decoration-dotted underline-offset-4">
+            未同步
+          </span>
+        </TooltipTrigger>
+        <TooltipContent>点右上角「同步远端用量」从 sub2api 读取累计已用额度</TooltipContent>
+      </Tooltip>
+    );
+  }
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span className="tabular-nums cursor-help font-mono text-sm text-[var(--warning)]">
+          ${Number(account.used_amount).toFixed(2)}
+        </span>
+      </TooltipTrigger>
+      <TooltipContent>
+        <div>同步时间：{formatDateTime(account.used_amount_at)}（{formatRelativeTime(account.used_amount_at)}）</div>
+        {account.used_amount_source && <div className="text-muted-foreground">来源：{account.used_amount_source}</div>}
+        <div className="text-muted-foreground">
+          取自 sub2api 账号累计用量。sub2api 不提供历史时点查询，账号被废弃时已自动抓取一次
+        </div>
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+function serializeSort(sort: SortState | null): string {
+  return sort ? `${sort.key}:${sort.dir}` : '';
+}
+
+/** 把同步结果映射成统一的批量结果弹窗内容。 */
+function buildSyncResult(result: DiscardUsageSyncResult): BatchResult {
+  const summary = result.summary ?? {};
+  const notes: string[] = [];
+  const failed = result.items
+    .filter((item) => item.reason)
+    .map((item) => ({
+      id: item.id,
+      label: item.email,
+      reason: DISCARD_USAGE_REASON_LABELS[item.reason as keyof typeof DISCARD_USAGE_REASON_LABELS] ?? String(item.reason),
+    }));
+
+  if (summary.not_linked) notes.push(`${summary.not_linked} 个账号从未上传 sub2api，无远端用量可查`);
+  if (summary.remote_account_not_found) notes.push(`${summary.remote_account_not_found} 个账号在 sub2api 中已不存在`);
+  if (summary.remote_used_amount_unknown) notes.push(`${summary.remote_used_amount_unknown} 个账号远端未提供用量字段`);
+  if (summary.failed) notes.push(`${summary.failed} 个账号查询失败`);
+
+  return {
+    action: '同步远端已用额度',
+    succeeded: summary.updated ?? 0,
+    failed,
+    notes: [`共扫描 ${summary.scanned ?? 0} 个账号`, ...notes],
+  };
 }

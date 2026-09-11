@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
-import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link } from '@tanstack/react-router';
-import { Archive, CloudDownload, Coins, Download, KeyRound, Loader2, Plus, RefreshCw, Search, Trash2, Upload, Users } from 'lucide-react';
+import { Archive, CloudDownload, Coins, Download, KeyRound, Loader2, Plus, RefreshCw, Trash2, Upload, Users } from 'lucide-react';
 import { toast } from 'sonner';
 import { accountsApi, sub2apiApi } from '@/api';
 import { download, errorMessage } from '@/api/client';
@@ -12,15 +12,19 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
-import { Skeleton } from '@/components/ui/skeleton';
+import { TableCell, TableHead, TableRow } from '@/components/ui/table';
 import { BalanceTag } from '@/components/balance-tag';
 import { StatusBadge } from '@/components/status-badge';
 import { BatchActionBar } from '@/components/batch-action-bar';
+import { BatchResultDialog, type BatchResult } from '@/components/batch-result-dialog';
 import { ConfirmDialog } from '@/components/confirm-dialog';
-import { EmptyState } from '@/components/empty-state';
+import { ListShell, ListToolbar, ToolbarChip, ToolbarSearch, ToolbarSpacer, RefreshButton } from '@/components/data/list-shell';
 import { FilterSelect } from '@/components/filter-select';
+import { PaginationBar } from '@/components/data/pagination-bar';
 import { SortableHead, type SortState } from '@/components/sortable-head';
+import { useRowSelection } from '@/hooks/use-row-selection';
+import { useListUrlState, useSearchParam } from '@/hooks/use-list-url-state';
+import { useLiveList } from '@/hooks/use-live-list';
 import {
   Dialog,
   DialogContent,
@@ -35,32 +39,59 @@ import { formatRelativeTime } from '@/lib/utils';
 
 export function MainPoolPage() {
   const queryClient = useQueryClient();
-  const [q, setQ] = useState('');
-  const [statusFilter, setStatusFilter] = useState('');
-  const [remoteFilter, setRemoteFilter] = useState('');
-  const [uploadedOnly, setUploadedOnly] = useState(false);
-  const [sort, setSort] = useState<SortState | null>(null);
-  const [selected, setSelected] = useState<Set<number>>(new Set());
+
+  const { values, set, reset, hasActiveFilters } = useListUrlState({
+    defaults: { q: '', statusFilter: '', remoteFilter: '', uploadedOnly: 0, sort: '', page: 1, page_size: 50 },
+  });
+
+  const statusFilter = String(values.statusFilter || '');
+  const remoteFilter = String(values.remoteFilter || '');
+  const uploadedOnly = Number(values.uploadedOnly) === 1;
+  const page = Number(values.page) || 1;
+  const pageSize = Number(values.page_size) || 50;
+
+  const sort = useMemo<SortState | null>(() => {
+    const raw = String(values.sort || '');
+    if (!raw) return null;
+    const [key, dir] = raw.split(':');
+    return key ? { key, dir: dir === 'asc' ? 'asc' : 'desc' } : null;
+  }, [values.sort]);
+
+  const search = useSearchParam({
+    value: String(values.q || ''),
+    onChange: (next) => set({ q: next, page: 1 }),
+  });
+
   const [uploadOpen, setUploadOpen] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
   const [discardOpen, setDiscardOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [estimate, setEstimate] = useState<MainBalanceEstimate | null>(null);
+  const [batchResult, setBatchResult] = useState<BatchResult | null>(null);
+  /** 单行操作的目标：与批量选择分开，避免点行内按钮时把已选的多条覆盖成一条 */
+  const [rowTargets, setRowTargets] = useState<MainAccount[]>([]);
 
-  const { data, isLoading } = useQuery({
-    queryKey: ['accounts', 'main', { q, statusFilter, remoteFilter, uploadedOnly, sort }],
+  const { data, isLoading, isRefreshing, refresh } = useLiveList({
+    queryKey: ['accounts', 'main', { q: values.q, statusFilter, remoteFilter, uploadedOnly, sort, page, pageSize }],
     queryFn: () =>
       accountsApi.list<MainAccount>('main', {
-        q: q || undefined,
+        q: String(values.q || '') || undefined,
         status: statusFilter || undefined,
         remote_status: remoteFilter || undefined,
         uploaded: uploadedOnly ? 'true' : undefined,
         sort: sort ? `${sort.key}:${sort.dir}` : undefined,
-        page_size: 200,
+        page,
+        page_size: pageSize,
       }),
-    refetchInterval: 10_000,
-    placeholderData: keepPreviousData,
+    interval: 10_000,
   });
+
+  const items = useMemo(() => data?.items ?? [], [data]);
+  const total = data?.total ?? 0;
+  const stats = data?.stats ?? {};
+
+  const resetKey = JSON.stringify({ q: values.q, statusFilter, remoteFilter, uploadedOnly, sort, page, pageSize });
+  const selection = useRowSelection({ items, total, resetKey });
 
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: ['accounts', 'main'] });
@@ -70,9 +101,12 @@ export function MainPoolPage() {
   const authorizeMutation = useMutation({
     mutationFn: (ids: number[]) => accountsApi.batchAuthorize(ids),
     onSuccess: (result) => {
-      toast.success(`已发起 ${result.started} 个账号的授权任务`);
-      for (const skip of result.skipped) toast.warning(`账号 ${skip.id} 跳过：${skip.reason}`);
-      setSelected(new Set());
+      setBatchResult({
+        action: '批量授权',
+        succeeded: result.started,
+        skipped: result.skipped.map((skip) => ({ label: `#${skip.id}`, reason: skip.reason })),
+      });
+      selection.clear();
       invalidate();
     },
     onError: (error) => toast.error(errorMessage(error)),
@@ -108,7 +142,8 @@ export function MainPoolPage() {
     mutationFn: (ids: number[]) => accountsApi.batchDiscard(ids),
     onSuccess: (result) => {
       toast.success(`已废弃 ${result.discarded} 个账号`);
-      setSelected(new Set());
+      selection.clear();
+      setRowTargets([]);
       setDiscardOpen(false);
       invalidate();
     },
@@ -119,7 +154,8 @@ export function MainPoolPage() {
     mutationFn: (ids: number[]) => accountsApi.batchDelete(ids),
     onSuccess: (result) => {
       toast.success(`已删除 ${result.deleted} 个账号`);
-      setSelected(new Set());
+      selection.clear();
+      setRowTargets([]);
       setDeleteOpen(false);
       invalidate();
     },
@@ -130,25 +166,54 @@ export function MainPoolPage() {
     mutationFn: ({ ids, options, order }: { ids: number[]; options?: UploadOptions; order?: UploadOrder }) =>
       accountsApi.batchUpload(ids, options, order),
     onSuccess: (result) => {
-      toast.success(`上传完成：新增 ${result.created}，替换 ${result.updated}` + (result.failed.length ? `，失败 ${result.failed.length}` : ''));
-      if (result.failed.length) {
-        toast.error(result.failed.map((f) => `${f.email ?? f.id}: ${f.error}`).slice(0, 3).join('\n'), { duration: 8000 });
-      }
-      setSelected(new Set());
+      setBatchResult({
+        action: '上传到 sub2api',
+        succeeded: result.created + result.updated,
+        notes: [`新增 ${result.created} 条，替换 ${result.updated} 条`],
+        failed: result.failed.map((item) => ({
+          id: item.id,
+          label: item.email ?? `#${item.id}`,
+          reason: item.error,
+        })),
+      });
+      selection.clear();
       invalidate();
       queryClient.invalidateQueries({ queryKey: ['sub2api', 'monitor'] });
     },
     onError: (error) => toast.error(errorMessage(error)),
   });
 
-  const items = data?.items ?? [];
-  const selectedIds = useMemo(() => [...selected], [selected]);
-  const selectedBalance = items.filter((i) => selected.has(i.id)).reduce((sum, i) => sum + (i.balance ?? 0), 0);
-  const stats = data?.stats ?? {};
+  /** 「选中全部 N 条」：批量接口只收 id，先从后端取回全部 id */
+  const filterForIds = useMemo(
+    () => ({
+      pool: 'main' as const,
+      q: String(values.q || '') || undefined,
+      status: statusFilter || undefined,
+      remote_status: remoteFilter || undefined,
+      uploaded: uploadedOnly ? 'true' : undefined,
+      sort: sort ? `${sort.key}:${sort.dir}` : undefined,
+    }),
+    [values.q, statusFilter, remoteFilter, uploadedOnly, sort],
+  );
+
+  const selectAllMatching = useMutation({
+    mutationFn: () => accountsApi.idsByFilter(filterForIds),
+    onSuccess: (result) => {
+      selection.replace(result.ids);
+      if (result.truncated) {
+        toast.warning(`筛选结果超过 ${result.ids.length} 条，已选中前 ${result.ids.length} 条`);
+      }
+    },
+    onError: (error) => toast.error(errorMessage(error)),
+  });
+
+  const selectedBalance = items.filter((account) => selection.isSelected(account.id)).reduce((sum, account) => sum + (account.balance ?? 0), 0);
+  const targetCount = rowTargets.length > 0 ? rowTargets.length : selection.count;
+  const targetIds = rowTargets.length > 0 ? rowTargets.map((account) => account.id) : selection.selectedIds;
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-wrap items-center gap-2">
+      <ListToolbar>
         {(
           [
             { value: 'active', label: '可用', variant: 'success' },
@@ -156,51 +221,33 @@ export function MainPoolPage() {
             { value: 'needs_reauth', label: '待重授', variant: 'warning' },
           ] as const
         ).map((chip) => (
-          <button
+          <ToolbarChip
             key={chip.value}
-            type="button"
-            aria-pressed={statusFilter === chip.value}
-            className="cursor-pointer rounded-full focus-visible:outline-none"
-            onClick={() => setStatusFilter((prev) => (prev === chip.value ? '' : chip.value))}
-          >
-            <Badge
-              variant={chip.variant}
-              className={
-                statusFilter === chip.value
-                  ? 'ring-2 ring-primary ring-offset-2 ring-offset-background'
-                  : 'opacity-80 hover:opacity-100'
-              }
-            >
-              {chip.label} {stats[chip.value] ?? 0}
-            </Badge>
-          </button>
+            label={chip.label}
+            count={stats[chip.value] ?? 0}
+            variant={chip.variant}
+            active={statusFilter === chip.value}
+            onClick={() => set({ statusFilter: statusFilter === chip.value ? '' : chip.value, page: 1 })}
+          />
         ))}
-        <Badge variant="muted">总余额 ${(stats.total_balance ?? 0).toFixed?.(2) ?? stats.total_balance ?? '0.00'}</Badge>
-        <button
-          type="button"
-          aria-pressed={uploadedOnly}
-          className="cursor-pointer rounded-full focus-visible:outline-none"
-          onClick={() => setUploadedOnly((prev) => !prev)}
-        >
-          <Badge
-            variant="secondary"
-            className={
-              uploadedOnly
-                ? 'ring-2 ring-primary ring-offset-2 ring-offset-background'
-                : 'opacity-80 hover:opacity-100'
-            }
-          >
-            已上传 {stats.uploaded ?? 0}
-          </Badge>
-        </button>
-        <div className="flex-1" />
-        <div className="relative">
-          <Search className="absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-          <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="搜索邮箱…" className="h-6 w-56 pl-8" />
-        </div>
+        <ToolbarChip
+          label="已上传"
+          count={stats.uploaded ?? 0}
+          variant="secondary"
+          active={uploadedOnly}
+          onClick={() => set({ uploadedOnly: uploadedOnly ? 0 : 1, page: 1 })}
+        />
+        <ToolbarChip label="总余额" variant="muted" />
+        <span className="tabular-nums -ml-1 text-sm font-semibold">
+          ${Number(stats.total_balance ?? 0).toFixed(2)}
+        </span>
+
+        <ToolbarSpacer />
+
+        <ToolbarSearch value={search.value} onChange={search.setValue} placeholder="搜索邮箱…" className="w-52" />
         <FilterSelect
           value={statusFilter}
-          onValueChange={setStatusFilter}
+          onValueChange={(value) => set({ statusFilter: value, page: 1 })}
           label="全部状态"
           className="w-[132px]"
           options={[
@@ -211,7 +258,7 @@ export function MainPoolPage() {
         />
         <FilterSelect
           value={remoteFilter}
-          onValueChange={setRemoteFilter}
+          onValueChange={(value) => set({ remoteFilter: value, page: 1 })}
           label="全部远端"
           className="w-[132px]"
           options={[
@@ -220,21 +267,14 @@ export function MainPoolPage() {
             { value: 'not_uploaded', label: '未上传' },
           ]}
         />
-        <Button
-          variant="outline"
-          size="sm"
-          disabled={estimateMutation.isPending}
-          onClick={() => estimateMutation.mutate()}
-        >
+        <Button variant="ghost" size="sm" onClick={reset} disabled={!hasActiveFilters}>
+          清除筛选
+        </Button>
+        <Button variant="outline" size="sm" disabled={estimateMutation.isPending} onClick={() => estimateMutation.mutate()}>
           {estimateMutation.isPending ? <Loader2 className="animate-spin" /> : <Coins />}
           预估剩余余额
         </Button>
-        <Button
-          variant="outline"
-          size="sm"
-          disabled={syncRemoteMutation.isPending}
-          onClick={() => syncRemoteMutation.mutate()}
-        >
+        <Button variant="outline" size="sm" disabled={syncRemoteMutation.isPending} onClick={() => syncRemoteMutation.mutate()}>
           {syncRemoteMutation.isPending ? <Loader2 className="animate-spin" /> : <CloudDownload />}
           同步远端
         </Button>
@@ -247,138 +287,156 @@ export function MainPoolPage() {
           size="sm"
           onClick={() =>
             download(
-              selected.size > 0
-                ? `/accounts/export?ids=${selectedIds.join(',')}&format=tosub2`
-                : '/accounts/export?pool=main&format=tosub2',
+              selection.count > 0 && selection.count <= 500
+                ? accountsApi.exportUrl({ ids: selection.selectedIds, format: 'tosub2' })
+                : accountsApi.exportByFilterUrl({ ...filterForIds, format: 'tosub2' }),
               'tosub2-accounts.json',
             ).catch((error) => toast.error(errorMessage(error)))
           }
         >
           <Download />
-          {selected.size > 0 ? `导出所选 (${selected.size})` : '导出账号'}
+          {selection.count > 0 ? `导出所选 (${selection.count})` : '导出账号'}
         </Button>
-      </div>
+        <RefreshButton isRefreshing={isRefreshing} onRefresh={refresh} />
+      </ListToolbar>
 
-      <div className="rounded-lg border bg-card">
-        {isLoading ? (
-          <div className="space-y-2 p-4">
-            {Array.from({ length: 6 }).map((_, i) => (
-              <Skeleton key={i} className="h-10" />
-            ))}
-          </div>
-        ) : items.length === 0 ? (
-          <EmptyState
-            icon={Users}
-            title={statusFilter || remoteFilter || uploadedOnly ? '没有符合条件的账号' : '主号池为空'}
-            description={
-              statusFilter || remoteFilter || uploadedOnly
-                ? '换个条件试试，或点击当前高亮的徽章取消筛选'
-                : '从备用号池「加入主号池」完成邮箱验证码登录，或手动添加账号'
-            }
-          />
-        ) : (
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead className="w-10">
-                  <Checkbox
-                    checked={selected.size === items.length}
-                    onCheckedChange={() =>
-                      setSelected((prev) => (prev.size === items.length ? new Set() : new Set(items.map((i) => i.id))))
-                    }
-                  />
-                </TableHead>
-                <SortableHead label="邮箱" sortKey="email" sort={sort} onSort={setSort} />
-                <SortableHead label="状态" sortKey="status" sort={sort} onSort={setSort} />
-                <SortableHead label="余额" sortKey="balance" sort={sort} onSort={setSort} firstDir="desc" />
-                <SortableHead label="远端状态" sortKey="remote_status" sort={sort} onSort={setSort} />
-                <SortableHead label="上传时间" sortKey="sub2api_uploaded_at" sort={sort} onSort={setSort} firstDir="desc" />
-                <SortableHead label="最近登录" sortKey="last_login_at" sort={sort} onSort={setSort} firstDir="desc" />
-                <TableHead className="text-right">操作</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {items.map((account) => (
-                <TableRow key={account.id}>
-                  <TableCell>
-                    <Checkbox
-                      checked={selected.has(account.id)}
-                      onCheckedChange={() =>
-                        setSelected((prev) => {
-                          const next = new Set(prev);
-                          if (next.has(account.id)) next.delete(account.id);
-                          else next.add(account.id);
-                          return next;
-                        })
-                      }
-                    />
-                  </TableCell>
-                  <TableCell className="max-w-[240px] truncate font-mono text-xs">
-                    {account.status === 'needs_reauth' && <span className="mr-1 text-[var(--warning)]">⚠</span>}
-                    {account.email}
-                    {account.has_password && <Badge variant="secondary" className="ml-2 py-0 font-sans">密码</Badge>}
-                    {account.has_2fa && <Badge variant="info" className="ml-2 py-0 font-sans">2FA</Badge>}
-                  </TableCell>
-                  <TableCell>
-                    <StatusBadge domain="main" value={account.status} />
-                  </TableCell>
-                  <TableCell>
-                    <BalanceTag value={account.balance} checkedAt={account.balance_checked_at} error={account.balance_error} />
-                  </TableCell>
-                  <TableCell>
-                    {account.sub2api_account_id ? (
-                      account.remote_status === 'active' ? (
-                        <Badge variant="success">● active</Badge>
-                      ) : (
-                        <Badge variant="danger">● {account.remote_status}</Badge>
-                      )
-                    ) : (
-                      <span className="text-muted-foreground">—</span>
-                    )}
-                  </TableCell>
-                  <TableCell className="text-xs text-muted-foreground">{formatRelativeTime(account.sub2api_uploaded_at)}</TableCell>
-                  <TableCell className="text-xs text-muted-foreground">{formatRelativeTime(account.last_login_at)}</TableCell>
-                  <TableCell className="text-right">
-                    <div className="flex justify-end gap-1">
-                      <Button size="sm" variant="outline" onClick={() => { setSelected(new Set([account.id])); setUploadOpen(true); }}>
-                        上传
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        disabled={account.status === 'authorizing'}
-                        onClick={() => authorizeMutation.mutate([account.id])}
-                      >
-                        <KeyRound className="h-3.5 w-3.5" />
-                        重新授权
-                      </Button>
-                      <Button size="sm" variant="ghost" onClick={() => balanceMutation.mutate([account.id])}>
-                        <RefreshCw className="h-3.5 w-3.5" />
-                        查余额
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        className="text-destructive"
-                        onClick={() => { setSelected(new Set([account.id])); setDiscardOpen(true); }}
-                      >
-                        <Archive className="h-3.5 w-3.5" />
-                      </Button>
-                    </div>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        )}
-      </div>
+      <ListShell
+        items={items}
+        isLoading={isLoading}
+        emptyIcon={Users}
+        emptyTitle="主号池为空"
+        emptyDescription="从备用号池「加入主号池」完成邮箱验证码登录，或手动添加账号"
+        filtersActive={hasActiveFilters}
+        onClearFilters={reset}
+        header={
+          <>
+            <TableHead className="w-10">
+              <Checkbox
+                checked={selection.headerState}
+                onCheckedChange={selection.toggleAll}
+                aria-label="全选当前页"
+              />
+            </TableHead>
+            <SortableHead label="邮箱" sortKey="email" sort={sort} onSort={(next) => set({ sort: serializeSort(next), page: 1 })} />
+            <SortableHead label="状态" sortKey="status" sort={sort} onSort={(next) => set({ sort: serializeSort(next), page: 1 })} />
+            <SortableHead label="余额" sortKey="balance" sort={sort} firstDir="desc" onSort={(next) => set({ sort: serializeSort(next), page: 1 })} />
+            <SortableHead label="远端状态" sortKey="remote_status" sort={sort} onSort={(next) => set({ sort: serializeSort(next), page: 1 })} />
+            <SortableHead
+              label="上传时间"
+              sortKey="sub2api_uploaded_at"
+              sort={sort}
+              firstDir="desc"
+              onSort={(next) => set({ sort: serializeSort(next), page: 1 })}
+            />
+            <SortableHead
+              label="最近登录"
+              sortKey="last_login_at"
+              sort={sort}
+              firstDir="desc"
+              onSort={(next) => set({ sort: serializeSort(next), page: 1 })}
+            />
+            <TableHead className="text-right">操作</TableHead>
+          </>
+        }
+      >
+        {items.map((account) => (
+          <TableRow key={account.id} data-state={selection.isSelected(account.id) ? 'selected' : undefined}>
+            <TableCell>
+              <Checkbox
+                checked={selection.isSelected(account.id)}
+                onCheckedChange={() => selection.toggle(account.id)}
+                aria-label={`选择 ${account.email}`}
+              />
+            </TableCell>
+            <TableCell className="max-w-[240px] truncate font-mono text-xs">
+              {account.status === 'needs_reauth' && <span className="mr-1 text-[var(--warning)]">⚠</span>}
+              {account.email}
+              {account.has_password && <Badge variant="secondary" className="ml-2 py-0 font-sans">密码</Badge>}
+              {account.has_2fa && <Badge variant="info" className="ml-2 py-0 font-sans">2FA</Badge>}
+            </TableCell>
+            <TableCell>
+              <StatusBadge domain="main" value={account.status} />
+            </TableCell>
+            <TableCell>
+              <BalanceTag value={account.balance} checkedAt={account.balance_checked_at} error={account.balance_error} />
+            </TableCell>
+            <TableCell>
+              {account.sub2api_account_id ? (
+                account.remote_status === 'active' ? (
+                  <Badge variant="success">● active</Badge>
+                ) : (
+                  <Badge variant="danger">● {account.remote_status}</Badge>
+                )
+              ) : (
+                <span className="text-muted-foreground">—</span>
+              )}
+            </TableCell>
+            <TableCell className="text-xs text-muted-foreground">{formatRelativeTime(account.sub2api_uploaded_at)}</TableCell>
+            <TableCell className="text-xs text-muted-foreground">{formatRelativeTime(account.last_login_at)}</TableCell>
+            <TableCell className="text-right">
+              <div className="flex justify-end gap-1">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => {
+                    setRowTargets([account]);
+                    setUploadOpen(true);
+                  }}
+                >
+                  上传
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  disabled={account.status === 'authorizing'}
+                  onClick={() => authorizeMutation.mutate([account.id])}
+                >
+                  <KeyRound />
+                  重新授权
+                </Button>
+                <Button size="sm" variant="ghost" onClick={() => balanceMutation.mutate([account.id])}>
+                  <RefreshCw />
+                  查余额
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="text-destructive"
+                  onClick={() => {
+                    setRowTargets([account]);
+                    setDiscardOpen(true);
+                  }}
+                >
+                  <Archive />
+                </Button>
+              </div>
+            </TableCell>
+          </TableRow>
+        ))}
+      </ListShell>
+
+      <PaginationBar
+        page={page}
+        pageSize={pageSize}
+        total={total}
+        onPageChange={(next) => set({ page: next })}
+        onPageSizeChange={(next) => set({ page_size: next, page: 1 })}
+      />
 
       <BatchActionBar
-        count={selected.size}
+        count={selection.count}
         extra={`合计余额 $${selectedBalance.toFixed(2)}`}
-        onClear={() => setSelected(new Set())}
+        onClear={selection.clear}
       >
-        <Button size="sm" onClick={() => authorizeMutation.mutate(selectedIds)} disabled={authorizeMutation.isPending}>
+        {selection.count > 0 && selection.count <= items.length && total > items.length && (
+          <Button size="sm" variant="ghost" onClick={() => selectAllMatching.mutate()} disabled={selectAllMatching.isPending}>
+            {selectAllMatching.isPending ? '加载中…' : `选中全部 ${total} 条`}
+          </Button>
+        )}
+        {selection.count > items.length && (
+          <span className="text-xs text-muted-foreground">已选中全部 {selection.count} 条筛选结果</span>
+        )}
+        <Button size="sm" onClick={() => authorizeMutation.mutate(selection.selectedIds)} disabled={authorizeMutation.isPending}>
           {authorizeMutation.isPending && <Loader2 className="animate-spin" />}
           批量授权
         </Button>
@@ -386,7 +444,7 @@ export function MainPoolPage() {
           <Upload />
           批量上传 sub2api
         </Button>
-        <Button size="sm" variant="outline" onClick={() => balanceMutation.mutate(selectedIds)}>
+        <Button size="sm" variant="outline" onClick={() => balanceMutation.mutate(selection.selectedIds)}>
           <Coins />
           批量获取余额
         </Button>
@@ -394,9 +452,10 @@ export function MainPoolPage() {
           size="sm"
           variant="outline"
           onClick={() =>
-            download(`/accounts/export?ids=${selectedIds.join(',')}&format=tosub2`, 'tosub2-accounts.json').catch((error) =>
-              toast.error(errorMessage(error)),
-            )
+            download(
+              accountsApi.exportUrl({ ids: selection.selectedIds, format: 'tosub2' }),
+              'tosub2-accounts.json',
+            ).catch((error) => toast.error(errorMessage(error)))
           }
         >
           <Download />
@@ -405,31 +464,48 @@ export function MainPoolPage() {
         <Button
           size="sm"
           variant="outline"
-          onClick={() => download(`/accounts/export?ids=${selectedIds.join(',')}&format=sub2api`, 'sub2api-import.json')}
+          onClick={() => download(accountsApi.exportUrl({ ids: selection.selectedIds, format: 'sub2api' }), 'sub2api-import.json')}
         >
           导出(sub2api)
         </Button>
         <Button
           size="sm"
           variant="outline"
-          onClick={() => download(`/accounts/export?ids=${selectedIds.join(',')}&format=source`, 'accounts-source.txt')}
+          onClick={() => download(accountsApi.exportUrl({ ids: selection.selectedIds, format: 'source' }), 'accounts-source.txt')}
         >
           导出(原始资料)
         </Button>
-        <Button size="sm" variant="destructive" onClick={() => setDiscardOpen(true)}>
+        <Button
+          size="sm"
+          variant="destructive"
+          onClick={() => {
+            setRowTargets([]);
+            setDiscardOpen(true);
+          }}
+        >
           批量废弃
         </Button>
-        <Button size="sm" variant="ghost" className="text-destructive" onClick={() => setDeleteOpen(true)}>
+        <Button
+          size="sm"
+          variant="ghost"
+          className="text-destructive"
+          onClick={() => {
+            setRowTargets([]);
+            setDeleteOpen(true);
+          }}
+        >
           <Trash2 />
         </Button>
       </BatchActionBar>
 
+      <BatchResultDialog result={batchResult} onOpenChange={(open) => !open && setBatchResult(null)} />
+
       <UploadConfigDialog
         open={uploadOpen}
         onOpenChange={setUploadOpen}
-        count={selected.size}
+        count={targetCount}
         busy={uploadMutation.isPending}
-        onUpload={(options, order) => uploadMutation.mutate({ ids: selectedIds, options, order })}
+        onUpload={(options, order) => uploadMutation.mutate({ ids: targetIds, options, order })}
       />
 
       <AddAccountDialog open={addOpen} onOpenChange={setAddOpen} />
@@ -438,24 +514,34 @@ export function MainPoolPage() {
 
       <ConfirmDialog
         open={discardOpen}
-        onOpenChange={setDiscardOpen}
-        title={`废弃 ${selected.size} 个账号？`}
+        onOpenChange={(open) => {
+          setDiscardOpen(open);
+          if (!open) setRowTargets([]);
+        }}
+        title={`废弃 ${targetCount} 个账号？`}
         description="账号将移入废弃号池并记录原因，可随时移回主号池。"
         confirmText="废弃"
         busy={discardMutation.isPending}
-        onConfirm={() => discardMutation.mutate(selectedIds)}
+        onConfirm={() => discardMutation.mutate(targetIds)}
       />
       <ConfirmDialog
         open={deleteOpen}
-        onOpenChange={setDeleteOpen}
-        title={`删除 ${selected.size} 个账号？`}
+        onOpenChange={(open) => {
+          setDeleteOpen(open);
+          if (!open) setRowTargets([]);
+        }}
+        title={`删除 ${targetCount} 个账号？`}
         description="将同时删除凭据、断点与产物文件，操作不可恢复。"
         confirmText="删除"
         busy={deleteMutation.isPending}
-        onConfirm={() => deleteMutation.mutate(selectedIds)}
+        onConfirm={() => deleteMutation.mutate(targetIds)}
       />
     </div>
   );
+}
+
+function serializeSort(sort: SortState | null): string {
+  return sort ? `${sort.key}:${sort.dir}` : '';
 }
 
 function BalanceEstimateDialog({

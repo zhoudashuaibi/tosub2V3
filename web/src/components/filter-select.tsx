@@ -8,7 +8,7 @@ export function FilterSelect({
   label,
   options,
   className,
-  size = 'sm',
+  size = 'default',
 }: {
   value: string;
   onValueChange: (value: string) => void;

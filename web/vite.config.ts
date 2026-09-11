@@ -24,6 +24,16 @@ export default defineConfig({
   build: {
     outDir: '../server/web-dist',
     emptyOutDir: true,
-    chunkSizeWarningLimit: 1200,
+    rollupOptions: {
+      output: {
+        // 把体积大且很少变动的库拆开：发版时用户只需重新下载业务代码
+        manualChunks: {
+          react: ['react', 'react-dom'],
+          tanstack: ['@tanstack/react-query', '@tanstack/react-router'],
+          radix: ['radix-ui'],
+        },
+      },
+    },
+    chunkSizeWarningLimit: 600,
   },
 });

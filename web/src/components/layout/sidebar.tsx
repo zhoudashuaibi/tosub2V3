@@ -12,42 +12,41 @@ import {
   Users,
   UsersRound,
 } from 'lucide-react';
+import type { LucideIcon } from 'lucide-react';
+import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Separator } from '@/components/ui/separator';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { cn } from '@/lib/utils';
 import { useUiStore } from '@/stores/ui';
+import { useLiveList } from '@/hooks/use-live-list';
+import { hotkeyHint, navSections } from '@/lib/nav';
+import { jobsApi } from '@/api';
 
-const NAV_SECTIONS = [
-  { label: '工作台', items: [{ label: '概览', to: '/', icon: LayoutDashboard, exact: true }] },
-  {
-    label: '账号号池',
-    items: [
-      { label: '备用号池', to: '/pools/reserve', icon: Inbox },
-      { label: '主号池', to: '/pools/main', icon: Users },
-      { label: '废弃号池', to: '/pools/discard', icon: Archive },
-    ],
-  },
-  {
-    label: 'TEAM号池',
-    items: [{ label: 'Team号池', to: '/pools/team', icon: UsersRound }],
-  },
-  {
-    label: '系统管理',
-    items: [
-      { label: '任务中心', to: '/jobs', icon: ListChecks },
-      { label: '代理列表', to: '/proxies', icon: Globe },
-      { label: 'Sub2API', to: '/sub2api', icon: Server },
-      { label: '设置', to: '/settings', icon: Settings },
-    ],
-  },
-] satisfies { label: string; items: NavItem[] }[];
-
-type NavItem = { label: string; to: string; icon: typeof Globe; exact?: boolean };
+/** 路由 → 图标。nav.ts 保持纯数据（无 React 依赖），图标映射放在这里。 */
+const ICONS: Record<string, LucideIcon> = {
+  '/': LayoutDashboard,
+  '/pools/reserve': Inbox,
+  '/pools/main': Users,
+  '/pools/discard': Archive,
+  '/pools/team': UsersRound,
+  '/jobs': ListChecks,
+  '/proxies': Globe,
+  '/sub2api': Server,
+  '/settings': Settings,
+};
 
 export function Sidebar() {
   const { sidebarCollapsed, toggleSidebar } = useUiStore();
   const matchRoute = useMatchRoute();
+  // 待输入角标：轻量计数接口（不拉任务行）
+  const { data: jobStats } = useLiveList({
+    queryKey: ['jobs', 'awaiting-stats'],
+    queryFn: () => jobsApi.stats(),
+    interval: 10_000,
+  });
+  const awaiting = jobStats?.stats.awaiting_input ?? 0;
 
   return (
     <aside
@@ -70,26 +69,50 @@ export function Sidebar() {
       <Separator className="bg-sidebar-border" />
       <ScrollArea className="flex-1 px-3 py-4">
         <nav className="flex flex-col gap-5">
-          {NAV_SECTIONS.map((section) => (
+          {navSections().map((section) => (
             <div key={section.label} className="flex flex-col gap-1">
-              {!sidebarCollapsed && <span className="px-2 text-[11px] font-medium text-sidebar-foreground/45">{section.label}</span>}
+              {!sidebarCollapsed && (
+                <span className="px-2 text-[11px] font-medium text-sidebar-foreground/45">{section.label}</span>
+              )}
               {section.items.map((item) => {
-                const active = matchRoute({ to: item.to, fuzzy: !('exact' in item && item.exact) });
-                const Icon = item.icon;
-                return (
+                const active = matchRoute({ to: item.to, fuzzy: !item.exact });
+                const Icon = ICONS[item.to] ?? Globe;
+                const hint = hotkeyHint(item.to);
+                const showBadge = item.badge === 'awaiting' && awaiting > 0;
+
+                const link = (
                   <Link
-                    key={item.to}
                     to={item.to}
                     className={cn(
-                      'flex h-10 items-center gap-3 rounded-md px-2.5 text-sm transition-colors',
-                      active ? 'bg-sidebar-accent font-medium text-sidebar-foreground' : 'text-sidebar-foreground/72 hover:bg-sidebar-accent hover:text-sidebar-foreground',
+                      'group flex h-10 items-center gap-3 rounded-md px-2.5 text-sm transition-colors',
+                      active
+                        ? 'bg-sidebar-accent font-medium text-sidebar-foreground'
+                        : 'text-sidebar-foreground/72 hover:bg-sidebar-accent hover:text-sidebar-foreground',
                       sidebarCollapsed && 'justify-center px-0',
                     )}
-                    title={item.label}
                   >
                     <Icon className="size-4 shrink-0" />
                     {!sidebarCollapsed && <span className="truncate">{item.label}</span>}
+                    {!sidebarCollapsed && showBadge && (
+                      <Badge variant="warning" className="tabular-nums ml-auto px-1.5">
+                        {awaiting}
+                      </Badge>
+                    )}
+                    {!sidebarCollapsed && !showBadge && hint && (
+                      <kbd className="ml-auto hidden text-[10px] text-sidebar-foreground/40 group-hover:inline">{hint}</kbd>
+                    )}
                   </Link>
+                );
+
+                if (!sidebarCollapsed) return <span key={item.to}>{link}</span>;
+                return (
+                  <Tooltip key={item.to}>
+                    <TooltipTrigger asChild>{link}</TooltipTrigger>
+                    <TooltipContent side="right">
+                      {item.label}
+                      {hint ? `（${hint}）` : ''}
+                    </TooltipContent>
+                  </Tooltip>
                 );
               })}
             </div>
@@ -97,8 +120,17 @@ export function Sidebar() {
         </nav>
       </ScrollArea>
       <div className="p-3">
-        <Button variant="ghost" size="sm" className={cn('w-full text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-foreground', sidebarCollapsed ? 'justify-center px-0' : 'justify-start')} onClick={toggleSidebar}>
-          {sidebarCollapsed ? <PanelLeftOpen data-icon="inline-start" /> : <PanelLeftClose data-icon="inline-start" />}
+        <Button
+          variant="ghost"
+          size="sm"
+          className={cn(
+            'w-full text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-foreground',
+            sidebarCollapsed ? 'justify-center px-0' : 'justify-start',
+          )}
+          onClick={toggleSidebar}
+          title={sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'}
+        >
+          {sidebarCollapsed ? <PanelLeftOpen /> : <PanelLeftClose />}
           {!sidebarCollapsed && '收起侧边栏'}
         </Button>
       </div>

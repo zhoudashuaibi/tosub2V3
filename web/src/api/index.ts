@@ -1,7 +1,8 @@
-import { api } from './client';
+import { api, download } from './client';
 import type {
   AccountCredentialsView,
   DashboardSummary,
+  DiscardUsageSyncResult,
   ImportResult,
   Job,
   MainAccount,
@@ -30,6 +31,9 @@ import type {
   UploadOptions,
   UploadOrder,
 } from './types';
+
+/** 账号导出格式 */
+export type AccountExportFormat = 'tosub2' | 'sub2api' | 'source';
 
 // ---------- auth ----------
 export const authApi = {
@@ -110,9 +114,41 @@ export const accountsApi = {
     ),
   batchDiscard: (ids: number[]) => api<{ discarded: number }>('/accounts/batch-discard', { json: { ids } }),
   restore: (id: number) => api<{ ok: boolean; status: string }>(`/accounts/${id}/restore`, { json: {} }),
+  /** 批量移回主号池：替代 N 次串行单条 restore */
+  batchRestore: (ids: number[]) =>
+    api<{ restored: number; skipped: number }>('/accounts/batch-restore', { json: { ids } }),
   batchDelete: (ids: number[]) => api<{ deleted: number }>('/accounts/batch-delete', { json: { ids } }),
   events: (id: number) =>
     api<{ items: { type: string; detail: Record<string, unknown> | null; created_at: string }[] }>(`/accounts/${id}/events`),
+
+  // ---------- 废弃池「已用额度」 ----------
+  /**
+   * 从 sub2api 拉取废弃号的累计已用额度并落库。
+   * 省略 ids 时按筛选/陈旧度同步；force=true 全量重算。
+   */
+  syncDiscardUsage: (body: { ids?: number[]; force?: boolean } = {}) =>
+    api<DiscardUsageSyncResult>('/accounts/discard-usage-sync', { json: body }),
+
+  /** 导出（GET 下载，带 Cookie） */
+  exportUrl: (params: { ids?: number[]; pool?: Pool; format: AccountExportFormat }) =>
+    `/accounts/export?${toQuery({
+      ids: params.ids?.length ? params.ids.join(',') : undefined,
+      pool: params.pool,
+      format: params.format,
+    })}`,
+  /**
+   * 按当前筛选取出全部 id（「选中全部 N 条」用）。
+   * 批量接口只收 id 列表，因此由服务端按与列表相同的口径解析，前端再按 maxItems 分片。
+   */
+  idsByFilter: (filter: AccountFilter & { pool: Pool; limit?: number }) =>
+    api<{ ids: number[]; total: number; truncated: boolean }>(`/accounts/ids?${toQuery(filter)}`),
+  /**
+   * 按当前筛选导出。
+   * 勾选「全部 N 条」时 ids 可能有几千个，塞进 query string 会超长，
+   * 因此改为把筛选条件传给服务端，由它用与列表完全相同的口径解析行集合。
+   */
+  exportByFilterUrl: (filter: AccountFilter & { pool: Pool; format: AccountExportFormat }) =>
+    `/accounts/export-by-filter?${toQuery(filter)}`,
 };
 
 // ---------- jobs ----------
@@ -122,11 +158,20 @@ export interface JobFilter {
   q?: string;
   page?: number;
   page_size?: number;
+  /** 只取计数：全局待输入提醒用，避免拉回整页任务行 */
+  stats_only?: string;
+  /** 只取任务行：不重算 stats */
+  items_only?: string;
 }
 
 export const jobsApi = {
   list: (f: JobFilter = {}) =>
     api<Paged<Job> & { stats: { queued: number; running: number; awaiting_input: number } }>(`/jobs?${toQuery(f)}`),
+  /** 轻量计数：全局提醒轮询用（不返回任务行） */
+  stats: () =>
+    api<{ total: number; stats: { queued: number; running: number; awaiting_input: number } }>(
+      '/jobs?stats_only=1&page_size=1',
+    ),
   get: (id: string) => api<Job & { can_download?: boolean }>(`/jobs/${id}`),
   logs: (id: string, after: number, limit = 65536) =>
     api<{ chunk: string; next_offset: number; eof: boolean }>(`/jobs/${id}/logs?after=${after}&limit=${limit}`),

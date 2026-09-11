@@ -26,7 +26,7 @@ export function useOrderPreference(storageKey: string): [UploadOrder | '', (valu
 export function UploadOrderSelect({
   value,
   onValueChange,
-  size = 'sm',
+  size = 'default',
 }: {
   value: UploadOrder | '';
   onValueChange: (value: UploadOrder | '') => void;
@@ -37,7 +37,7 @@ export function UploadOrderSelect({
       value={value}
       onValueChange={(next) => onValueChange(next === '' ? '' : (next as UploadOrder))}
       label="按选择顺序（默认）"
-      className={size === 'sm' ? 'w-[208px]' : 'w-full'}
+      className={size === 'sm' ? 'w-[200px]' : 'w-full'}
       size={size}
       options={UPLOAD_ORDER_OPTIONS}
     />

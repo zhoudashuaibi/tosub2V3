@@ -115,9 +115,49 @@ export interface DiscardAccount {
   status: string;
   discard_reason: 'banned_401' | 'rate_limited_429' | 'repair_failed' | 'login_failed' | 'manual' | null;
   discard_detail: string | null;
+  /** 最后一次余额快照。历史字段，界面不再当作「废弃时余额」展示 */
   balance: number | null;
   banned: boolean;
   discarded_at: string | null;
+  /** 加入备用号池时间：COALESCE(imported_at, created_at) */
+  reserve_joined_at: string | null;
+  /** 加入主号池时间：首次 join_succeeded 事件时间，无事件回退 created_at */
+  joined_main_at: string | null;
+  /** 废弃时（或最近一次同步时）的 sub2api 累计已用额度 */
+  used_amount: number | null;
+  /** 该数值的抓取时间；为空表示从未同步 */
+  used_amount_at: string | null;
+  /** 取值来源，如 used_amount / usage_stats.summary.total_cost */
+  used_amount_source: string | null;
+  /** 无快照或快照超过 24h → 待同步 */
+  used_amount_stale: boolean;
+}
+
+/** 废弃池用量同步的分类结果（reason 词表与主池预估保持一致） */
+export type DiscardUsageReason = 'not_linked' | 'remote_account_not_found' | 'remote_used_amount_unknown';
+
+export interface DiscardUsageItem {
+  id: number;
+  email: string;
+  used_amount: number | null;
+  used_amount_source: string | null;
+  used_amount_at: string | null;
+  remote_account_id: number | null;
+  reason: DiscardUsageReason | null;
+  ok: boolean;
+}
+
+export interface DiscardUsageSyncResult {
+  ok: boolean;
+  summary: {
+    scanned: number;
+    updated: number;
+    not_linked: number;
+    remote_account_not_found: number;
+    remote_used_amount_unknown: number;
+    failed: number;
+  };
+  items: DiscardUsageItem[];
 }
 
 export type Account = ReserveAccount | MainAccount | DiscardAccount;
@@ -172,7 +212,11 @@ export interface Job {
   attempt: number;
   proxy_id: number | null;
   proxy_display: string | null;
-  error: string | null;
+  /** 仅详情接口返回完整错误；列表只给 has_error + error_summary */
+  error?: string | null;
+  has_error: boolean;
+  /** 列表用的截断摘要（≤120 字符） */
+  error_summary: string | null;
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
@@ -445,6 +489,13 @@ export interface SettingsView {
     };
   };
 }
+
+/** 废弃池的 reason → 中文文案（与主池预估余额的未知原因词表同源） */
+export const DISCARD_USAGE_REASON_LABELS: Record<DiscardUsageReason, string> = {
+  not_linked: '未上传 sub2api',
+  remote_account_not_found: 'sub2api 中已无此账号',
+  remote_used_amount_unknown: 'sub2api 未提供用量字段',
+};
 
 export const STAGE_LABELS: Record<string, string> = {
   web_login: '进入登录',

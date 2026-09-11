@@ -1,3 +1,4 @@
+import { lazy, Suspense } from 'react';
 import {
   createRootRoute,
   createRoute,
@@ -8,17 +9,43 @@ import {
 import { useQuery } from '@tanstack/react-query';
 import { authApi } from '@/api';
 import { TooltipProvider } from '@/components/ui/tooltip';
+import { Skeleton } from '@/components/ui/skeleton';
 import { AuthLayout } from '@/components/layout/auth-layout';
 import { LoginPage } from '@/pages/login';
-import { DashboardPage } from '@/pages/dashboard';
-import { ReservePoolPage } from '@/pages/pools/reserve';
-import { MainPoolPage } from '@/pages/pools/main';
-import { DiscardPoolPage } from '@/pages/pools/discard';
-import { TeamPoolPage } from '@/pages/pools/team';
-import { JobsPage } from '@/pages/jobs';
-import { ProxiesPage } from '@/pages/proxies';
-import { Sub2ApiPage } from '@/pages/sub2api';
-import { SettingsPage } from '@/pages/settings';
+
+/**
+ * 路由级代码分割。
+ *
+ * 原先是单 chunk 全量加载（约 685 KB），首屏必须解析完 team/sub2api 这些重页面才能渲染。
+ * 拆开后首屏只加载概览与登录所需的代码，其余页面按导航命中时再取。
+ */
+const DashboardPage = lazy(() => import('@/pages/dashboard').then((m) => ({ default: m.DashboardPage })));
+const ReservePoolPage = lazy(() => import('@/pages/pools/reserve').then((m) => ({ default: m.ReservePoolPage })));
+const MainPoolPage = lazy(() => import('@/pages/pools/main').then((m) => ({ default: m.MainPoolPage })));
+const DiscardPoolPage = lazy(() => import('@/pages/pools/discard').then((m) => ({ default: m.DiscardPoolPage })));
+const TeamPoolPage = lazy(() => import('@/pages/pools/team').then((m) => ({ default: m.TeamPoolPage })));
+const JobsPage = lazy(() => import('@/pages/jobs').then((m) => ({ default: m.JobsPage })));
+const ProxiesPage = lazy(() => import('@/pages/proxies').then((m) => ({ default: m.ProxiesPage })));
+const Sub2ApiPage = lazy(() => import('@/pages/sub2api').then((m) => ({ default: m.Sub2ApiPage })));
+const SettingsPage = lazy(() => import('@/pages/settings').then((m) => ({ default: m.SettingsPage })));
+
+/** 页面级骨架：与列表页加载态视觉一致，避免切换时闪白。 */
+function PageSkeleton() {
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center gap-2">
+        {Array.from({ length: 4 }).map((_, index) => (
+          <Skeleton key={index} className="h-6 w-20" />
+        ))}
+      </div>
+      <div className="table-shell space-y-2 rounded-lg border bg-card p-4">
+        {Array.from({ length: 6 }).map((_, index) => (
+          <Skeleton key={index} className="h-10" />
+        ))}
+      </div>
+    </div>
+  );
+}
 
 /** 根路由：只挂全局 Provider，不做认证守卫（login 页必须在守卫之外）。 */
 function RootLayout() {
@@ -72,6 +99,21 @@ const loginRoute = createRoute({
   component: LoginPage,
 });
 
+/** 列表页的 URL 查询参数：宽松解析，非法值回退默认，保证手改 URL 不炸。 */
+function listSearch(search: Record<string, unknown>): Record<string, string | number> {
+  const out: Record<string, string | number> = {};
+  for (const [key, value] of Object.entries(search)) {
+    if (value === undefined || value === null || value === '') continue;
+    if (key === 'page' || key === 'page_size') {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed) && parsed > 0) out[key] = parsed;
+      continue;
+    }
+    out[key] = String(value);
+  }
+  return out;
+}
+
 const indexRoute = createRoute({
   getParentRoute: () => authLayoutRoute,
   path: '/',
@@ -81,18 +123,21 @@ const indexRoute = createRoute({
 const reserveRoute = createRoute({
   getParentRoute: () => authLayoutRoute,
   path: '/pools/reserve',
+  validateSearch: listSearch,
   component: withLayout('备用号池', ReservePoolPage),
 });
 
 const mainRoute = createRoute({
   getParentRoute: () => authLayoutRoute,
   path: '/pools/main',
+  validateSearch: listSearch,
   component: withLayout('主号池', MainPoolPage),
 });
 
 const discardRoute = createRoute({
   getParentRoute: () => authLayoutRoute,
   path: '/pools/discard',
+  validateSearch: listSearch,
   component: withLayout('废弃号池', DiscardPoolPage),
 });
 
@@ -105,12 +150,14 @@ const teamRoute = createRoute({
 const jobsRoute = createRoute({
   getParentRoute: () => authLayoutRoute,
   path: '/jobs',
+  validateSearch: listSearch,
   component: withLayout('任务中心', JobsPage),
 });
 
 const proxiesRoute = createRoute({
   getParentRoute: () => authLayoutRoute,
   path: '/proxies',
+  validateSearch: listSearch,
   component: withLayout('代理列表', ProxiesPage),
 });
 
@@ -126,11 +173,13 @@ const settingsRoute = createRoute({
   component: withLayout('设置', SettingsPage),
 });
 
-function withLayout(title: string, Page: React.ComponentType) {
+function withLayout(title: string, Page: React.LazyExoticComponent<React.ComponentType>) {
   function Wrapped() {
     return (
       <AuthLayout title={title}>
-        <Page />
+        <Suspense fallback={<PageSkeleton />}>
+          <Page />
+        </Suspense>
       </AuthLayout>
     );
   }
@@ -161,9 +210,9 @@ declare module '@tanstack/react-router' {
   }
 }
 
-// client.ts 触发的 401 事件 → 清缓存跳登录
+// client.ts 触发的 401 事件 → 回登录页
 if (typeof window !== 'undefined') {
   window.addEventListener('tosub2:unauthorized', () => {
-    window.location.href = '/login';
+    if (window.location.pathname !== '/login') window.location.href = '/login';
   });
 }

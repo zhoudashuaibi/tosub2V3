@@ -19,21 +19,33 @@
   <body>
     <div id="root"></div>
     <script>
-      window.__bootErrors = [];
-      window.addEventListener('error', function (e) {
-        window.__bootErrors.push(String(e.message));
-        var d = document.createElement('div');
-        d.id = 'boot-error';
-        d.style.cssText = 'position:fixed;bottom:0;left:0;right:0;background:#dc2626;color:#fff;padding:8px;font:12px monospace;white-space:pre-wrap;z-index:99999';
-        d.textContent = 'JS ERROR: ' + e.message;
-        document.body.appendChild(d);
-      });
-      window.addEventListener('unhandledrejection', function (e) {
-        var d = document.createElement('div');
-        d.style.cssText = 'position:fixed;bottom:0;left:0;right:0;background:#b45309;color:#fff;padding:8px;font:12px monospace;white-space:pre-wrap;z-index:99999';
-        d.textContent = 'REJECTION: ' + (e.reason && (e.reason.stack || e.reason.message) || e.reason);
-        document.body.appendChild(d);
-      });
+      // 全局错误兜底横幅：只在开发模式或 URL 带 ?debug=1 时挂载，
+      // 避免生产环境把原始异常直接暴露在页面底部。
+      (function () {
+        var debug = /[?&]debug=1\b/.test(location.search);
+        if (!debug) return;
+        function banner(background) {
+          return function (text) {
+            var d = document.createElement('div');
+            d.style.cssText =
+              'position:fixed;bottom:0;left:0;right:0;background:' +
+              background +
+              ';color:#fff;padding:8px;font:12px monospace;white-space:pre-wrap;z-index:99999';
+            d.textContent = text;
+            document.body.appendChild(d);
+          };
+        }
+        var show = banner('#dc2626');
+        var warn = banner('#b45309');
+        window.__bootErrors = [];
+        window.addEventListener('error', function (e) {
+          window.__bootErrors.push(String(e.message));
+          show('JS ERROR: ' + e.message);
+        });
+        window.addEventListener('unhandledrejection', function (e) {
+          warn('REJECTION: ' + ((e.reason && (e.reason.stack || e.reason.message)) || e.reason));
+        });
+      })();
     </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
