@@ -1,6 +1,8 @@
 node_modules
 server/web-dist
-data
+# 必须写成 /data：不带斜杠的 data 会匹配任意层级的同名路径段，
+# 从而把 web/src/components/data/ 这类源码目录一起忽略掉
+/data
 data-backup-*
 tmp
 *.log
