@@ -117,6 +117,10 @@ export interface DiscardAccount {
   discard_detail: string | null;
   /** 最后一次余额快照。历史字段，界面不再当作「废弃时余额」展示 */
   balance: number | null;
+  /** 初始余额（导入时从邮箱余额通知初始化），放在「已用额度」前展示 */
+  initial_balance: number | null;
+  /** 是否拿到过初始余额；false 时 initial_balance 不可信（界面显示「未查询」） */
+  has_balance: boolean;
   banned: boolean;
   discarded_at: string | null;
   /** 加入备用号池时间：COALESCE(imported_at, created_at) */

@@ -6,6 +6,7 @@ import { accountsApi } from '@/api';
 import { download, errorMessage } from '@/api/client';
 import type { DiscardAccount, DiscardUsageSyncResult } from '@/api/types';
 import { DISCARD_USAGE_REASON_LABELS } from '@/api/types';
+import { BalanceTag } from '@/components/balance-tag';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
@@ -220,7 +221,8 @@ export function DiscardPoolPage() {
   return (
     <div className="space-y-4">
       <div className="rounded-md bg-muted/60 px-4 py-2.5 text-sm text-muted-foreground">
-        移回主号池后账号为「待重新授权」状态，建议先批量授权再上传。「已用额度」取自 sub2api 账号用量统计，
+        移回主号池后账号为「待重新授权」状态，建议先批量授权再上传。「初始余额」为导入时从邮箱余额
+        初始化的值（与备用池同源，未拿到时显示「未查询」）；「已用额度」取自 sub2api 账号用量统计，
         与主号池预估剩余余额同源。
       </div>
 
@@ -357,6 +359,13 @@ export function DiscardPoolPage() {
               onSort={(next) => set({ sort: serializeSort(next), page: 1 })}
             />
             <SortableHead
+              label="初始余额"
+              sortKey="initial_balance"
+              sort={sort}
+              firstDir="desc"
+              onSort={(next) => set({ sort: serializeSort(next), page: 1 })}
+            />
+            <SortableHead
               label="已用额度"
               sortKey="discard_used_amount"
               sort={sort}
@@ -404,6 +413,9 @@ export function DiscardPoolPage() {
             </TableCell>
             <TableCell className="text-xs text-muted-foreground" title={formatDateTime(account.joined_main_at)}>
               {account.joined_main_at ? formatRelativeTime(account.joined_main_at) : '—'}
+            </TableCell>
+            <TableCell>
+              <BalanceTag value={account.has_balance ? account.initial_balance : null} />
             </TableCell>
             <TableCell>
               <UsedAmountTag account={account} />

@@ -128,6 +128,8 @@ const SORT_WHITELIST = {
     created_at: 'created_at',
     email: 'email',
     discarded_at: 'discarded_at',
+    // 初始余额：与备用池同列（导入时初始化的余额），UI 放在「已用额度」前面
+    initial_balance: 'initial_balance',
     // 时间线列：SELECT 里的派生别名，SQLite 允许 ORDER BY 引用它
     reserve_joined_at: 'reserve_joined_at',
     joined_main_at: 'joined_main_at',
@@ -460,6 +462,9 @@ export function createAccountsModule({ engine, logger }) {
         discard_detail: row.discard_detail ? sanitizeText(row.discard_detail) : null,
         // balance 保留给导出与既有调用方；UI 不再把它当作「废弃时余额」展示
         balance: row.balance,
+        // 初始余额（导入时初始化，来自邮箱余额通知）；has_balance=0 表示从未拿到过
+        initial_balance: row.initial_balance ?? null,
+        has_balance: Boolean(row.has_balance),
         banned: Boolean(row.banned),
         discarded_at: row.discarded_at,
         // ---- 时间线 ----

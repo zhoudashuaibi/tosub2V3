@@ -185,6 +185,25 @@ test('已用额度：可按用量排序，未知沉底（两个方向都是）',
   assert.deepEqual(asc.items.map((item) => item.id), [3, 1, 2]);
 });
 
+test('初始余额：废弃池列表返回该列（排在已用额度前）并可排序', async (t) => {
+  const { app, db } = await setup(t);
+  db.prepare('UPDATE accounts SET initial_balance=20, has_balance=1 WHERE id=1').run();
+
+  const body = await listDiscard(app);
+  // 注意 id 不在排序白名单里，一律建 id → item 的映射再断言，别依赖行序
+  const byId = new Map(body.items.map((item) => [item.id, item]));
+  assert.equal(byId.get(1).initial_balance, 20);
+  assert.equal(byId.get(1).has_balance, true);
+  // 从未初始化过余额的号：数值为 null、has_balance=false，界面据此显示「未查询」
+  assert.equal(byId.get(2).initial_balance, null);
+  assert.equal(byId.get(2).has_balance, false);
+
+  const desc = await listDiscard(app, 'sort=initial_balance:desc');
+  assert.equal(desc.items[0].id, 1, 'DESC 时有余额的号排最前');
+  const asc = await listDiscard(app, 'sort=initial_balance:asc');
+  assert.equal(asc.items.at(-1).id, 1, 'ASC 时 NULL 在前，20 落到最后');
+});
+
 test('同步端点：分类统计（更新 / 远端无此号 / 未关联）并落库', async (t) => {
   const { app, db } = await setup(t);
   const response = await app.inject({
