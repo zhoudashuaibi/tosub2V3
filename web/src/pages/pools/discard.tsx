@@ -4,10 +4,11 @@ import { Archive, RotateCcw, Trash2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { accountsApi } from '@/api';
 import { download, errorMessage } from '@/api/client';
-import type { DiscardAccount, DiscardUsageSyncResult } from '@/api/types';
+import type { CodexFingerprintMode, DiscardAccount, DiscardUsageSyncResult } from '@/api/types';
 import { DISCARD_USAGE_REASON_LABELS } from '@/api/types';
 import { BalanceTag } from '@/components/balance-tag';
 import { Badge } from '@/components/ui/badge';
+import { CODEX_FINGERPRINT_MODE_OPTIONS } from '@/components/codex-fingerprint-mode-select';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { TableCell, TableHead, TableRow } from '@/components/ui/table';
@@ -40,6 +41,26 @@ const REASON_CHIPS: Array<{ value: keyof typeof REASON_LABELS; variant: 'danger'
   { value: 'login_failed', variant: 'danger' },
   { value: 'manual', variant: 'muted' },
 ];
+
+/**
+ * 封号时 Codex 指纹收敛档位的紧凑标签（表内用，宽度有限）。
+ * 完整文案（含「默认」「风险」等说明）在悬浮提示里复用上传弹窗那份
+ * CODEX_FINGERPRINT_MODE_OPTIONS，避免两处文案漂移。
+ */
+const FINGERPRINT_LABELS: Record<CodexFingerprintMode, string> = {
+  off: '关闭（透传）',
+  device: '仅设备',
+  session: '设备+会话',
+  full: '完全收敛',
+};
+
+/** 收敛越强越可疑：全收敛用警示色吸引眼球，透传用弱化色，一眼能看出「这批号是不是都开了收敛」。 */
+const FINGERPRINT_VARIANTS: Record<CodexFingerprintMode, 'muted' | 'secondary' | 'info' | 'warning'> = {
+  off: 'muted',
+  device: 'secondary',
+  session: 'info',
+  full: 'warning',
+};
 
 function localDateValue(date = new Date()) {
   const year = date.getFullYear();
@@ -225,6 +246,8 @@ export function DiscardPoolPage() {
         初始化的值（与备用池同源，未拿到时显示「未查询」）；「已用额度」取自 sub2api 账号用量统计，
         与主号池预估剩余余额同源；「代理 IP」是废弃那一刻抓的出口代理快照（代理名 + 认证账号），
         同一个代理上死了一批号就是该 IP 被拉黑的信号 —— 搜索框支持直接搜代理名或认证账号。
+        「Codex 指纹收敛」同样是**废弃那一刻**从远端账号 extra 抓的档位快照（off = 远端没开收敛），
+        同一档收敛下死了一批号就是该档位可疑的信号，点表头可把同档的号聚在一起看。
       </div>
 
       <ListToolbar>
@@ -350,6 +373,12 @@ export function DiscardPoolPage() {
               sort={sort}
               onSort={(next) => set({ sort: serializeSort(next), page: 1 })}
             />
+            <SortableHead
+              label="Codex 指纹收敛"
+              sortKey="codex_fingerprint_mode"
+              sort={sort}
+              onSort={(next) => set({ sort: serializeSort(next), page: 1 })}
+            />
             <TableHead>详情</TableHead>
             <SortableHead
               label="加入备用池"
@@ -405,6 +434,9 @@ export function DiscardPoolPage() {
             </TableCell>
             <TableCell>
               <DiscardProxyCell account={account} />
+            </TableCell>
+            <TableCell>
+              <DiscardCodexFingerprintCell account={account} />
             </TableCell>
             <TableCell className="max-w-[240px]">
               {account.discard_detail ? (
@@ -571,6 +603,52 @@ function DiscardProxyCell({ account }: { account: DiscardAccount }) {
         {account.proxy_id != null && <div className="text-muted-foreground">代理 ID：{account.proxy_id}</div>}
         <div className="text-muted-foreground">
           废弃当时抓取（{formatDateTime(account.proxy_at)}）；认证账号是代理服务商那一侧的账号，不是号本身
+        </div>
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+/**
+ * 封号时的 Codex 指纹收敛档位：四档之一，或「—」（读不到）。
+ *
+ * 与「代理 IP」列同一个用途 —— 封号归因：同一档收敛下死了一批号，就是该档位可疑的信号。
+ * 值同样是废弃那一刻从远端账号 extra 抓的快照，之后不改写（远端档位随时能被人改，
+ * 事后现查得到的是「现在是什么」，与封号当时无关）。
+ *
+ * off 照实显示「关闭（透传）」而不是并入「—」：远端没开收敛是**确定**的结论
+ * （sub2api 契约里 off 就是不写这个 extra 键），跟「没抓到」是两回事，
+ * 混起来就分不清「这批号都没开收敛」和「这批号压根没抓到档位」。
+ */
+function DiscardCodexFingerprintCell({ account }: { account: DiscardAccount }) {
+  const mode = account.codex_fingerprint_mode;
+  if (!mode) {
+    return (
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="cursor-help text-xs text-muted-foreground underline decoration-dotted underline-offset-4">
+            —
+          </span>
+        </TooltipTrigger>
+        <TooltipContent className="max-w-md">
+          没有这条号的收敛档位记录：本列是废弃那一刻从 sub2api 远端账号 extra 抓的快照。
+          从未上传过远端、远端账号已被删除，或远端对象不带 extra 时会取不到，不反推成「关闭」
+        </TooltipContent>
+      </Tooltip>
+    );
+  }
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Badge variant={FINGERPRINT_VARIANTS[mode]} className="cursor-help">
+          {FINGERPRINT_LABELS[mode]}
+        </Badge>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-md">
+        <div>{CODEX_FINGERPRINT_MODE_OPTIONS.find((option) => option.value === mode)?.label ?? mode}</div>
+        <div className="text-muted-foreground">
+          废弃当时抓取（{formatDateTime(account.codex_fingerprint_at)}），取自 sub2api 账号
+          extra.codex_fingerprint_mode；之后远端改档位也不会改写这里
         </div>
       </TooltipContent>
     </Tooltip>

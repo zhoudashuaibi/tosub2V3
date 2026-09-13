@@ -136,7 +136,11 @@
 { "items": [{
     "id": 301, "email": "y@b.com", "pool": "discard", "status": "discarded",
     "discard_reason": "rate_limited_429", "discard_detail": "upstream 429 too many requests ...",
-    "balance": 0.2, "discarded_at": "..."
+    "balance": 0.2, "discarded_at": "...",
+    // 废弃那一刻的快照（之后不改写；取不到即 null，不反推）：
+    "proxy_name": "23", "proxy_user": "u123", "proxy_id": 23, "proxy_at": "...",
+    // 封号时的 Codex 指纹收敛档位：off | device | session | full；null = 读不到（off 是有效值）
+    "codex_fingerprint_mode": "session", "codex_fingerprint_at": "..."
   }],
   "total": 12, "stats": { "banned_401": 8, "rate_limited_429": 2, "repair_failed": 1, "manual": 1 } }
 ```

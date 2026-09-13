@@ -500,10 +500,10 @@ export function createMonitor({ db, crypto, client, getConfig, pools, engine, up
    */
   async function discardLocal(local, reason, detail, remote, monitor) {
     try {
-      // 用量/出口代理快照不在这里做：pools.moveToDiscard 落库后会统一触发 onDiscarded 钩子，
-      // 所有废弃入口（手动/巡检/登录终局失败）走同一条 best-effort 通道。
-      // remote 必须一起传下去：代理绑定只在「废弃这一刻」可靠，事务提交后这个号
-      // 会被暂停调度、也可能被改绑或删除，事后再查就取不到真正的出口 IP 了。
+      // 用量/出口代理/Codex 指纹收敛快照都不在这里做：pools.moveToDiscard 落库后会统一触发
+      // onDiscarded 钩子，所有废弃入口（手动/巡检/登录终局失败）走同一条 best-effort 通道。
+      // remote 必须一起传下去：代理绑定与收敛档位都只在「废弃这一刻」可靠，事务提交后这个号
+      // 会被暂停调度、也可能被改绑/删号/改档位，事后再查就取不到封号当时的状态了。
       pools.moveToDiscard(local.id, reason, detail, { proxy: remote ?? null });
     } catch (error) {
       logger.debug({ accountId: local.id }, `monitor discard skipped: ${error.message}`);

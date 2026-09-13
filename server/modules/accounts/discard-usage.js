@@ -1,5 +1,5 @@
 /**
- * 废弃号池「已用额度」快照。
+ * 废弃号池「已用额度」快照 + 废弃瞬间的「远端事实」快照（出口代理 / Codex 指纹收敛档位）。
  *
  * 取值与「主号池预估剩余余额」完全同源：sub2api 管理端账号用量
  * （client.accountUsedAmount → used_amount / consumed_amount / total_cost / usage.* /
@@ -10,12 +10,14 @@
  *     只能在废弃当下抓一次；事后刷新得到的是当前累计值，UI 会标注同步时间。
  *  2. 远端账号可能被删除（远端同步只扫主号池，废弃号的 sub2api_account_id 会变陈旧），
  *     快照能保住已有数字。
+ *  3. 出口代理与 Codex 指纹收敛档位同理，而且更脆：代理会被「一键更换 IP」改绑并删掉旧代理，
+ *     收敛档位可以在 sub2api 账号编辑页随时改 —— 错过废弃那一刻，两者都再也查不到「当时是多少」。
  *
  * 远端解析沿用与主池预估相同的双路回退：sub2api_account_id 命中 → 否则按 email 命中。
  */
 
 import { proxyAuthAccount } from '../../lib/sanitize.js';
-import { extractRemoteProxy } from '../sub2api/remote-sync.js';
+import { extractRemoteProxy, extractCodexFingerprintMode } from '../sub2api/remote-sync.js';
 
 /** 未知用量的原因词表 —— 与 buildMainBalanceEstimate 的 reason 保持一致，前端可复用同一套文案。 */
 export const DISCARD_USAGE_REASONS = {
@@ -271,6 +273,32 @@ export function createDiscardUsage({
   }
 
   /**
+   * 废弃号池「封号时的 Codex 指纹收敛档位」快照。
+   *
+   * 与出口代理同属「事后查不到」的信息：档位只存在远端账号 extra 上，本地库没有第二份，
+   * 而号废弃后可能被暂停/清理、档位也可能被人改过。所以同一时刻抓一次落库，之后不改写。
+   *
+   * off 是**有效值**（远端确实没开收敛），照写；只有读不到（从未上传 / 远端账号已删除 /
+   * 远端对象不带 extra）才留空，UI 显示「—」。绝不把「不知道」写成 off。
+   */
+  function writeCodexFingerprintSnapshot(accountId, mode) {
+    const value = mode == null || String(mode).trim() === '' ? null : String(mode).trim();
+    if (!value) return null;
+    const now = new Date().toISOString();
+    const result = db
+      .prepare(
+        `UPDATE accounts SET discard_codex_fingerprint_mode=?, discard_codex_fingerprint_at=?, updated_at=?
+         WHERE id=? AND pool='discard'`,
+      )
+      .run(value, now, now, accountId);
+    // 账号已被移回主池/删除时流水数=0：不留快照，也不留事件（否则列是空的、事件却写着有档位）
+    if (result.changes === 0) return null;
+    // 审计事件与「废弃」「代理快照」分开记：封号当时是哪一档收敛，事后要能单独回溯
+    recordEvent(accountId, 'discard_codex_fingerprint_snapshot', { mode: value });
+    return now;
+  }
+
+  /**
    * 本机 tosub2 代理兜底：该号最后一条用过代理的任务。
    *
    * 唯一索引保证每个账号同时只有一条活跃任务，所以「最后一次」就是废弃当时那次；
@@ -427,15 +455,15 @@ export function createDiscardUsage({
 
   function snapshotAfterDiscard(accountId, snapshot = {}) {
     const run = async () => {
-      // 代理快照自己吞异常，成功与否只影响返回值
-      const proxyWritten = await snapshotDiscardProxy(accountId, snapshot.proxy ?? null);
+      // 代理/指纹快照自己吞异常，成功与否只影响返回值
+      const facts = await snapshotDiscardFacts(accountId, snapshot.proxy ?? null);
       try {
         const result = await sync({ ids: [accountId], concurrency: 1, quiet: true });
         const item = result.items[0] ?? null;
-        return item ? { ...item, proxy_written: proxyWritten } : proxyWritten ? { proxy_written: true } : null;
+        return item ? { ...item, ...facts } : facts;
       } catch (error) {
         logger?.warn?.({ accountId, err: error.message }, 'discard usage snapshot failed');
-        return proxyWritten ? { proxy_written: true } : null;
+        return facts;
       }
     };
     // 队列必须永不 reject：调用方基本都不 await（废弃是 fire-and-forget），
@@ -446,38 +474,51 @@ export function createDiscardUsage({
   }
 
   /**
-   * 代理快照：远端绑定优先，其次本机任务出口。整段吞异常 —— 代理列只是取证信息，
-   * 绝不能因为它失败而影响用量快照或废弃流转。
+   * 废弃瞬间抓一次「远端事实」快照：出口代理 + Codex 指纹收敛档位。
    *
-   * remoteProxy：调用方（巡检）在废弃当下同步过来的**远端账号对象**（不是代理对象）。
+   * 两者都只存在于远端账号对象上，所以共用一次远端解析：调用方（巡检）在废弃当下
+   * 手里就有远端账号对象时零请求；没有时（手动批量废弃、登录终局失败）才回落一次远端查询，
+   * 且只查一次、两个字段一起补 —— 分两次查等于把同一个号查两遍。
+   *
+   * 整段吞异常 —— 这两列只是封号归因的取证信息，绝不能因为它们失败而影响用量快照或废弃流转。
+   *
+   * remoteAccount：调用方（巡检）在废弃当下同步过来的**远端账号对象**（不是代理对象）。
    * 有它就地从对象里提取，不必再查远端 —— 也查不到：事务提交后号可能已被暂停/删除，
-   * 或已被改绑，事后再查拿到的不是废弃当时的出口。
+   * 或已被改绑、被人改过收敛档位，事后再查拿到的不是废弃当时的状态。
+   *
+   * @returns {Promise<{proxy_written: boolean, codex_fingerprint_written: boolean}>} 永不 reject
    */
-  async function snapshotDiscardProxy(accountId, remoteProxy) {
+  async function snapshotDiscardFacts(accountId, remoteAccount) {
     try {
       // 传进来的可能是「带 proxy 的远端账号」，也可能是已经提好的代理对象（两者的字段同名，
       // extractRemoteProxy 都能认）。号没绑代理时它返回 null → 继续走下面的回退，
       // 不能当成「解析成功但值为空」而提前收工。
-      let resolved = extractRemoteProxy(remoteProxy);
-      // 调用方没给（手动批量废弃、登录终局失败）→ 自己去远端找一次；
-      // 远端同步模块可能晚于本模块注册，用 getRemoteSync 惰性取。
-      if (!resolved) {
+      let proxy = extractRemoteProxy(remoteAccount);
+      let mode = extractCodexFingerprintMode(remoteAccount);
+      // 代理或档位任一没解出来就去远端查一次；远端同步模块可能晚于本模块注册，用 getRemoteSync 惰性取
+      if (!proxy || mode == null) {
         const remoteSync = getRemoteSync ? getRemoteSync() : null;
-        if (remoteSync?.resolveDiscardProxy) {
+        if (remoteSync?.resolveDiscardRemote) {
           const row = db.prepare('SELECT email, sub2api_account_id FROM accounts WHERE id=?').get(accountId);
           if (row) {
-            resolved = await remoteSync.resolveDiscardProxy({
+            const resolved = await remoteSync.resolveDiscardRemote({
               accountId: row.sub2api_account_id,
               email: row.email,
             });
+            // 调用方给的那半边更可信（是废弃当下那一瞬），远端补查只填空缺
+            proxy = proxy ?? resolved?.proxy ?? null;
+            mode = mode ?? resolved?.codex_fingerprint_mode ?? null;
           }
         }
       }
-      if (!resolved) resolved = resolveJobProxy(accountId);
-      return Boolean(writeProxySnapshot(accountId, resolved));
+      if (!proxy) proxy = resolveJobProxy(accountId);
+      return {
+        proxy_written: Boolean(writeProxySnapshot(accountId, proxy)),
+        codex_fingerprint_written: Boolean(writeCodexFingerprintSnapshot(accountId, mode)),
+      };
     } catch (error) {
-      logger?.debug?.({ accountId, err: error.message }, 'discard proxy snapshot failed');
-      return false;
+      logger?.debug?.({ accountId, err: error.message }, 'discard facts snapshot failed');
+      return { proxy_written: false, codex_fingerprint_written: false };
     }
   }
 

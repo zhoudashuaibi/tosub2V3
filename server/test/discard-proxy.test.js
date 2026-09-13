@@ -63,14 +63,19 @@ const proxyRow = (db, id) =>
 /** 远端单账号接口 + 代理列表：真实形状（账号只给 proxy_id，代理本身另查） */
 function fakeRemoteSync({ remoteById = {}, proxies = [], failGetAccount = false } = {}) {
   return {
-    resolveDiscardProxy: async ({ accountId, email }) => {
+    // 与 remote-sync 的真实接口一致：一次解析同时给出代理与 Codex 指纹收敛档位。
+    // fake 只负责代理那半边（档位由 extra 决定，这里不伪造），保持既有断言语义不变。
+    resolveDiscardRemote: async ({ accountId, email }) => {
       const remote = remoteById[String(accountId)] ?? (email ? remoteById[email] : null);
-      if (!remote) return null;
+      if (!remote) return { proxy: null, codex_fingerprint_mode: null };
       const proxyId = Number(remote.proxy_id);
-      if (!Number.isSafeInteger(proxyId) || proxyId <= 0) return null;
+      if (!Number.isSafeInteger(proxyId) || proxyId <= 0) return { proxy: null, codex_fingerprint_mode: null };
       if (failGetAccount) throw new Error('sub2api 连不上');
       const proxy = proxies.find((item) => Number(item.id) === proxyId) || {};
-      return { id: proxyId, name: proxy.name ?? null, username: proxy.username ?? null };
+      return {
+        proxy: { id: proxyId, name: proxy.name ?? null, username: proxy.username ?? null },
+        codex_fingerprint_mode: null,
+      };
     },
   };
 }
@@ -119,7 +124,7 @@ test('手动废弃：调用方没给代理 → 按 sub2api_account_id 单查远�
 test('登录终局失败：号不在远端时退回本机任务出口，仍记得到是哪个 IP', async (t) => {
   const ctx = setup();
   t.after(() => ctx.db.close());
-  // 2 号从未上传远端：resolveDiscardProxy 返回 null
+  // 2 号从未上传远端：resolveDiscardRemote 两个字段都返回空
   const { pools } = buildHarness({ ...ctx, remoteSync: fakeRemoteSync() });
 
   const now = new Date().toISOString();

@@ -150,14 +150,17 @@ flowchart TD
   `repair_parked` 连败熔断或已封锁 / `repair_no_credentials` 缺凭据 / `ignored`+`auto_repair_off` 未开启），
   而不是笼统的「未处理」。
 
-## 5. 远端同步与废弃代理归因（remote-sync.js）
+## 5. 远端同步与废弃归因（remote-sync.js）
 
 - `syncRemoteStatus()`：远端账号按 id / email 回填 `sub2api_account_id`、镜像 `sub2api_status`，远端已不存在则清关联；同邮箱多份记一次 `sub2api_duplicate`。
 - `resolveSub2apiProxy(accountId)`：余额任务选路——号在远端且绑了代理时返回该代理的直连 URL。
-- `resolveDiscardProxy({ remote, accountId, email })`：**废弃瞬间**取出口代理快照（代理名 + 认证账号），供废弃池「代理 IP」列。取值顺序：调用方手里的远端账号对象（巡检/远端同步已有）→ 单账号接口（1 次请求）→ 有上限的邮箱查找（`findAccountByEmail`，上限 200）。
+- `resolveDiscardRemote({ remote, accountId, email })`：**废弃瞬间**一次解析出两列取证信息 —— `{ proxy, codex_fingerprint_mode }`。出口代理供「代理 IP」列（代理名 + 认证账号），档位供「Codex 指纹收敛」列。两者在同一个远端账号对象上，**共用这一次解析**：分两次查等于把同一个号查两遍，批量废弃时被放大千倍。
+  - 取值顺序：调用方手里的远端账号对象（巡检/远端同步已有，零请求）→ 单账号接口（1 次请求）→ 有上限的邮箱查找（`findAccountByEmail`，上限 200）。
   - 刻意**不用**全量远端索引建 email 表：那会按远端账号总数翻几十页，而废弃池里成百上千个「从未上传」的号都会走到这条回退，等价于把远端列表扫上千次（废弃用量同步早期踩过同一个坑）。
   - 代理列表（`listProxies`）走 60s 缓存，只为把 `proxy_id` 补成名字/认证账号；拿不到就留空，不猜「直连」。
+- `resolveDiscardProxy({ remote, accountId, email })`：只要代理的旧入口，语义等价于 `resolveDiscardRemote(...).proxy`（保留给既有调用方与单测）。
 - `extractRemoteProxy(account)`（纯函数，单测对象）：兼容 `account.proxy` 对象与平铺字段两种上游形状，只取身份不取密码。
+- `extractCodexFingerprintMode(account)`（纯函数，单测对象）：读 `extra.codex_fingerprint_mode`（兼容平铺键）。**键缺失 = 确定的 `off`**（sub2api 契约里 off 就是不写这个键），只有连 `extra` 都拿不到才返回 `null`（未知）—— 混起来会让「没开收敛」看起来像「没抓到」；非法值按 `normalizeCodexFingerprintMode` 归为 `off`。
 
 ## 6. 配置与连通性
 

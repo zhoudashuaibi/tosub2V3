@@ -8,12 +8,14 @@ import { errors } from '../../lib/http-errors.js';
  * @param {object} db
  * @param {object} crypto
  * @param {{ onDiscarded?: (accountId: number, snapshot?: { proxy?: object|null }) => unknown }} [hooks]
- *   onDiscarded：账号**成功**进入废弃池后的回调（快照用量 / 出口代理等）。放在这里是因为
+ *   onDiscarded：账号**成功**进入废弃池后的回调（快照用量 / 出口代理 / Codex 指纹收敛档位）。放在这里是因为
  *   废弃入口有多条（手动批量、401/429 巡检、登录终局失败、永久封禁），散在各调用点
  *   会漏 —— 漏掉的那条路径上的号就永远是「未同步」。best-effort：不 await、吞异常，
  *   绝不影响转池事务的结果。
  *   snapshot.proxy：调用方在废弃当下观测到的远端绑定代理（巡检/远端同步本来就有），
  *   交给回调落库 —— 事后重查可能已被改绑或随号一起删除，取不到真实出口。
+ *   同一个远端账号对象里还带着 extra.codex_fingerprint_mode（封号时的收敛档位），
+ *   回调会一并提取落库，所以调用方只需把对象原样传进来。
  */
 export function createPools(db, crypto, { onDiscarded = null } = {}) {
   function recordEvent(accountId, type, detail) {
@@ -127,7 +129,8 @@ export function createPools(db, crypto, { onDiscarded = null } = {}) {
    *
    * proxy：调用方在废弃当下观测到的远端绑定代理（巡检/远端同步手里的 remote 对象）。
    * 传它而不是让回调自己去查，是因为事务提交后远端可能已经被暂停甚至删除，
-   * 再查就取不到「废弃那一刻的出口 IP」了。
+   * 再查就取不到「废弃那一刻的出口 IP」了。同一个对象里的 extra.codex_fingerprint_mode
+   * （封号时的 Codex 指纹收敛档位）也由回调就地提取 —— 同样是事后查不到的信息，原样传进来即可。
    */
   function moveToDiscard(accountId, reason, detail = '', { fromPools = ['main', 'reserve'], proxy = null } = {}) {
     const now = new Date().toISOString();
@@ -156,11 +159,12 @@ export function createPools(db, crypto, { onDiscarded = null } = {}) {
     const tx = db.transaction(() => {
       const result = db
         .prepare(
-          // 出口代理快照是「废弃时的状态」，与 discard_reason / discarded_at 同属废弃专属字段：
-          // 号回了主池就不再是废弃号，留着会让下一次废弃看到旧 IP（下次废弃会重新抓）。
+          // 出口代理 / Codex 指纹收敛快照都是「废弃时的状态」，与 discard_reason / discarded_at 同属废弃专属字段：
+          // 号回了主池就不再是废弃号，留着会让下一次废弃看到旧值（下次废弃会重新抓）。
           `UPDATE accounts SET pool='main', status='needs_reauth', discard_reason=NULL, discard_detail=NULL,
              discarded_at=NULL, discard_proxy_name=NULL, discard_proxy_user=NULL, discard_proxy_id=NULL,
-             discard_proxy_at=NULL, updated_at=? WHERE id=? AND pool='discard'`,
+             discard_proxy_at=NULL, discard_codex_fingerprint_mode=NULL, discard_codex_fingerprint_at=NULL,
+             updated_at=? WHERE id=? AND pool='discard'`,
         )
         .run(now, accountId);
       if (result.changes === 0) throw errors.poolTransferConflict('账号不在废弃号池');

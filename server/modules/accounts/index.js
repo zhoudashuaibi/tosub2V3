@@ -142,6 +142,15 @@ const SORT_WHITELIST = {
     // 名字可能是纯数字（sub2api 代理名就是 1、2、3…），按文本排序即可，
     // 真正要看的聚合在筛选/搜索里，不靠这个排序。
     proxy_name: 'CASE WHEN accounts.discard_proxy_name IS NULL THEN 1 ELSE 0 END, accounts.discard_proxy_name',
+    // 封号时的 Codex 指纹收敛档位：同为取证列，但**按收敛强度排，不按字典序** ——
+    // 字典序是 device < full < off < session，读起来毫无意义（off 夹在中间）。
+    // 这里映射成 0/1/2/3，顺排即「透传 → 仅设备 → 设备+会话 → 完全收敛」，
+    // 倒排把最可疑的「完全收敛」放最前，正好是排障时要看的顺序。
+    // 两段式与兄弟列同一写法（方向只作用于**最后一个**表达式，所以「是否为空」分组键固定 ASC：
+    // 读不到档位的号两个方向都沉底，和 used_amount / proxy_name 完全一致）。
+    codex_fingerprint_mode: `CASE WHEN accounts.discard_codex_fingerprint_mode IS NULL THEN 1 ELSE 0 END,
+      CASE accounts.discard_codex_fingerprint_mode
+        WHEN 'off' THEN 0 WHEN 'device' THEN 1 WHEN 'session' THEN 2 WHEN 'full' THEN 3 ELSE 4 END`,
   },
 };
 
@@ -512,6 +521,11 @@ export function createAccountsModule({ engine, logger }) {
         proxy_user: row.discard_proxy_user ?? null,
         proxy_id: row.discard_proxy_id ?? null,
         proxy_at: row.discard_proxy_at ?? null,
+        // ---- 封号时的 Codex 指纹收敛档位（归因：同一档收敛下死了一批号 = 该档位可疑）----
+        // 四档之一（off=远端没开收敛），null = 读不到（从未上传 / 远端已删 / 远端对象不带 extra），
+        // 与 proxy_* 同为废弃当下抓一次的快照
+        codex_fingerprint_mode: row.discard_codex_fingerprint_mode ?? null,
+        codex_fingerprint_at: row.discard_codex_fingerprint_at ?? null,
       };
     }
 

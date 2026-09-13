@@ -3,9 +3,12 @@
  *  - syncRemoteStatus：按 email/ID 把远端账号关联回本地（回填 sub2api_account_id），
  *    并镜像远端真实 status 到 sub2api_status；远端已不存在的本地关联一并清除
  *  - resolveSub2apiProxy：余额查询选路——号已上传 sub2api 时解析其在远端绑定的代理 URL
+ *  - resolveDiscardRemote：废弃瞬间的远端事实快照（出口代理 + Codex 指纹收敛档位）
  *
  * 远端全量索引（账号/代理列表）带 60s TTL 缓存：批量余额查询、巡检、同步共享一次拉取。
  */
+
+import { normalizeCodexFingerprintMode } from './upload.js';
 
 const CACHE_TTL_MS = 60_000;
 
@@ -60,6 +63,33 @@ export function extractRemoteProxy(account) {
     host: safeHost,
     port: hasPort ? port : null,
   };
+}
+
+/**
+ * 从 sub2api 远端账号对象提取「当前 Codex 指纹收敛档位」，用于废弃号池的封号归因。
+ *
+ * 档位只存在于远端 extra 上，形状兼容两种（都不命中即返回 null）：
+ *   1. account.extra.codex_fingerprint_mode —— sub2api 账号对象的标准位置
+ *   2. account.codex_fingerprint_mode      —— 少数接口把 extra 键平铺在账号对象上
+ *
+ * **键缺失 ≠ 读不到**，这是本函数唯一的坑：按 sub2api 契约，off（透传）就是不写这个键
+ * （上传侧同样如此，见 upload.js buildPayload），所以「拿到了 extra 对象、但里面没这个键」
+ * 是**确定**的 off；只有连 extra 都拿不到（远端对象根本不带这个字段）才返回 null，
+ * 交给 UI 显示「—」。把两者混起来会让「关闭收敛」看起来像「没抓到」。
+ *
+ * 值存在时按四档白名单归一，非法值同样归为 off —— 与 sub2api 读取侧、
+ * 与上传侧 normalizeCodexFingerprintMode 是同一口径。
+ */
+export function extractCodexFingerprintMode(account) {
+  if (!account || typeof account !== 'object') return null;
+  const hasFlat = account.codex_fingerprint_mode !== undefined;
+  const extra = account.extra && typeof account.extra === 'object' ? account.extra : null;
+  const raw = hasFlat ? account.codex_fingerprint_mode : extra?.codex_fingerprint_mode;
+  if (raw !== null && raw !== undefined && String(raw).trim() !== '') {
+    return normalizeCodexFingerprintMode(raw);
+  }
+  // 没有值：只有确认拿到过 extra / 平铺键，才能断定「远端就是 off」
+  return hasFlat || extra ? 'off' : null;
 }
 
 export function createRemoteSync({ db, client, getConfig, logger }) {
@@ -235,8 +265,8 @@ export function createRemoteSync({ db, client, getConfig, logger }) {
   }
 
   /**
-   * 废弃瞬间的代理快照：优先用调用方已经拿到的远端账号对象（巡检本来就有，
-   * 且那是「废弃那一刻」的真实绑定，事后 60s 缓存过期重查可能已被改绑）；
+   * 废弃瞬间解析远端账号对象：优先用调用方已经拿到的那个（巡检本来就有，
+   * 且那是「废弃那一刻」的真实状态，事后 60s 缓存过期重查可能已被改绑/改配置）；
    * 没有时按 id → 邮箱回退查一次远端。
    *
    * 回退刻意分两档，避免批量废弃把 sub2api 打爆（每次废弃都会走这里，量大时会被放大千倍）：
@@ -247,7 +277,7 @@ export function createRemoteSync({ db, client, getConfig, logger }) {
    *     废弃用量同步早期就是踩了这个坑（见 discard-usage.js 的注释）。
    * 远端账号已不存在（本地号从未上传 / 远端已被清理）时返回 null —— 不猜。
    */
-  async function resolveDiscardProxy({ remote = null, accountId = null, email = null } = {}) {
+  async function fetchDiscardRemote({ remote = null, accountId = null, email = null } = {}) {
     let target = remote;
     if (!target) {
       const linked = Number(accountId);
@@ -257,7 +287,7 @@ export function createRemoteSync({ db, client, getConfig, logger }) {
           const account = payload?.data && typeof payload.data === 'object' ? payload.data : payload;
           if (account && Number(account.id ?? linked)) target = account;
         } catch (error) {
-          logger?.debug?.({ accountId: linked, err: error.message }, 'discard proxy: getAccount failed');
+          logger?.debug?.({ accountId: linked, err: error.message }, 'discard remote: getAccount failed');
         }
       }
     }
@@ -267,14 +297,40 @@ export function createRemoteSync({ db, client, getConfig, logger }) {
       try {
         target = (await client.findAccountByEmail(key, { maxAccounts: DISCARD_PROXY_EMAIL_LOOKUP_MAX })) ?? null;
       } catch (error) {
-        logger?.debug?.({ err: error.message }, 'discard proxy: email lookup failed');
+        logger?.debug?.({ err: error.message }, 'discard remote: email lookup failed');
         return null;
       }
     }
-    if (!target) return null;
+    return target ?? null;
+  }
+
+  /**
+   * 废弃瞬间的「远端事实」快照：出口代理 + Codex 指纹收敛档位。
+   *
+   * 两者都只存在于同一个远端账号对象上（proxy_id 与 extra.codex_fingerprint_mode），
+   * 所以共用一次远端解析 —— 分两次查等于把同一个号查两遍，批量废弃时会被放大千倍。
+   *
+   * @returns {Promise<{ proxy: object|null, codex_fingerprint_mode: string|null }>}
+   *   proxy 为 null 表示「没绑代理 / 拿不到」（语义与旧 resolveDiscardProxy 一致，不猜直连）；
+   *   codex_fingerprint_mode 为四档之一或 null（null = 读不到，绝不代填 off）
+   */
+  async function resolveDiscardRemote(args = {}) {
+    const target = await fetchDiscardRemote(args);
+    // 远端账号查不到：两个字段一起留空，而不是只让其中一个变成「未知」
+    if (!target) return { proxy: null, codex_fingerprint_mode: null };
+    return {
+      proxy: await completeDiscardProxy(target),
+      codex_fingerprint_mode: extractCodexFingerprintMode(target),
+    };
+  }
+
+  /**
+   * 代理快照补齐：远端账号通常只给 proxy_id，名字/认证账号要另查一次代理列表
+   * （有 60s 缓存，批量废弃不会放大请求量）。拿不到名字就不猜，原样返回。
+   */
+  async function completeDiscardProxy(target) {
     const snapshot = extractRemoteProxy(target);
     if (!snapshot) return null;
-    // 远端账号通常只给 proxy_id，名字/认证账号要另查一次代理列表（有 60s 缓存，批量废弃不会放大请求量）
     if (snapshot.name || snapshot.username || !snapshot.id) return snapshot;
     const proxy = (await remoteProxyIndex()).get(snapshot.id);
     if (!proxy) return snapshot;
@@ -290,5 +346,10 @@ export function createRemoteSync({ db, client, getConfig, logger }) {
     };
   }
 
-  return { syncRemoteStatus, resolveSub2apiProxy, resolveDiscardProxy };
+  /** 只要出口代理的旧入口（保留给只关心代理的调用方与既有单测）：语义与 resolveDiscardProxy 历史行为一致。 */
+  async function resolveDiscardProxy(args = {}) {
+    return (await resolveDiscardRemote(args)).proxy;
+  }
+
+  return { syncRemoteStatus, resolveSub2apiProxy, resolveDiscardProxy, resolveDiscardRemote };
 }

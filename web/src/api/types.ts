@@ -143,6 +143,14 @@ export interface DiscardAccount {
   proxy_user: string | null;
   proxy_id: number | null;
   proxy_at: string | null;
+  /**
+   * 封号时的 Codex 指纹收敛档位快照（归因：同一档收敛下死了一批号 = 该档位可疑）。
+   * 四档之一 —— `off` 是**有效值**（远端确实没开收敛，sub2api 侧就是不写这个 extra 键）；
+   * `null` 才是读不到（从未上传过远端 / 远端账号已删除 / 远端对象不带 extra）。
+   */
+  codex_fingerprint_mode: CodexFingerprintMode | null;
+  /** 该档位的抓取时间（废弃那一刻）；为空表示没抓到 */
+  codex_fingerprint_at: string | null;
 }
 
 /** 废弃池用量同步的分类结果（reason 词表与主池预估保持一致） */
