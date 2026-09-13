@@ -6,7 +6,7 @@ import path from 'node:path';
 import { openDatabase } from '../lib/db.js';
 import { createCrypto } from '../lib/crypto.js';
 import { createLogger } from '../lib/logger.js';
-import { createRemoteSync, buildProxyUrl } from '../modules/sub2api/remote-sync.js';
+import { createRemoteSync, buildProxyUrl, extractRemoteProxy } from '../modules/sub2api/remote-sync.js';
 
 const logger = createLogger('silent');
 
@@ -185,4 +185,107 @@ test('resolveSub2apiProxy：已上传且绑代理 → 返回 URL；未配置/未
   // 未绑代理的远端号：listProxies 只在解析到 proxy_id 后才请求，noproxy 号不会触发也不返回路由
   const noProxyId = ctx.db.prepare(`SELECT id FROM accounts WHERE email='noproxy@test.local'`).get().id;
   assert.equal(await configured.resolveSub2apiProxy(noProxyId), null);
+});
+
+test('extractRemoteProxy：识别嵌套/平铺两种代理形状，没绑代理返回 null', () => {
+  // 真实 sub2api 账号只给 proxy_id，代理本身要另查列表（由 resolveDiscardProxy 补齐）
+  assert.deepEqual(extractRemoteProxy({ id: 1, proxy_id: 3 }), {
+    id: 3,
+    name: null,
+    username: null,
+    host: null,
+    port: null,
+  });
+  // 账号对象里直接带 proxy 对象：一次拿全，不必再查列表
+  assert.deepEqual(
+    extractRemoteProxy({ id: 1, proxy: { id: 9, name: '23', username: 'u123', host: 'a.com', port: 8080 } }),
+    { id: 9, name: '23', username: 'u123', host: 'a.com', port: 8080 },
+  );
+  // proxy 对象缺 id → 回退账号上的 proxy_id
+  assert.equal(extractRemoteProxy({ proxy_id: 5, proxy: { name: '5' } }).id, 5);
+  // 平铺形状
+  assert.deepEqual(extractRemoteProxy({ proxy_name: 'n1', proxy_username: 'acc' }), {
+    id: null,
+    name: 'n1',
+    username: 'acc',
+    host: null,
+    port: null,
+  });
+  // 空串/0/未绑代理都不算信息
+  assert.equal(extractRemoteProxy({ id: 1, proxy_id: 0 }), null);
+  assert.equal(extractRemoteProxy({ id: 1, proxy_id: 0, proxy_name: '  ' }), null);
+  assert.equal(extractRemoteProxy(null), null);
+});
+
+test('resolveDiscardProxy：远端只给 proxy_id 时补齐代理名与认证账号', async () => {
+  const proxies = [{ id: 3, name: '23', host: 'a.com', port: 8080, username: 'u123', password: 'p' }];
+  const remoteAccounts = [{ id: 7, credentials: { email: 'bound@test.local' }, status: 'active', proxy_id: 3 }];
+  const sync = buildSync({ remoteAccounts, proxies });
+
+  // 1) 巡检手里已有远端账号 → 用 proxy_id 去代理列表补齐名字/认证账号
+  assert.deepEqual(await sync.resolveDiscardProxy({ remote: remoteAccounts[0] }), {
+    id: 3,
+    name: '23',
+    username: 'u123',
+    host: 'a.com',
+    port: 8080,
+  });
+
+  // 2) 只有本地的 sub2api_account_id → 单账号接口（不拉全量列表）
+  let getAccountCalls = 0;
+  const byIdSync = createRemoteSync({
+    db: ctx.db,
+    client: {
+      listAllOpenAiAccounts: async () => {
+        throw new Error('不应调用全量列表接口');
+      },
+      getAccount: async (id) => {
+        getAccountCalls += 1;
+        assert.equal(Number(id), 7);
+        return { data: remoteAccounts[0] };
+      },
+      listProxies: async () => proxies,
+      accountEmail: (account) => account?.credentials?.email || null,
+    },
+    getConfig: () => ({ base_url: 'http://sub2api.test', admin_key: 'sk-test' }),
+    logger,
+  });
+  assert.equal((await byIdSync.resolveDiscardProxy({ accountId: 7 })).name, '23');
+  assert.equal(getAccountCalls, 1);
+
+  // 3) 远端没有这个号 → null，不猜
+  const empty = buildSync({ remoteAccounts: [], proxies: [] });
+  assert.equal(await empty.resolveDiscardProxy({ accountId: 999 }), null);
+  assert.equal(await empty.resolveDiscardProxy({ email: 'nobody@test.local' }), null);
+  // 4) 远端号没绑代理 → null（与「直连」区分：空就是没记录）
+  const unbound = buildSync({
+    remoteAccounts: [{ id: 8, credentials: { email: 'noproxy@test.local' }, proxy_id: 0 }],
+    proxies,
+  });
+  assert.equal(await unbound.resolveDiscardProxy({ accountId: 8 }), null);
+  // 5) 没有 ID 时走有上限的邮箱查找，且**不许**退化成全量远端列表
+  //    （废池里成百上千个「从未上传」的号都会走到这条回退，全量列表会被放大上千倍）
+  let lookupArgs = null;
+  const byEmailSync = createRemoteSync({
+    db: ctx.db,
+    client: {
+      listAllOpenAiAccounts: async () => {
+        throw new Error('不应调用全量列表接口');
+      },
+      findAccountByEmail: async (email, options) => {
+        lookupArgs = { email, options };
+        return { id: 7, credentials: { email: 'bound@test.local' }, proxy_id: 3 };
+      },
+      listProxies: async () => proxies,
+      accountEmail: (account) => account?.credentials?.email || null,
+    },
+    getConfig: () => ({ base_url: 'http://sub2api.test', admin_key: 'sk-test' }),
+    logger,
+  });
+  assert.equal((await byEmailSync.resolveDiscardProxy({ email: 'bound@test.local' })).name, '23');
+  assert.equal(lookupArgs.email, 'bound@test.local');
+  assert.ok(
+    Number.isSafeInteger(lookupArgs.options?.maxAccounts) && lookupArgs.options.maxAccounts <= 500,
+    '邮箱回退必须带上限，否则大号池实例会退化成全量遍历',
+  );
 });

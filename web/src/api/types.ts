@@ -135,6 +135,14 @@ export interface DiscardAccount {
   used_amount_source: string | null;
   /** 无快照或快照超过 24h → 待同步 */
   used_amount_stale: boolean;
+  /**
+   * 废弃时的出口代理快照（IP 归因：同一个 IP 上死了一批号 = 该 IP 被拉黑的信号）。
+   * name 是 sub2api 代理名，user 是代理的认证账号；废弃当下抓一次，之后不改写。
+   */
+  proxy_name: string | null;
+  proxy_user: string | null;
+  proxy_id: number | null;
+  proxy_at: string | null;
 }
 
 /** 废弃池用量同步的分类结果（reason 词表与主池预估保持一致） */

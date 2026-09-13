@@ -14,6 +14,9 @@
  * 远端解析沿用与主池预估相同的双路回退：sub2api_account_id 命中 → 否则按 email 命中。
  */
 
+import { proxyAuthAccount } from '../../lib/sanitize.js';
+import { extractRemoteProxy } from '../sub2api/remote-sync.js';
+
 /** 未知用量的原因词表 —— 与 buildMainBalanceEstimate 的 reason 保持一致，前端可复用同一套文案。 */
 export const DISCARD_USAGE_REASONS = {
   not_linked: '未关联远端账号',
@@ -120,6 +123,7 @@ export function createDiscardUsage({
   db,
   client = null,
   getClient = null,
+  getRemoteSync = null,
   logger = null,
   buildFilterWhere = null,
   /** 走邮箱查找时最多查几个远端账号（超过即判定找不到，避免退化成全量遍历） */
@@ -235,6 +239,81 @@ export function createDiscardUsage({
     return now;
   }
 
+  /**
+   * 废弃号池「废弃时的出口代理」快照。
+   *
+   * 主来源是调用方在废弃当下同步过来的远端绑定代理（sub2api 账号的 proxy_id → 代理名 + 认证账号）。
+   * 兜底来源是本机 tosub2 代理：账号最后一次任务的 jobs.proxy_id（登录/修复任务真正走的出口）。
+   *
+   * 为什么兜底要单独查而不复用远端值：登录类废弃（login_failed / repair_failed）的号往往
+   * 根本不在远端、也就没有远端绑定，但这批号恰恰是「本机代理出口被拉黑」最可疑的那批，
+   * 有本机代理 id 也比空着强。两者都不会瞎猜：一个都没有就保持为空。
+   */
+  function writeProxySnapshot(accountId, proxy) {
+    const pick = (value) => (value == null || String(value).trim() === '' ? null : String(value).trim());
+    const rawId = Number(proxy?.id);
+    const id = Number.isSafeInteger(rawId) && rawId > 0 ? rawId : null;
+    const name = pick(proxy?.name);
+    const username = pick(proxy?.username);
+    if (!id && !name && !username) return null;
+    const now = new Date().toISOString();
+    const result = db
+      .prepare(
+        `UPDATE accounts SET discard_proxy_name=?, discard_proxy_user=?, discard_proxy_id=?, discard_proxy_at=?, updated_at=?
+         WHERE id=? AND pool='discard'`,
+      )
+      .run(name, username, id, now, now, accountId);
+    // 账号已被移回主池/删除时流水数=0：不留快照，也不留事件（否则列是空的、事件却写着有代理）
+    if (result.changes === 0) return null;
+    // 审计事件与「废弃」本身分开记：废弃当时挂的是哪条出口，事后要能单独回溯
+    recordEvent(accountId, 'discard_proxy_snapshot', { proxy_id: id, name, username });
+    return now;
+  }
+
+  /**
+   * 本机 tosub2 代理兜底：该号最后一条用过代理的任务。
+   *
+   * 唯一索引保证每个账号同时只有一条活跃任务，所以「最后一次」就是废弃当时那次；
+   * 按 created_at DESC 而不是 updated_at，避免任务收尾时的补写把顺序搅乱。
+   * jobs.proxy_label 是 sub2api 绑定代理的展示名（余额任务走远端选路时记的），
+   * 老库可能没有这一列，取不到就当没有，绝不因此让快照失败。
+   */
+  function resolveJobProxy(accountId) {
+    let row = null;
+    try {
+      row = db
+        .prepare(
+          `SELECT proxy_id, proxy_label FROM jobs
+           WHERE account_id=? AND (proxy_id IS NOT NULL OR proxy_label IS NOT NULL)
+           ORDER BY created_at DESC LIMIT 1`,
+        )
+        .get(accountId);
+    } catch {
+      try {
+        row = db
+          .prepare(
+            `SELECT proxy_id, NULL AS proxy_label FROM jobs
+             WHERE account_id=? AND proxy_id IS NOT NULL ORDER BY created_at DESC LIMIT 1`,
+          )
+          .get(accountId);
+      } catch {
+        return null;
+      }
+    }
+    if (!row) return null;
+    const local = Number(row.proxy_id);
+    const localRow = Number.isSafeInteger(local) && local > 0
+      ? db.prepare('SELECT id, label, display_url FROM proxies WHERE id=?').get(local)
+      : null;
+    const boundId = Number(row.proxy_id);
+    return {
+      id: localRow?.id ?? (Number.isSafeInteger(boundId) && boundId > 0 ? boundId : null),
+      // 本机代理没起名字时退回 sub2api 绑定代理的展示名（余额任务走远端选路时记的）
+      name: localRow?.label ?? row.proxy_label ?? null,
+      username: proxyAuthAccount(localRow?.display_url),
+    };
+  }
+
   function recordEvent(accountId, type, detail) {
     db.prepare('INSERT INTO account_events(account_id, type, detail, created_at) VALUES(?,?,?,?)').run(
       accountId,
@@ -346,19 +425,60 @@ export function createDiscardUsage({
    */
   let discardSnapshotQueue = Promise.resolve();
 
-  function snapshotAfterDiscard(accountId) {
+  function snapshotAfterDiscard(accountId, snapshot = {}) {
     const run = async () => {
+      // 代理快照自己吞异常，成功与否只影响返回值
+      const proxyWritten = await snapshotDiscardProxy(accountId, snapshot.proxy ?? null);
       try {
         const result = await sync({ ids: [accountId], concurrency: 1, quiet: true });
-        return result.items[0] ?? null;
+        const item = result.items[0] ?? null;
+        return item ? { ...item, proxy_written: proxyWritten } : proxyWritten ? { proxy_written: true } : null;
       } catch (error) {
         logger?.warn?.({ accountId, err: error.message }, 'discard usage snapshot failed');
-        return null;
+        return proxyWritten ? { proxy_written: true } : null;
       }
     };
-    // 前一个失败也不能断链（run 内部已吞异常，这里再兜一层）
-    discardSnapshotQueue = discardSnapshotQueue.then(run, run);
+    // 队列必须永不 reject：调用方基本都不 await（废弃是 fire-and-forget），
+    // 一旦链上留下未处理的 reject，Node 会把它当未捕获异常处理。
+    // 因此这里用 then(run, run) 续链（上一个失败也换 run 顶上），并对结果再兜一层 catch。
+    discardSnapshotQueue = discardSnapshotQueue.then(run, run).catch(() => null);
     return discardSnapshotQueue;
+  }
+
+  /**
+   * 代理快照：远端绑定优先，其次本机任务出口。整段吞异常 —— 代理列只是取证信息，
+   * 绝不能因为它失败而影响用量快照或废弃流转。
+   *
+   * remoteProxy：调用方（巡检）在废弃当下同步过来的**远端账号对象**（不是代理对象）。
+   * 有它就地从对象里提取，不必再查远端 —— 也查不到：事务提交后号可能已被暂停/删除，
+   * 或已被改绑，事后再查拿到的不是废弃当时的出口。
+   */
+  async function snapshotDiscardProxy(accountId, remoteProxy) {
+    try {
+      // 传进来的可能是「带 proxy 的远端账号」，也可能是已经提好的代理对象（两者的字段同名，
+      // extractRemoteProxy 都能认）。号没绑代理时它返回 null → 继续走下面的回退，
+      // 不能当成「解析成功但值为空」而提前收工。
+      let resolved = extractRemoteProxy(remoteProxy);
+      // 调用方没给（手动批量废弃、登录终局失败）→ 自己去远端找一次；
+      // 远端同步模块可能晚于本模块注册，用 getRemoteSync 惰性取。
+      if (!resolved) {
+        const remoteSync = getRemoteSync ? getRemoteSync() : null;
+        if (remoteSync?.resolveDiscardProxy) {
+          const row = db.prepare('SELECT email, sub2api_account_id FROM accounts WHERE id=?').get(accountId);
+          if (row) {
+            resolved = await remoteSync.resolveDiscardProxy({
+              accountId: row.sub2api_account_id,
+              email: row.email,
+            });
+          }
+        }
+      }
+      if (!resolved) resolved = resolveJobProxy(accountId);
+      return Boolean(writeProxySnapshot(accountId, resolved));
+    } catch (error) {
+      logger?.debug?.({ accountId, err: error.message }, 'discard proxy snapshot failed');
+      return false;
+    }
   }
 
   return { sync, snapshotAfterDiscard, selectTargets };

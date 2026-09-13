@@ -138,6 +138,10 @@ const SORT_WHITELIST = {
     // 于是 COALESCE 永远拿到非 NULL 的别名，兜底形同虚设（实测两个方向都排在最后才失败）。
     // 显式两段排序：先按「是否为空」分组，再按值排序，ASC/DESC 都稳定。
     discard_used_amount: 'CASE WHEN accounts.discard_used_amount IS NULL THEN 1 ELSE 0 END, accounts.discard_used_amount',
+    // 出口代理：同一个 IP 上死了一批号才是信号，所以「空值沉底」的规则同上。
+    // 名字可能是纯数字（sub2api 代理名就是 1、2、3…），按文本排序即可，
+    // 真正要看的聚合在筛选/搜索里，不靠这个排序。
+    proxy_name: 'CASE WHEN accounts.discard_proxy_name IS NULL THEN 1 ELSE 0 END, accounts.discard_proxy_name',
   },
 };
 
@@ -176,16 +180,20 @@ export function createAccountsModule({ engine, logger }) {
     const discardUsage = createDiscardUsage({
       db,
       getClient: () => app.sub2apiClient,
+      // 同上：远端同步模块可能晚于本模块注册，惰性取。
+      // 废弃时代理快照要靠它把远端绑定代理（名字 + 认证账号）解析出来。
+      getRemoteSync: () => app.sub2apiRemoteSync,
       logger,
       buildFilterWhere: (query) => buildAccountFilters({ ...query, pool: 'discard' }),
     });
     // 废弃入口有多条（手动批量、401/429 巡检、登录终局失败、永久封禁），
     // 统一挂在 pools 的池流转上，避免再漏掉某条路径导致那批号永远「未同步」。
+    // snapshot.proxy：调用方（巡检）在废弃当下观测到的远端绑定代理，原样落库。
+    // 这里刻意不用「sub2api 是否已配置」短路整条钩子：出口代理快照有一半信息来自本机任务
+    // 记录（登录类废弃的号多数根本没上过远端），没配 sub2api 照样该记；远端用量那半边
+    // 自己会失败，只留一条 debug 日志。
     const pools = createPools(db, crypto, {
-      onDiscarded: (accountId) => {
-        if (!sub2apiConfigured()) return null;
-        return discardUsage.snapshotAfterDiscard(accountId);
-      },
+      onDiscarded: (accountId, snapshot) => discardUsage.snapshotAfterDiscard(accountId, snapshot),
     });
     const mailInit = createMailInit({
       db,
@@ -328,8 +336,16 @@ export function createAccountsModule({ engine, logger }) {
       const filters = ['pool = ?'];
       const params = [pool];
       if (query.q) {
-        filters.push('email LIKE ?');
-        params.push(`%${String(query.q)}%`);
+        const keyword = `%${String(query.q)}%`;
+        if (pool === 'discard') {
+          // 废弃池的搜索框兼作「按代理 IP 反查」入口：同一个出口上死了一批号时，
+          // 直接搜代理名/认证账号就能把它们筛出来，不必新加一个筛选控件。
+          filters.push('(email LIKE ? OR discard_proxy_name LIKE ? OR discard_proxy_user LIKE ?)');
+          params.push(keyword, keyword, keyword);
+        } else {
+          filters.push('email LIKE ?');
+          params.push(keyword);
+        }
       }
       if (query.status) {
         filters.push('status = ?');
@@ -480,6 +496,12 @@ export function createAccountsModule({ engine, logger }) {
         used_amount_at: row.discard_used_amount_at ?? null,
         used_amount_source: row.discard_used_amount_source ?? null,
         used_amount_stale: isDiscardUsageStale(row.discard_used_amount_at),
+        // ---- 废弃时的出口代理（IP 归因：同一个 IP 死了一批号 = 该 IP 被拉黑）----
+        // 废弃当下抓一次的快照，之后不改写；name 是 sub2api 代理名，user 是代理认证账号
+        proxy_name: row.discard_proxy_name ?? null,
+        proxy_user: row.discard_proxy_user ?? null,
+        proxy_id: row.discard_proxy_id ?? null,
+        proxy_at: row.discard_proxy_at ?? null,
       };
     }
 

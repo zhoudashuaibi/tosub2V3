@@ -131,16 +131,40 @@ flowchart TD
 - 补号计数以**本地主池为准 × 远端实际状态**联合判断：已废弃但远端未删的号、他人上传的号、远端已删除的本地号都不计入；限流中（429）与 error（401）的号不计入；reserve 池在途 joining（有活跃任务）计入可用，防止在途期间重复触发。
 - 补号并发：单轮最多同时发起 `min(3, 空缺数)` 个 join，其余等下一轮（避免任务槽被补号占满）。
 - 补号挑号顺序可配置（取值同号池手动批量 `order` 枚举，04-04）：`replenish_upload_order` 主池库存上传顺序（默认 `balance_asc` 余额小优先）；`replenish_join_order` 备用池登录顺序（默认 `balance_desc` 有余额、金额大优先；按金额排序时余额未知的排最后）。
-- 巡检结果写 `account_events` 并在 `GET /api/v1/sub2api/monitor` 暴露 `last_check_at / next_check_at / last_error / last_result{discarded, repairing, replenished}`。
+- 巡检结果写 `account_events` 并在 `GET /api/v1/sub2api/monitor` 暴露 `last_check_at / next_check_at / last_error / last_result{...}`。
+- **巡检日志（`monitor_logs` + `monitor_log_items`，保留最近 100 轮）里的两种量必须分清**，前端 chip 也按此标注：
+  - **状态量**（每轮都会重复出现的当前状态，同一个号连续多轮出现属正常）：
+    `error_accounts`（远端 error 数）、`rate_limited`（本轮观察到的限流号数，超阈值废弃的也计入）、
+    `ban_unconfirmed`（疑似封禁待邮件辅证）、`repair_pending`（修复任务在途、还没回执）。
+  - **动作量**（只统计本轮真正发生的事）：`discarded`（真进了废弃池才算，状态冲突单独记 `discard_failed`
+    明细与计数，不再谎报「已废弃」）、`repairing`（本轮新发起的修复）、`repair_ok` / `repair_failed` /
+    `repair_parked`（距上轮以来落地的修复回执）、`uploaded` / `replenished`。
+- **修复结果回执**：401 只代表会话过期，发起修复时日志先写一条 `repairing` 明细；任务终态由
+  `noteRepairOutcome`（引擎 `onLoginFinished` 钩子）写回**同一行**的 `outcome`：
+  `ok` 修复成功 / `failed` 本次失败（未达上限，冷却后重试）/ `parked` 连败达上限暂停保留待重授 /
+  `followup` refresh 失败已自动转完整登录（仍算在途）。这样「已发起修复」一定有下文，
+  不会和「未处理」混在一起看不出修好还是修废。
+- 本轮没发起修复时，明细动作写明原因（`repair_pending` 任务在途 / `repair_cooldown` 冷却中 /
+  `repair_parked` 连败熔断或已封锁 / `repair_no_credentials` 缺凭据 / `ignored`+`auto_repair_off` 未开启），
+  而不是笼统的「未处理」。
 
-## 5. 配置与连通性
+## 5. 远端同步与废弃代理归因（remote-sync.js）
+
+- `syncRemoteStatus()`：远端账号按 id / email 回填 `sub2api_account_id`、镜像 `sub2api_status`，远端已不存在则清关联；同邮箱多份记一次 `sub2api_duplicate`。
+- `resolveSub2apiProxy(accountId)`：余额任务选路——号在远端且绑了代理时返回该代理的直连 URL。
+- `resolveDiscardProxy({ remote, accountId, email })`：**废弃瞬间**取出口代理快照（代理名 + 认证账号），供废弃池「代理 IP」列。取值顺序：调用方手里的远端账号对象（巡检/远端同步已有）→ 单账号接口（1 次请求）→ 有上限的邮箱查找（`findAccountByEmail`，上限 200）。
+  - 刻意**不用**全量远端索引建 email 表：那会按远端账号总数翻几十页，而废弃池里成百上千个「从未上传」的号都会走到这条回退，等价于把远端列表扫上千次（废弃用量同步早期踩过同一个坑）。
+  - 代理列表（`listProxies`）走 60s 缓存，只为把 `proxy_id` 补成名字/认证账号；拿不到就留空，不猜「直连」。
+- `extractRemoteProxy(account)`（纯函数，单测对象）：兼容 `account.proxy` 对象与平铺字段两种上游形状，只取身份不取密码。
+
+## 6. 配置与连通性
 
 - `GET /api/v1/sub2api/config` → 脱敏视图：`admin_key` 只回 `"sk-****abcd"`（尾 4 位）+ `has_key: true`；PUT 时 `admin_key` 留空/传 `****` = 不修改。
 - `POST /api/v1/sub2api/test`：用当前（或请求体携带的）配置拉 `groups/all`，返回 `{ok, groups: n, latency_ms}` 或脱敏后的错误。
 - `GET /api/v1/sub2api/groups|proxies`：代理远端列表（上传配置弹窗选分组/手动代理用）。
 - `GET /api/v1/sub2api/remote-accounts?email=`：远端账号查询（主号池行内「远端状态」气泡）。
 
-## 6. 安全要点
+## 7. 安全要点
 
 - `admin_key` 只存加密 settings；任何 API 响应、日志、任务日志不得出现明文（`sanitize.js` 强制）。
 - 上传失败的错误信息回传前过一遍脱敏（去掉请求头/密钥片段）。

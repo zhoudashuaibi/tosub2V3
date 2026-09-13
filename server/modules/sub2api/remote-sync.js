@@ -9,6 +9,9 @@
 
 const CACHE_TTL_MS = 60_000;
 
+/** 废弃时代理快照的邮箱查找上限：翻到这么多远端账号还没命中就认「找不到」，避免退化成全量遍历。 */
+const DISCARD_PROXY_EMAIL_LOOKUP_MAX = 200;
+
 /** 从 sub2api 代理字段构造代理 URL（protocol://user:pass@host:port）。 */
 export function buildProxyUrl(proxy) {
   const protocol = String(proxy?.protocol || 'http').toLowerCase();
@@ -20,6 +23,43 @@ export function buildProxyUrl(proxy) {
   const password = proxy?.password ? String(proxy.password || '') : '';
   const auth = username ? `${encodeURIComponent(username)}:${encodeURIComponent(password)}@` : '';
   return `${protocol}://${auth}${host}:${port}`;
+}
+
+/**
+ * 从 sub2api 远端账号对象提取「当前出口代理」快照，用于废弃号池的 IP 归因。
+ *
+ * 上游返回形状不止一种，这里按优先级兼容（都不命中即返回 null = 没绑代理）：
+ *   1. account.proxy 是对象：{ id, name, username, host, port }，id 缺失时回退 account.proxy_id
+ *   2. 代理字段被平铺在账号上：discard_proxy_name / proxy_name 等
+ *
+ * 认证账号（username）是判断「同一个 IP 上是不是同一批号」的关键：
+ * 同一台代理服务器换个认证账号就是另一条出口，只看 name 会误判。
+ * 这里只取身份，不取密码。
+ */
+export function extractRemoteProxy(account) {
+  const nested = account?.proxy && typeof account.proxy === 'object' ? account.proxy : null;
+  const proxyId = Number(nested?.id ?? account?.proxy_id ?? 0);
+  const name =
+    nested?.name ??
+    account?.proxy_name ??
+    account?.discard_proxy_name ??
+    (typeof account?.proxy === 'string' ? account.proxy : null);
+  const username =
+    nested?.username ?? account?.proxy_username ?? account?.proxy_user ?? account?.discard_proxy_user ?? null;
+  const host = nested?.host ?? account?.proxy_host ?? null;
+  const port = Number(nested?.port ?? account?.proxy_port ?? 0);
+  const text = (value) => (value != null && String(value).trim() ? String(value).trim() : null);
+  const [safeName, safeUser, safeHost] = [text(name), text(username), text(host)];
+  const hasId = Number.isSafeInteger(proxyId) && proxyId > 0;
+  const hasPort = Number.isSafeInteger(port) && port > 0;
+  if (!hasId && !safeName && !safeUser && !safeHost) return null;
+  return {
+    id: hasId ? proxyId : null,
+    name: safeName,
+    username: safeUser,
+    host: safeHost,
+    port: hasPort ? port : null,
+  };
 }
 
 export function createRemoteSync({ db, client, getConfig, logger }) {
@@ -194,5 +234,61 @@ export function createRemoteSync({ db, client, getConfig, logger }) {
     return { url, remote_id: Number(remote.id), proxy_id: proxyId, proxy_name: proxy.name || null };
   }
 
-  return { syncRemoteStatus, resolveSub2apiProxy };
+  /**
+   * 废弃瞬间的代理快照：优先用调用方已经拿到的远端账号对象（巡检本来就有，
+   * 且那是「废弃那一刻」的真实绑定，事后 60s 缓存过期重查可能已被改绑）；
+   * 没有时按 id → 邮箱回退查一次远端。
+   *
+   * 回退刻意分两档，避免批量废弃把 sub2api 打爆（每次废弃都会走这里，量大时会被放大千倍）：
+   *   · 有 sub2api_account_id → 只查单个账号（1 次请求，与远端总量无关）
+   *   · 没有 ID → 才走**有上限**的邮箱查找（client.findAccountByEmail，翻到上限就认「找不到」）。
+   *     这里绝不用全量远端索引（remoteAccountIndex）：那会按远端账号总数翻几十页，
+   *     废弃池里成百上千个「从未上传」的号逐个走一遍，等价于把远端列表扫上千次 ——
+   *     废弃用量同步早期就是踩了这个坑（见 discard-usage.js 的注释）。
+   * 远端账号已不存在（本地号从未上传 / 远端已被清理）时返回 null —— 不猜。
+   */
+  async function resolveDiscardProxy({ remote = null, accountId = null, email = null } = {}) {
+    let target = remote;
+    if (!target) {
+      const linked = Number(accountId);
+      if (Number.isSafeInteger(linked) && linked > 0 && typeof client.getAccount === 'function') {
+        try {
+          const payload = await client.getAccount(linked);
+          const account = payload?.data && typeof payload.data === 'object' ? payload.data : payload;
+          if (account && Number(account.id ?? linked)) target = account;
+        } catch (error) {
+          logger?.debug?.({ accountId: linked, err: error.message }, 'discard proxy: getAccount failed');
+        }
+      }
+    }
+    if (!target) {
+      const key = String(email || '').trim().toLowerCase();
+      if (!key || typeof client.findAccountByEmail !== 'function') return null;
+      try {
+        target = (await client.findAccountByEmail(key, { maxAccounts: DISCARD_PROXY_EMAIL_LOOKUP_MAX })) ?? null;
+      } catch (error) {
+        logger?.debug?.({ err: error.message }, 'discard proxy: email lookup failed');
+        return null;
+      }
+    }
+    if (!target) return null;
+    const snapshot = extractRemoteProxy(target);
+    if (!snapshot) return null;
+    // 远端账号通常只给 proxy_id，名字/认证账号要另查一次代理列表（有 60s 缓存，批量废弃不会放大请求量）
+    if (snapshot.name || snapshot.username || !snapshot.id) return snapshot;
+    const proxy = (await remoteProxyIndex()).get(snapshot.id);
+    if (!proxy) return snapshot;
+    return {
+      id: snapshot.id,
+      name: proxy.name != null && String(proxy.name).trim() ? String(proxy.name).trim() : null,
+      username:
+        proxy.username != null && String(proxy.username).trim()
+          ? String(proxy.username).trim()
+          : snapshot.username,
+      host: proxy.host != null && String(proxy.host).trim() ? String(proxy.host).trim() : snapshot.host,
+      port: Number.isSafeInteger(Number(proxy.port)) && Number(proxy.port) > 0 ? Number(proxy.port) : snapshot.port,
+    };
+  }
+
+  return { syncRemoteStatus, resolveSub2apiProxy, resolveDiscardProxy };
 }

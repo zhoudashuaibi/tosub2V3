@@ -223,7 +223,8 @@ export function DiscardPoolPage() {
       <div className="rounded-md bg-muted/60 px-4 py-2.5 text-sm text-muted-foreground">
         移回主号池后账号为「待重新授权」状态，建议先批量授权再上传。「初始余额」为导入时从邮箱余额
         初始化的值（与备用池同源，未拿到时显示「未查询」）；「已用额度」取自 sub2api 账号用量统计，
-        与主号池预估剩余余额同源。
+        与主号池预估剩余余额同源；「代理 IP」是废弃那一刻抓的出口代理快照（代理名 + 认证账号），
+        同一个代理上死了一批号就是该 IP 被拉黑的信号 —— 搜索框支持直接搜代理名或认证账号。
       </div>
 
       <ListToolbar>
@@ -343,6 +344,12 @@ export function DiscardPoolPage() {
             </TableHead>
             <SortableHead label="邮箱" sortKey="email" sort={sort} onSort={(next) => set({ sort: serializeSort(next), page: 1 })} />
             <SortableHead label="废弃原因" sortKey="discard_reason" sort={sort} onSort={(next) => set({ sort: serializeSort(next), page: 1 })} />
+            <SortableHead
+              label="代理 IP"
+              sortKey="proxy_name"
+              sort={sort}
+              onSort={(next) => set({ sort: serializeSort(next), page: 1 })}
+            />
             <TableHead>详情</TableHead>
             <SortableHead
               label="加入备用池"
@@ -395,6 +402,9 @@ export function DiscardPoolPage() {
             <TableCell className="max-w-[220px] truncate font-mono text-xs">{account.email}</TableCell>
             <TableCell>
               <StatusBadge domain="discard" value={account.discard_reason} />
+            </TableCell>
+            <TableCell>
+              <DiscardProxyCell account={account} />
             </TableCell>
             <TableCell className="max-w-[240px]">
               {account.discard_detail ? (
@@ -520,6 +530,50 @@ export function DiscardPoolPage() {
         onConfirm={() => deleteMutation.mutate(targetIds)}
       />
     </div>
+  );
+}
+
+/**
+ * 废弃时的出口代理：名字 + 认证账号。
+ *
+ * 两截都有意义：代理名（sub2api 里的编号）说明是哪台机器，
+ * 认证账号说明是这台机器上的哪条出口 —— 同一个代理服务商换一个认证账号就是另一个 IP。
+ * 两个都没有时显示「—」而不是「直连」：老数据本来就没抓过，不能反推成直连。
+ */
+function DiscardProxyCell({ account }: { account: DiscardAccount }) {
+  const name = account.proxy_name;
+  const user = account.proxy_user;
+  if (!name && !user) {
+    return (
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="cursor-help text-xs text-muted-foreground underline decoration-dotted underline-offset-4">
+            —
+          </span>
+        </TooltipTrigger>
+        <TooltipContent>
+          没有这条号的出口代理记录：本列是废弃那一刻抓的快照，只在废弃时代理信息可读到才有值
+        </TooltipContent>
+      </Tooltip>
+    );
+  }
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <div className="max-w-[150px] cursor-help font-mono text-xs leading-tight">
+          <div className="truncate">{name ?? `代理 #${account.proxy_id ?? '?'}`}</div>
+          {user && <div className="truncate text-muted-foreground">认证账号 {user}</div>}
+        </div>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-md">
+        <div>代理名：{name ?? `代理 #${account.proxy_id ?? '?'}`}</div>
+        <div>认证账号：{user ?? '未记录'}</div>
+        {account.proxy_id != null && <div className="text-muted-foreground">代理 ID：{account.proxy_id}</div>}
+        <div className="text-muted-foreground">
+          废弃当时抓取（{formatDateTime(account.proxy_at)}）；认证账号是代理服务商那一侧的账号，不是号本身
+        </div>
+      </TooltipContent>
+    </Tooltip>
   );
 }
 

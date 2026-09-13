@@ -63,6 +63,19 @@ export function maskProxyUrl(url) {
   }
 }
 
+/**
+ * 代理 URL → 认证账户名（可能是完整的脱敏展示串，密码段被 *** 顶掉，用户名仍在）。
+ * 用户名是代理供应商那一侧的身份（不是 ChatGPT 账号），用于区分「同一台机器上不同的出口账号」。
+ */
+export function proxyAuthAccount(url) {
+  try {
+    const parsed = new URL(String(url || ''));
+    return parsed.username ? decodeURIComponent(parsed.username) : null;
+  } catch {
+    return null;
+  }
+}
+
 /** 管理密钥类字符串 → 尾 4 位掩码：sk-****abcd */
 export function maskSecret(value) {
   const text = String(value || '').trim();

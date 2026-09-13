@@ -7,11 +7,13 @@ import { errors } from '../../lib/http-errors.js';
  *
  * @param {object} db
  * @param {object} crypto
- * @param {{ onDiscarded?: (accountId: number) => unknown }} [hooks]
- *   onDiscarded：账号**成功**进入废弃池后的回调（快照用量等）。放在这里是因为
+ * @param {{ onDiscarded?: (accountId: number, snapshot?: { proxy?: object|null }) => unknown }} [hooks]
+ *   onDiscarded：账号**成功**进入废弃池后的回调（快照用量 / 出口代理等）。放在这里是因为
  *   废弃入口有多条（手动批量、401/429 巡检、登录终局失败、永久封禁），散在各调用点
  *   会漏 —— 漏掉的那条路径上的号就永远是「未同步」。best-effort：不 await、吞异常，
  *   绝不影响转池事务的结果。
+ *   snapshot.proxy：调用方在废弃当下观测到的远端绑定代理（巡检/远端同步本来就有），
+ *   交给回调落库 —— 事后重查可能已被改绑或随号一起删除，取不到真实出口。
  */
 export function createPools(db, crypto, { onDiscarded = null } = {}) {
   function recordEvent(accountId, type, detail) {
@@ -26,13 +28,17 @@ export function createPools(db, crypto, { onDiscarded = null } = {}) {
   /**
    * 事务提交后触发废弃钩子。必须在 tx() 成功之后调用，否则回滚的流转也会抓快照；
    * 同步抛错同样要吞掉：快照失败不能把已经成功的废弃变成报错。
+   *
+   * @returns {Promise<unknown>|null} 快照任务的 Promise（失败已吞）。调用方**不必** await；
+   *   返回它只是为了「废弃后要立刻断言快照」的场景（测试、以及将来想把结果写进响应的接口）
+   *   有个可等待的把手 —— 不返回的话调用方只能轮询数据库。
    */
-  function notifyDiscarded(accountId) {
-    if (typeof onDiscarded !== 'function') return;
+  function notifyDiscarded(accountId, snapshot = {}) {
+    if (typeof onDiscarded !== 'function') return null;
     try {
-      Promise.resolve(onDiscarded(accountId)).catch(() => {});
+      return Promise.resolve(onDiscarded(accountId, snapshot)).catch(() => {});
     } catch {
-      /* ignore：best-effort */
+      return null; // ignore：best-effort
     }
   }
 
@@ -74,7 +80,7 @@ export function createPools(db, crypto, { onDiscarded = null } = {}) {
   }
 
   /** 登录失败：回备用池（status=mail_failed + 错误）或直接废弃（永久封禁）。 */
-  function joinFailed(accountId, { error, jobId = null, permanent = false }) {
+  function joinFailed(accountId, { error, jobId = null, permanent = false, proxy = null }) {
     const now = new Date().toISOString();
     const tx = db.transaction(() => {
       if (permanent) {
@@ -110,13 +116,20 @@ export function createPools(db, crypto, { onDiscarded = null } = {}) {
       return { pool: 'reserve', status: 'mail_failed' };
     });
     const result = tx();
-    // 永久封禁直接进废弃池：与 moveToDiscard 一样，落库后立刻抓一次用量快照
-    if (result?.pool === 'discard') notifyDiscarded(accountId);
+    // 永久封禁直接进废弃池：与 moveToDiscard 一样，落库后立刻抓一次用量/出口代理快照。
+    // 快照 Promise 随结果返回，调用方不需要 await（失败已吞）
+    if (result?.pool === 'discard') result.snapshot = notifyDiscarded(accountId, { proxy });
     return result;
   }
 
-  /** main → discard。reason ∈ banned_401 | rate_limited_429 | repair_failed | login_failed | manual */
-  function moveToDiscard(accountId, reason, detail = '', { fromPools = ['main', 'reserve'] } = {}) {
+  /**
+   * main → discard。reason ∈ banned_401 | rate_limited_429 | repair_failed | login_failed | manual
+   *
+   * proxy：调用方在废弃当下观测到的远端绑定代理（巡检/远端同步手里的 remote 对象）。
+   * 传它而不是让回调自己去查，是因为事务提交后远端可能已经被暂停甚至删除，
+   * 再查就取不到「废弃那一刻的出口 IP」了。
+   */
+  function moveToDiscard(accountId, reason, detail = '', { fromPools = ['main', 'reserve'], proxy = null } = {}) {
     const now = new Date().toISOString();
     const tx = db.transaction(() => {
       const result = db
@@ -130,9 +143,10 @@ export function createPools(db, crypto, { onDiscarded = null } = {}) {
       return { pool: 'discard', reason };
     });
     const result = tx();
-    // 废弃当下抓一次用量快照：sub2api 只有「当前累计」、没有历史时点查询，
-    // 错过此刻之后再补也只能拿到当前值
-    notifyDiscarded(accountId);
+    // 废弃当下抓一次用量/出口代理快照：sub2api 只有「当前累计」、没有历史时点查询，
+    // 错过此刻之后再补也只能拿到当前值（代理更是会随改绑/删除一起消失）。
+    // 同样把快照 Promise 挂在结果上：正常调用点照旧不 await
+    result.snapshot = notifyDiscarded(accountId, { proxy });
     return result;
   }
 
@@ -142,8 +156,11 @@ export function createPools(db, crypto, { onDiscarded = null } = {}) {
     const tx = db.transaction(() => {
       const result = db
         .prepare(
+          // 出口代理快照是「废弃时的状态」，与 discard_reason / discarded_at 同属废弃专属字段：
+          // 号回了主池就不再是废弃号，留着会让下一次废弃看到旧 IP（下次废弃会重新抓）。
           `UPDATE accounts SET pool='main', status='needs_reauth', discard_reason=NULL, discard_detail=NULL,
-             discarded_at=NULL, updated_at=? WHERE id=? AND pool='discard'`,
+             discarded_at=NULL, discard_proxy_name=NULL, discard_proxy_user=NULL, discard_proxy_id=NULL,
+             discard_proxy_at=NULL, updated_at=? WHERE id=? AND pool='discard'`,
         )
         .run(now, accountId);
       if (result.changes === 0) throw errors.poolTransferConflict('账号不在废弃号池');
