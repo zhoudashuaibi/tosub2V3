@@ -220,7 +220,7 @@ function userAgentForTransport(transport) {
 }
 
 function browserIdentityForTransport(transport) {
-  return browserIdentityForTlsProfile(transport?.profile || "chrome146");
+  return browserIdentityForTlsProfile(transport?.identityProfile || transport?.profile || "chrome146");
 }
 
 function browserHeadersForTransport(transport) {
@@ -965,6 +965,7 @@ async function loginChatgptWeb(client, { chatgptBase, authBase, email, rl, passw
         authenticated = await verifyPassword(client, {
           authBase,
           rl,
+          deviceId,
           password,
           referer: authPage.finalUrl,
         });
@@ -976,6 +977,7 @@ async function loginChatgptWeb(client, { chatgptBase, authBase, email, rl, passw
       authenticated = await verifyPassword(client, {
         authBase,
         rl,
+        deviceId,
         password,
         referer: authPage.finalUrl,
       });
@@ -1094,22 +1096,36 @@ async function switchPasswordPageToEmailOtp(client, { authBase, referer }) {
   }
 }
 
-async function verifyPassword(client, { authBase, rl, password, referer }) {  let nextPassword = password;
+async function verifyPassword(client, { authBase, rl, deviceId, password, referer }) {
+  let nextPassword = password;
   for (;;) {
     const value = nextPassword || (await askInput(rl, "Password (q=quit): ", "password"));
     nextPassword = "";
     if (!value || value.toLowerCase() === "q") throw new Error("Stopped before password validation");
     try {
+      const sentinelHeaders = await createSentinelHeaders(client, {
+        authBase,
+        deviceId,
+        flow: "password_verify",
+      });
       const { data } = await authJsonStep(client, authBase, "POST", "/api/accounts/password/verify", {
         password: value,
-      }, { referer });
+      }, { referer, headers: sentinelHeaders });
       console.log("[ok] Password accepted");
       return data;
     } catch (error) {
-      if (!/HTTP 401|invalid.*password|incorrect.*password/i.test(String(error?.message || ""))) throw error;
+      if (!isRejectedPasswordError(error)) throw error;
       console.log("[warn] Password was rejected. Enter it again, or q to quit.");
     }
   }
+}
+
+function isRejectedPasswordError(error) {
+  const message = String(error?.message || "");
+  return (
+    /(?:invalid|incorrect|wrong)[_\s-]*password|password[_\s-]*(?:invalid|incorrect|wrong)/i.test(message)
+    || /HTTP 401/i.test(message)
+  );
 }
 
 async function completeTotpMfaIfNeeded(client, { authBase, rl, payload, totpSecret, totpPickupUrl, referer }) {
@@ -1256,20 +1272,12 @@ async function completeAccountProfileIfNeeded(client, { authBase, deviceId, payl
   console.log(
     `[profile] Account profile is incomplete; generating a name and an age between ${PROFILE_MIN_AGE} and ${PROFILE_MAX_AGE}.`,
   );
-  console.log("[sentinel] Requesting a fresh security token for account profile creation.");
-  let sentinelToken;
+  let sentinelHeaders;
   try {
-    sentinelToken = await fetchSentinelToken({
+    sentinelHeaders = await createSentinelHeaders(client, {
+      authBase,
+      deviceId,
       flow: "oauth_create_account",
-      deviceID: deviceId,
-      fetch: (url, options) => client.rawFetch(url, {
-        ...options,
-        signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
-        timeoutMs: DEFAULT_TIMEOUT_MS,
-      }),
-      reqEndpoint: sentinelRequirementsEndpoint(authBase),
-      deviceProfile: browserIdentityForTransport(client.transport),
-      sendClientHints: !client.transport?.enabled,
     });
   } catch (error) {
     throw new Error(
@@ -1287,7 +1295,7 @@ async function completeAccountProfileIfNeeded(client, { authBase, deviceId, payl
       profile,
       {
         referer: profileUrl,
-        headers: { "openai-sentinel-token": sentinelToken },
+        headers: sentinelHeaders,
       },
     ));
   } catch (error) {
@@ -1311,6 +1319,71 @@ function sentinelRequirementsEndpoint(authBase) {
     return "https://sentinel.openai.com/backend-api/sentinel/req";
   }
   return new URL("/backend-api/sentinel/req", target).toString();
+}
+
+/**
+ * 动态 Sentinel 令牌：优先在 Python TLS 会话内加载真实 SDK 生成。
+ * 传输层不可用时返回 null，由 createSentinelHeaders 退回进程内生成器。
+ */
+async function dynamicSentinelTokens(client, { authBase, deviceId, flow }) {
+  if (process.env.NODE_ENV === "test" && process.env.TOSUB2_TEST_SENTINEL_TOKEN) {
+    return {
+      token: JSON.stringify({
+        p: "test-proof",
+        t: null,
+        c: process.env.TOSUB2_TEST_SENTINEL_TOKEN,
+        id: deviceId,
+        flow,
+      }),
+      soToken: process.env.TOSUB2_TEST_SENTINEL_SO_TOKEN || null,
+    };
+  }
+  if (client.transport?.enabled && typeof client.transport.generateSentinelTokens === "function") {
+    return client.transport.generateSentinelTokens({
+      flow,
+      deviceID: deviceId,
+      pageUrl: sentinelPageUrl(authBase, flow),
+      includeSessionObserver: true,
+    });
+  }
+  return null;
+}
+
+async function createSentinelHeaders(client, { authBase, deviceId, flow }) {
+  console.log(`[sentinel] Requesting a fresh security token for ${flow}.`);
+  const tokens = await dynamicSentinelTokens(client, { authBase, deviceId, flow });
+  if (tokens) {
+    return {
+      "openai-sentinel-token": tokens.token,
+      ...(tokens.soToken ? { "openai-sentinel-so-token": tokens.soToken } : {}),
+    };
+  }
+  // 传输层未启用（--native-http 或非官方域名）时沿用进程内 Sentinel 生成器，避免功能回退。
+  console.log("[sentinel] Python TLS 传输层未启用，改用进程内生成器。");
+  const token = await fetchSentinelToken({
+    flow,
+    deviceID: deviceId,
+    fetch: (url, options) => client.rawFetch(url, {
+      ...options,
+      signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+      timeoutMs: DEFAULT_TIMEOUT_MS,
+    }),
+    reqEndpoint: sentinelRequirementsEndpoint(authBase),
+    deviceProfile: browserIdentityForTransport(client.transport),
+    sendClientHints: !client.transport?.enabled,
+  });
+  return { "openai-sentinel-token": token };
+}
+
+function sentinelPageUrl(authBase, flow) {
+  const pathname = {
+    email_otp_validate: "/email-verification",
+    oauth_create_account: "/about-you",
+    password_reset: "/reset-password/new-password",
+    password_verify: "/log-in/password",
+    username_password_create: "/create-account/password",
+  }[flow] || "/log-in";
+  return `${authBase}${pathname}`;
 }
 
 function generateAccountProfile(now = new Date()) {

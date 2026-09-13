@@ -3,7 +3,9 @@
 
 import base64
 from concurrent.futures import ThreadPoolExecutor
+import importlib.util
 import json
+from pathlib import Path
 import re
 import sys
 from typing import get_args
@@ -19,6 +21,33 @@ except Exception as error:  # pragma: no cover - exercised on missing local depe
     IMPORT_ERROR = f"{type(error).__name__}: {error}"
 
 
+# The Cloudflare challenge solver and the dynamic Sentinel client live in
+# cloudflare-ctf/. Both are loaded lazily and treated as optional: if they are
+# missing the plain request path keeps working and only the two operations below
+# report a descriptive error instead of taking the whole worker down at import.
+SOLVER_DIR = Path(__file__).resolve().parent / "cloudflare-ctf"
+SOLVER_PATH = SOLVER_DIR / "cloudflare_solver.py"
+CLOUDFLARE_SOLVER = None
+SentinelClient = None
+SOLVER_IMPORT_ERROR = None
+if IMPORT_ERROR is None:
+    try:
+        if str(SOLVER_DIR) not in sys.path:
+            sys.path.insert(0, str(SOLVER_DIR))
+        from sentinel_client import SentinelClient  # noqa: E402
+
+        SOLVER_SPEC = importlib.util.spec_from_file_location("tosub2_cloudflare_solver", SOLVER_PATH)
+        if SOLVER_SPEC is not None and SOLVER_SPEC.loader is not None:
+            CLOUDFLARE_SOLVER = importlib.util.module_from_spec(SOLVER_SPEC)
+            SOLVER_SPEC.loader.exec_module(CLOUDFLARE_SOLVER)
+        else:  # pragma: no cover - installation corruption
+            SOLVER_IMPORT_ERROR = f"solver entry point missing: {SOLVER_PATH}"
+    except Exception as error:  # pragma: no cover - exercised on missing optional module
+        CLOUDFLARE_SOLVER = None
+        SentinelClient = None
+        SOLVER_IMPORT_ERROR = f"{type(error).__name__}: {error}"
+
+
 def write_message(payload):
     sys.stdout.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n")
     sys.stdout.flush()
@@ -29,18 +58,22 @@ class Worker:
         self.session = None
         self.proxy = None
         self.impersonate = "chrome146"
+        self.verify_tls = True
+        self.sentinel_client = None
         self.fallback_profiles = ("chrome146", "chrome145", "chrome142", "chrome136")
 
-    def configure(self, proxy, impersonate, allow_fallback=True):
+    def configure(self, proxy, impersonate, allow_fallback=True, verify_tls=True):
         if IMPORT_ERROR:
             raise RuntimeError(
                 "Python curl_cffi is unavailable. Run: python -m pip install -r requirements.txt "
                 f"({IMPORT_ERROR})"
             )
+        self.close_sentinel()
         if self.session is not None:
             self.session.close()
             self.session = None
         self.proxy = proxy or None
+        self.verify_tls = bool(verify_tls)
         requested_profile = impersonate or "chrome146"
         profiles = [requested_profile]
         if allow_fallback:
@@ -51,7 +84,18 @@ class Worker:
         last_error = None
         for profile in profiles:
             try:
-                self.session = requests.Session(impersonate=profile, proxy=self.proxy)
+                session_options = {"impersonate": profile}
+                if self._uses_local_http_proxy():
+                    # curl_cffi needs the explicit mapping form for local HTTP proxies.
+                    session_options["proxies"] = {
+                        "http": self.proxy,
+                        "https": self.proxy,
+                    }
+                else:
+                    session_options["proxy"] = self.proxy
+                if not self.verify_tls:
+                    session_options["verify"] = False
+                self.session = requests.Session(**session_options)
                 self.impersonate = profile
                 if profile != requested_profile:
                     sys.stderr.write(
@@ -64,6 +108,13 @@ class Worker:
                 if not self._is_unsupported_impersonate(error):
                     raise
         raise last_error
+
+    def _uses_local_http_proxy(self):
+        if not self.proxy:
+            return False
+        parsed = urlparse(self.proxy)
+        hostname = (parsed.hostname or "").lower()
+        return parsed.scheme == "http" and hostname in {"localhost", "127.0.0.1", "::1"}
 
     def probe_profiles(self, url, profiles=None, timeout_ms=15000, concurrency=4):
         if IMPORT_ERROR:
@@ -192,7 +243,7 @@ class Worker:
                 if profile == original_profile:
                     continue
                 try:
-                    self.configure(self.proxy, profile, allow_fallback=False)
+                    self.configure(self.proxy, profile, allow_fallback=False, verify_tls=self.verify_tls)
                     response = self.session.request(
                         method,
                         url,
@@ -249,6 +300,73 @@ class Worker:
             "cookies": cookies,
         }
 
+    def solve_cloudflare(self, message):
+        if self.session is None:
+            raise RuntimeError("TLS session must be configured before solving Cloudflare")
+        if CLOUDFLARE_SOLVER is None:
+            raise RuntimeError(
+                "Cloudflare solver module could not be loaded"
+                + (f" ({SOLVER_IMPORT_ERROR})" if SOLVER_IMPORT_ERROR else "")
+            )
+        challenge_body = message.get("challengeBody") or ""
+        challenge_html = base64.b64decode(challenge_body).decode("utf-8", errors="ignore")
+        challenge_url = str(message.get("url") or "")
+        parsed = urlparse(challenge_url)
+        verification_url = f"{parsed.scheme}://{parsed.netloc}/"
+        return CLOUDFLARE_SOLVER.solve_challenge(
+            self.session,
+            challenge_url=challenge_url,
+            challenge_html=challenge_html,
+            challenge_size=len(challenge_html.encode("utf-8")),
+            user_agent=str(message.get("userAgent") or "Mozilla/5.0"),
+            browser_identity=message.get("browserIdentity") or {},
+            verification_url=verification_url,
+            node_command=str(message.get("nodeCommand") or "node"),
+            timeout_seconds=max(10, int(message.get("solverTimeoutMs") or 70000) // 1000),
+        )
+
+    def generate_sentinel_tokens(self, message):
+        if self.session is None:
+            raise RuntimeError("TLS session must be configured before generating Sentinel tokens")
+        if SentinelClient is None:
+            raise RuntimeError(
+                "Dynamic Sentinel client could not be loaded"
+                + (f" ({SOLVER_IMPORT_ERROR})" if SOLVER_IMPORT_ERROR else "")
+            )
+        identity = message.get("browserIdentity") or {}
+        user_agent = str(message.get("userAgent") or identity.get("userAgent") or "Mozilla/5.0")
+        page_url = str(message.get("pageUrl") or "https://auth.openai.com/create-account/password")
+        device_id = str(message.get("deviceID") or "") or None
+        sentinel = SentinelClient(
+            page_url=page_url,
+            client=self.session,
+            user_agent=user_agent,
+            browser_identity=identity,
+            node_command=str(message.get("nodeCommand") or "node"),
+            device_id=device_id,
+        )
+        try:
+            flow = str(message.get("flow") or "default")
+            token = sentinel.token(flow)
+            so_token = None
+            if message.get("includeSessionObserver", True):
+                try:
+                    so_token = sentinel.session_observer_token(flow)
+                except RuntimeError as error:
+                    # The Session Observer collector is optional; a token without
+                    # it is still accepted by the account endpoints.
+                    if "returned no value" not in str(error):
+                        raise
+            return {"token": token, "soToken": so_token}
+        finally:
+            sentinel.close()
+
+    def close_sentinel(self):
+        if self.sentinel_client is None:
+            return
+        self.sentinel_client.close()
+        self.sentinel_client = None
+
 
 def main():
     worker = Worker()
@@ -258,8 +376,16 @@ def main():
             request_id = message.get("id")
             operation = message.get("operation", "request")
             if operation == "configure":
-                worker.configure(message.get("proxy"), message.get("impersonate"))
-                result = {"configured": True, "profile": worker.impersonate}
+                worker.configure(
+                    message.get("proxy"),
+                    message.get("impersonate"),
+                    verify_tls=message.get("verifyTls", True),
+                )
+                result = {
+                    "configured": True,
+                    "profile": worker.impersonate,
+                    "identityProfile": worker.impersonate,
+                }
             elif operation == "probe_profiles":
                 result = worker.probe_profiles(
                     str(message.get("url") or "https://chatgpt.com/"),
@@ -267,7 +393,12 @@ def main():
                     message.get("probeTimeoutMs") or 15000,
                     message.get("concurrency") or 4,
                 )
+            elif operation == "solve_cloudflare":
+                result = worker.solve_cloudflare(message)
+            elif operation == "generate_sentinel_tokens":
+                result = worker.generate_sentinel_tokens(message)
             elif operation == "close":
+                worker.close_sentinel()
                 write_message({"id": request_id, "ok": True, "result": {"closed": True}})
                 return
             else:

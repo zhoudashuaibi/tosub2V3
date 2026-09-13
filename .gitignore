@@ -14,3 +14,6 @@ gui-test-screenshots
 .agents
 .playwright-mcp
 example.json
+# Python 运行时缓存：core/cloudflare-ctf 的动态 Sentinel / CF 求解器会生成
+__pycache__/
+*.pyc

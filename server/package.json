@@ -16,6 +16,7 @@
     "better-sqlite3": "^11.8.1",
     "fastify": "^5.2.1",
     "fastify-plugin": "^6.0.0",
+    "jsdom": "^26.1.0",
     "pino": "^9.6.0"
   },
   "engines": {
