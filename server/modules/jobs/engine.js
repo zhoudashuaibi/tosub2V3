@@ -647,7 +647,12 @@ export function createJobsEngine({ config, db, logger }) {
       prompt_kind: null,
     });
     const job = stmt.getJob.get(jobId);
-    if (job) hooks.onLoginFinished?.(job, runtime?.account, { ok: false, code: 'CANCELED', message: reason, canceled: true });
+    if (!job) return;
+    // 排队中的任务没有 runtime（进程从未起过），账号视图必须自己查：
+    // 否则「取消全部」只把 jobs 标成 canceled，账号永远停在 joining/authorizing，
+    // 备用池列表就会一直显示「加入中」，且「加入主号池」按钮永久禁用。
+    const account = runtime?.account || (job.account_id ? stmt.getAccount.get(job.account_id) : null);
+    hooks.onLoginFinished?.(job, account, { ok: false, code: 'CANCELED', message: reason, canceled: true });
   }
 
   async function cancelAll() {
@@ -686,13 +691,21 @@ export function createJobsEngine({ config, db, logger }) {
     return stmt.getJob.get(id);
   }
 
-  function casAccountStatus(accountId, status, fromStatuses = null) {
+  /**
+   * 账号状态 CAS。
+   *
+   * pool 必须跟着状态一起传：authorizing 是主号池语义，备用池对应的是 joining
+   * （由调用方自行 CAS）。少了这层约束，给备用号重试/提交登录任务会把账号写成
+   * authorizing —— 取消回滚按 `pool='reserve' AND status='joining'` 兜底时就再也
+   * 匹配不到，号会永久卡在「授权中」。
+   */
+  function casAccountStatus(accountId, status, fromStatuses = null, pool = 'main') {
     const from = fromStatuses
       ? `AND status IN (${fromStatuses.map((s) => `'${s}'`).join(',')})`
       : '';
     const result = db
-      .prepare(`UPDATE accounts SET status = ?, updated_at = ? WHERE id = ? ${from}`)
-      .run(status, new Date().toISOString(), accountId);
+      .prepare(`UPDATE accounts SET status = ?, updated_at = ? WHERE id = ? AND pool = ? ${from}`)
+      .run(status, new Date().toISOString(), accountId, pool);
     return result.changes > 0;
   }
 

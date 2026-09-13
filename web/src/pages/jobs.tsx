@@ -80,6 +80,10 @@ export function JobsPage() {
   const invalidate = useCallback(() => {
     queryClient.invalidateQueries({ queryKey: ['jobs'] });
     queryClient.invalidateQueries({ queryKey: ['dashboard'] });
+    // 取消/重试会改账号状态（joining → mail_failed、authorizing → needs_reauth）：号池列表若不失效，
+    // 备用池会继续显示「加入中」并禁用「加入主号池」，看起来像任务没被取消掉。
+    queryClient.invalidateQueries({ queryKey: ['accounts'] });
+    queryClient.invalidateQueries({ queryKey: ['sub2api'] });
   }, [queryClient]);
 
   const cleanupMutation = useMutation({

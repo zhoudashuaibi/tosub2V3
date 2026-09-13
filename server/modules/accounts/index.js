@@ -228,16 +228,26 @@ export function createAccountsModule({ engine, logger }) {
       if (!job?.account_id) return;
       try {
         if (canceled) {
-          // 用户放弃：回池但不算失败
-          if (account?.pool === 'reserve') {
+          // 用户放弃：回池但不算失败。终态视图 runtime?.account 可能不存在（排队中就被取消的
+          // 任务从未起过进程），用 job.account_id 回查数据库，否则账号会永久停在半途状态。
+          const current = account || db.prepare('SELECT * FROM accounts WHERE id = ?').get(job.account_id);
+          if (!current) return;
+          const now = new Date().toISOString();
+          if (current.pool === 'reserve') {
+            // 两个都回滚：
+            //  - joining  ：加入流程中途被取消
+            //  - authorizing：历史遗留/异常路径把备用号写成了主池状态（见 engine.casAccountStatus 的 pool 约束）
+            // 只匹配 joining 会漏掉后者，号就永远回不了备用池。
             db.prepare(
-              `UPDATE accounts SET status='mail_failed', mail_error='任务已取消', updated_at=? WHERE id=? AND pool='reserve' AND status='joining'`,
-            ).run(new Date().toISOString(), job.account_id);
-          } else {
+              `UPDATE accounts SET status='mail_failed', mail_error='任务已取消', updated_at=?
+               WHERE id=? AND pool='reserve' AND status IN ('joining','authorizing')`,
+            ).run(now, job.account_id);
+          } else if (current.pool === 'main') {
             db.prepare(
               `UPDATE accounts SET status='needs_reauth', updated_at=? WHERE id=? AND pool='main' AND status='authorizing'`,
-            ).run(new Date().toISOString(), job.account_id);
+            ).run(now, job.account_id);
           }
+          pools.recordEvent(job.account_id, 'join_canceled', { job_id: job.id, reason: String(message || '') });
           return;
         }
         if (ok) return;
