@@ -34,15 +34,26 @@
 
 ```mermaid
 flowchart TD
-    A[选定主号池账号] --> B[构建账号 payload<br/>（tokens_enc → sub2api 格式）]
+    A[选定主号池账号] --> L[上传闸门：与巡检补号共用一条队列<br/>串行执行]
+    L --> B[构建账号 payload<br/>（tokens_enc → sub2api 格式）]
     B --> C[拉取远端全量 openai 账号<br/>建立 email 索引]
     C --> D{email 在远端?}
-    D -- 没有 --> E[新增组: POST /accounts/batch<br/>（余额未查过则先查一次, 追加 ---N 后缀）]
-    D -- 已有 --> F[替换组: PUT /accounts/id<br/>覆盖 credentials + clear-error + schedulable]
+    D -- 没有 --> R[创建前二次校验<br/>重拉一次索引]
+    R -- 仍未出现 --> E[新增组: POST /accounts/batch<br/>（余额未查过则先查一次, 追加 ---N 后缀）]
+    R -- 已出现 --> F[替换组: PUT /accounts/id<br/>覆盖 credentials + clear-error + schedulable]
+    D -- 已有 --> F
     E --> G[代理分配]
     F --> G
     G --> H[回填 sub2api_account_id / uploaded_at<br/>+ account_events]
 ```
+
+**并发与幂等**（2026-09 事故后加固，`upload.js`）：
+
+- **上传闸门**：`uploadAccounts` 内部串行（模块级 Promise 链）。手动批量上传与巡检自动补号共用同一管线，并发进入时两边都会先各自快照远端索引、双双判定「远端还没有这个号」，从而对同一个号各建一份远端账号；先建的那份随即失去本地关联，成为仍在接流量、却永远不会被回推凭据的孤儿（表现为 sub2api 里两个同名账号，其中一个长期 401）。
+- **创建前二次校验**：新增组在真正 `POST /accounts/batch` 之前重拉一次索引，中途已被别处建好的号降级为替换组。
+- **批次幂等键**：`tosub2-upload-<sha256(时间桶 + 待创建内容)>`，同内容重复提交（双击/重试/跨实例）折叠成一次；时间桶（10 分钟）避免远端号被删后重新上传时命中旧缓存响应而被静默跳过（原实现用 `randomUUID()`，上游幂等层形同虚设）。
+- **email 索引取最小 id**：同一邮箱在远端出现多份时，本地只关联 id 最小的那份（与远端返回顺序无关），保证多次上传绑定结果稳定。
+- **重复检测**：巡检每轮 `syncRemoteStatus` 统计同邮箱多远端账号（`duplicates`），集合变化时记 `sub2api_duplicate` 事件并告警；清理用 `node scripts/dedupe-remote-accounts.mjs`（默认 dry-run）。
 
 **payload 构建**（v1 `buildSub2ApiUploadPayload` console-server.mjs:2464-2634 的完整语义）：
 

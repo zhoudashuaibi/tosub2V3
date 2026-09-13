@@ -132,7 +132,10 @@ export function MainPoolPage() {
     onSuccess: (result) => {
       const parts = [`新关联 ${result.linked}`, `状态更新 ${result.status_updated}`];
       if (result.unlinked) parts.push(`解除 ${result.unlinked}`);
-      toast.success(`远端同步完成（扫描 ${result.scanned}）：${parts.join('，')}`);
+      if (result.duplicates) parts.push(`远端重复 ${result.duplicates}`);
+      const text = `远端同步完成（扫描 ${result.scanned}）：${parts.join('，')}`;
+      if (result.duplicates) toast.warning(`${text}。重复账号的孤儿副本不会再被回推凭据，建议清理`);
+      else toast.success(text);
       invalidate();
     },
     onError: (error) => toast.error(errorMessage(error)),

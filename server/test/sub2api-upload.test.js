@@ -6,7 +6,7 @@ import path from 'node:path';
 import { openDatabase } from '../lib/db.js';
 import { createCrypto } from '../lib/crypto.js';
 import { createLogger } from '../lib/logger.js';
-import { createUploader, balanceTierPriority, mergeUploadOptions } from '../modules/sub2api/upload.js';
+import { createUploader, balanceTierPriority, mergeUploadOptions, uploadIdempotencyKey } from '../modules/sub2api/upload.js';
 import { buildMainBalanceEstimate } from '../modules/accounts/index.js';
 import { createSub2apiClient } from '../modules/sub2api/client.js';
 
@@ -19,13 +19,28 @@ function setup() {
   const db = openDatabase(dataDir, { logger });
   const crypto = createCrypto({ dataDir, secretKeyEnv: 'test-secret', logger });
   const created = [];
+  const createBatches = [];
+  const updated = [];
+  const remote = new Map(); // email → 远端账号（mock 的远端状态，创建后即可被索引到）
+  let nextRemoteId = 100;
   const client = {
-    listAllOpenAiAccounts: async () => [],
+    listAllOpenAiAccounts: async () => [...remote.values()],
     accountEmail: (account) => account?.credentials?.email || null,
-    createAccountsBatch: async (payloads) => {
-      created.push(...payloads);
+    createAccountsBatch: async (payloads, idempotencyKey) => {
+      createBatches.push({ payloads, idempotencyKey });
+      for (const payload of payloads) {
+        const email = String(payload.credentials?.email || '').toLowerCase();
+        remote.set(email, { id: nextRemoteId, credentials: payload.credentials, name: payload.name, status: 'active' });
+        nextRemoteId += 1;
+        created.push(payload);
+      }
       return { data: [] };
     },
+    updateAccount: async (id, payload) => {
+      updated.push({ id, payload });
+    },
+    clearError: async () => {},
+    setSchedulable: async () => {},
     listProxies: async () => [],
   };
   const uploader = createUploader({
@@ -38,7 +53,7 @@ function setup() {
     proxySelector: null,
     logger,
   });
-  return { dataDir, db, crypto, uploader, created };
+  return { dataDir, db, crypto, uploader, client, created, createBatches, updated, remote };
 }
 
 // 不带 access_token：余额为空时跳过实时补查，保持「未查过」口径
@@ -131,6 +146,74 @@ test('显式指定优先级时不做余额分档', async () => {
   const byEmail = priorityByEmail();
   assert.equal(byEmail.get('a@test.local').priority, 99);
   assert.equal(byEmail.get('b@test.local').priority, 99);
+});
+
+test('并发上传串行执行：同一个号只创建一次，后到的那次走替换', async () => {
+  const id = insertAccount(ctx.db, ctx.crypto, { email: 'race@test.local', balance: 20 });
+
+  const [first, second] = await Promise.all([
+    ctx.uploader.uploadAccounts([id], {}),
+    ctx.uploader.uploadAccounts([id], {}),
+  ]);
+
+  assert.equal(ctx.createBatches.length, 1, '并发进入也只应有一次批量创建');
+  assert.equal(ctx.createBatches[0].payloads.length, 1);
+  assert.equal(first.created, 1);
+  assert.equal(first.updated, 0);
+  assert.equal(second.created, 0);
+  assert.equal(second.updated, 1);
+  const remoteId = ctx.remote.get('race@test.local').id;
+  assert.equal(ctx.updated.length, 1);
+  assert.equal(ctx.updated[0].id, remoteId);
+  assert.equal(
+    ctx.db.prepare('SELECT sub2api_account_id FROM accounts WHERE id=?').get(id).sub2api_account_id,
+    remoteId,
+  );
+  const events = ctx.db.prepare('SELECT type FROM account_events WHERE account_id=? ORDER BY id').all(id);
+  assert.deepEqual(events.map((e) => e.type), ['uploaded_sub2api', 'sub2api_replaced']);
+});
+
+test('创建前二次校验：快照之后远端已出现的号降级为替换，不再重复创建', async () => {
+  const id = insertAccount(ctx.db, ctx.crypto, { email: 'stale@test.local', balance: 20 });
+  // 第一次拉取是空的（=陈旧快照），之后远端已经有这个号（=别处并发建好了）
+  let calls = 0;
+  ctx.client.listAllOpenAiAccounts = async () => {
+    calls += 1;
+    return calls === 1 ? [] : [{ id: 777, status: 'active', credentials: { email: 'stale@test.local' } }];
+  };
+
+  const result = await ctx.uploader.uploadAccounts([id], {});
+
+  assert.equal(ctx.createBatches.length, 0, '创建前已存在于远端 → 不应再创建');
+  assert.equal(result.created, 0);
+  assert.equal(result.updated, 1);
+  assert.equal(ctx.updated[0].id, 777);
+  assert.equal(
+    ctx.db.prepare('SELECT sub2api_account_id FROM accounts WHERE id=?').get(id).sub2api_account_id,
+    777,
+  );
+});
+
+test('同一批次内重复的账号 id 去重：不会在远端建出两份', async () => {
+  const id = insertAccount(ctx.db, ctx.crypto, { email: 'twice@test.local', balance: 20 });
+
+  const result = await ctx.uploader.uploadAccounts([id, id], {});
+
+  assert.equal(ctx.createBatches.length, 1);
+  assert.equal(ctx.createBatches[0].payloads.length, 1);
+  assert.equal(result.created, 1);
+});
+
+test('uploadIdempotencyKey：同内容同时间桶一致且与顺序无关，跨桶或内容变化则不同', () => {
+  const a = [{ payload: { name: 'x', credentials: { email: 'a@test.local' } } }];
+  const b = [{ payload: { name: 'y', credentials: { email: 'b@test.local' } } }];
+  const now = Date.parse('2026-09-13T08:00:00Z');
+
+  assert.match(uploadIdempotencyKey(a, now), /^tosub2-upload-[0-9a-f]{32}$/);
+  assert.equal(uploadIdempotencyKey([...a, ...b], now), uploadIdempotencyKey([...b, ...a], now));
+  assert.notEqual(uploadIdempotencyKey(a, now), uploadIdempotencyKey(b, now));
+  // 跨时间桶 → 视为新批次，避免远端号被删后重新上传命中旧缓存响应被静默跳过
+  assert.notEqual(uploadIdempotencyKey(a, now), uploadIdempotencyKey(a, now + 11 * 60_000));
 });
 
 test('Sub2API 管理端账号统计：使用 /stats?days=90 并携带管理员密钥', async () => {

@@ -16,7 +16,64 @@ export function createUploader({ db, crypto, client, getConfig, settingsGet, dat
     return JSON.parse(fs.readFileSync(exportPath, 'utf8'));
   }
 
-  async function uploadAccounts(accountIds, optionsOverride = {}) {
+  // 上传闸门：手动批量上传与巡检自动补号共用本管线，必须串行执行。
+  // 并发进入时两次调用会在各自开头各自快照远端索引，双双判定「远端还没有这个号」，
+  // 于是对同一个号各建一份远端账号；先建的那份随即失去本地关联（回填只认一个 id），
+  // 变成仍在接流量、却再也不会被修复（凭据不回推）的孤儿。
+  let uploadChain = Promise.resolve();
+  function enqueueUpload(task) {
+    const result = uploadChain.then(task);
+    // 闸门本身不被单次失败打断，失败只回传给调用方
+    uploadChain = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  function uploadAccounts(accountIds, optionsOverride = {}) {
+    return enqueueUpload(() => runUpload(accountIds, optionsOverride));
+  }
+
+  /**
+   * 远端账号 email 索引（email → 远端 id）。同一邮箱在远端出现多份时只保留**最小**（最早创建）的 id：
+   * 重复本身是异常态（上传前有串行闸门 + 创建前二次校验），取最小可保证绑定结果与远端返回顺序无关，
+   * 多次上传不会在几份重复账号之间来回抖动。
+   */
+  function emailIndex(accounts) {
+    const byEmail = new Map();
+    for (const acc of accounts) {
+      const email = client.accountEmail(acc);
+      const id = Number(acc?.id);
+      if (!email || !Number.isSafeInteger(id) || id <= 0) continue;
+      const key = email.toLowerCase();
+      const current = byEmail.get(key);
+      if (current === undefined || id < current) byEmail.set(key, id);
+    }
+    return byEmail;
+  }
+
+  /**
+   * 创建前二次校验：重拉远端索引，把「决策快照」之后已被别处建好的号从新增降级为替换。
+   * 拉取失败不阻断（退回原有行为），只是少一层保护。
+   */
+  async function demoteExistingCreates(toCreate, toUpdate, emailById) {
+    if (!toCreate.length) return;
+    let latest;
+    try {
+      latest = emailIndex(await client.listAllOpenAiAccounts());
+    } catch (error) {
+      logger?.warn?.({ err: error.message }, '创建前二次校验失败，按原计划创建');
+      return;
+    }
+    for (let i = toCreate.length - 1; i >= 0; i -= 1) {
+      const item = toCreate[i];
+      const remoteId = latest.get(emailById.get(item.id));
+      if (!Number.isSafeInteger(remoteId) || remoteId <= 0) continue;
+      logger?.warn?.({ accountId: item.id, remoteId }, '账号在创建前已存在于远端，降级为替换凭据');
+      toUpdate.push({ id: item.id, payload: item.payload, remoteId });
+      toCreate.splice(i, 1);
+    }
+  }
+
+  async function runUpload(accountIds, optionsOverride = {}) {
     const config = getConfig();
     if (!config?.base_url || !config?.admin_key) {
       throw errors.sub2apiNotConfigured('请先配置 sub2api 后端地址与管理员密钥');
@@ -27,9 +84,14 @@ export function createUploader({ db, crypto, client, getConfig, settingsGet, dat
       optionsOverride,
     );
 
+    // 去重：同一账号在一次批次里出现两次会被远端建成两份（与并发上传同源的重复来源）
+    const ids = [...new Set((Array.isArray(accountIds) ? accountIds : []).map(Number))].filter(
+      (id) => Number.isSafeInteger(id) && id > 0,
+    );
+
     const accounts = [];
     const accountRows = [];
-    for (const id of accountIds) {
+    for (const id of ids) {
       const row = db.prepare('SELECT * FROM accounts WHERE id = ?').get(id);
       if (!row || !row.tokens_enc) continue;
       try {
@@ -43,16 +105,12 @@ export function createUploader({ db, crypto, client, getConfig, settingsGet, dat
       }
     }
     if (!accounts.length) {
-      return { created: 0, updated: 0, failed: accountIds.map((id) => ({ id, email: null, error: '账号不存在或缺少 tokens' })), updated_account_ids: [] };
+      return { created: 0, updated: 0, failed: ids.map((id) => ({ id, email: null, error: '账号不存在或缺少 tokens' })), updated_account_ids: [] };
     }
 
     // 远端全量索引
     const existing = await client.listAllOpenAiAccounts();
-    const remoteByEmail = new Map();
-    for (const acc of existing) {
-      const email = client.accountEmail(acc);
-      if (email) remoteByEmail.set(email, Number(acc.id));
-    }
+    const remoteByEmail = emailIndex(existing);
 
     // 代理分配（最少绑定 + 整批均匀）
     let proxySelection = null;
@@ -80,7 +138,6 @@ export function createUploader({ db, crypto, client, getConfig, settingsGet, dat
 
     const toCreate = [];
     const toUpdate = [];
-    const createdAccountIds = [];
     const emailById = new Map();
     accounts.forEach((exportData, index) => {
       const row = accountRows[index];
@@ -91,10 +148,7 @@ export function createUploader({ db, crypto, client, getConfig, settingsGet, dat
       const payload = buildPayload(account, options, proxySelection, row);
       const remoteId = email ? remoteByEmail.get(email) : null;
       if (Number.isSafeInteger(remoteId) && remoteId > 0) toUpdate.push({ id: row.id, payload, remoteId });
-      else {
-        toCreate.push({ id: row.id, payload });
-        createdAccountIds.push(row.id);
-      }
+      else toCreate.push({ id: row.id, payload });
     });
 
     // 新增组：余额未查过则先实时查一次，追加 ---N 后缀
@@ -102,27 +156,25 @@ export function createUploader({ db, crypto, client, getConfig, settingsGet, dat
       await appendBalanceSuffix(item, options, db, crypto);
     }
 
+    // 创建前二次校验：上面的索引是「决策快照」，到真正落库之间还隔着代理分配与余额补查（可能数秒），
+    // 期间别处（并发上传、另一个实例）可能已经把这个号建好，直接 create 会在远端留下两份。
+    await demoteExistingCreates(toCreate, toUpdate, emailById);
+
     let created = 0;
     const failed = [];
     const updatedAccountIds = [];
 
     if (toCreate.length) {
       try {
-        await client.createAccountsBatch(
-          toCreate.map((item) => item.payload),
-          `tosub2-upload-${nodeCrypto.randomUUID()}`,
-        );
+        // 幂等键由待创建内容 + 时间桶决定：同一批号重复提交（双击、重试、跨实例并发）得到同一个 key，
+        // 交给 sub2api 侧幂等层折叠；此前用 randomUUID()，每次调用都是新 key，上游幂等形同虚设。
+        await client.createAccountsBatch(toCreate.map((item) => item.payload), uploadIdempotencyKey(toCreate));
         created = toCreate.length;
         // 批量创建响应不含新账号 ID：重拉远端索引按 email 回填真实 sub2api_account_id
         // （远端状态列、已上传统计、余额查询选路都依赖它；重拉失败退化为仅记上传时间，留待同步补齐）
         let createdIndexByEmail = null;
         try {
-          const after = await client.listAllOpenAiAccounts();
-          createdIndexByEmail = new Map();
-          for (const acc of after) {
-            const email = client.accountEmail(acc);
-            if (email) createdIndexByEmail.set(email.toLowerCase(), Number(acc.id));
-          }
+          createdIndexByEmail = emailIndex(await client.listAllOpenAiAccounts());
         } catch (indexError) {
           logger?.warn?.({ err: indexError.message }, 'reload remote index after create failed');
         }
@@ -311,6 +363,24 @@ export function buildExportFromTokens(row, tokens) {
       },
     ],
   };
+}
+
+/**
+ * 幂等键时间桶：同内容重复提交在桶内折叠成一次创建；跨桶视为新批次。
+ * 之所以带上时间桶而不是纯内容哈希——远端账号被删除后重新上传时内容可能完全一致，
+ * 纯内容哈希会命中很久以前的缓存响应，导致「远端没建、本地却记成已上传」。
+ */
+const IDEMPOTENCY_BUCKET_MS = 10 * 60_000;
+
+/**
+ * 批次幂等键：由待创建内容 + 时间桶决定，与批次内顺序无关。
+ * 同一批号在短时间内重复提交（双击、重试、并发实例）→ 同一个 key，交给 sub2api 侧幂等层折叠。
+ */
+export function uploadIdempotencyKey(items, now = Date.now()) {
+  const material = items.map((item) => JSON.stringify(item.payload)).sort().join('\n');
+  const bucket = Math.floor(now / IDEMPOTENCY_BUCKET_MS);
+  const digest = nodeCrypto.createHash('sha256').update(`${bucket}\n${material}`).digest('hex');
+  return `tosub2-upload-${digest.slice(0, 32)}`;
 }
 
 /**

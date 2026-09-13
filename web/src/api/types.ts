@@ -394,6 +394,10 @@ export interface Sub2ApiSyncResult {
   linked: number;
   unlinked: number;
   status_updated: number;
+  /** 同邮箱在远端存在多份账号的本地账号数（历史并发上传遗留的孤儿副本，需要清理） */
+  duplicates?: number;
+  duplicate_new?: number;
+  duplicate_items?: { email: string; remote_ids: number[]; extras: number[] }[];
 }
 
 export interface DashboardSummary {

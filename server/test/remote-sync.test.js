@@ -117,6 +117,51 @@ test('syncRemoteStatus：优先按本地 ID 匹配（email 变更仍能关联）
   assert.equal(row.sub2api_status, 'active');
 });
 
+test('syncRemoteStatus：同邮箱多远端账号 → 记一次 sub2api_duplicate 事件并统计', async () => {
+  const id = insertMain(ctx.db, { email: 'dup@test.local', sub2apiAccountId: 20 });
+  const sync = buildSync({
+    remoteAccounts: [
+      { id: 20, credentials: { email: 'dup@test.local' }, status: 'active' },
+      { id: 30, credentials: { email: 'dup@test.local' }, status: 'error' },
+    ],
+  });
+
+  const first = await sync.syncRemoteStatus();
+  assert.equal(first.duplicates, 1);
+  assert.equal(first.duplicate_new, 1);
+  assert.deepEqual(first.duplicate_items, [
+    { email: 'dup@test.local', remote_ids: [20, 30], extras: [30] },
+  ]);
+  const events = ctx.db.prepare(`SELECT type FROM account_events WHERE account_id=? ORDER BY id`).all(id);
+  assert.deepEqual(events.map((e) => e.type), ['sub2api_duplicate']);
+  // 关联仍指向最早的那份，不会被重复账号带偏
+  assert.equal(ctx.db.prepare('SELECT sub2api_account_id FROM accounts WHERE id=?').get(id).sub2api_account_id, 20);
+
+  // 重复集合未变 → 不重复记事件，但每轮仍然统计到，方便巡检日志持续提醒
+  const second = await sync.syncRemoteStatus();
+  assert.equal(second.duplicates, 1);
+  assert.equal(second.duplicate_new, 0);
+  assert.equal(second.duplicate_items.length, 0);
+  assert.equal(
+    ctx.db.prepare(`SELECT COUNT(*) n FROM account_events WHERE account_id=? AND type='sub2api_duplicate'`).get(id).n,
+    1,
+  );
+});
+
+test('syncRemoteStatus：未关联时按 email 命中最早的一份（与远端返回顺序无关）', async () => {
+  const id = insertMain(ctx.db, { email: 'dup2@test.local' });
+  const sync = buildSync({
+    remoteAccounts: [
+      { id: 30, credentials: { email: 'dup2@test.local' }, status: 'error' },
+      { id: 20, credentials: { email: 'dup2@test.local' }, status: 'active' },
+    ],
+  });
+
+  await sync.syncRemoteStatus();
+
+  assert.equal(ctx.db.prepare('SELECT sub2api_account_id FROM accounts WHERE id=?').get(id).sub2api_account_id, 20);
+});
+
 test('resolveSub2apiProxy：已上传且绑代理 → 返回 URL；未配置/未上传/未绑代理 → null', async () => {
   const proxies = [{ id: 3, protocol: 'http', host: '10.0.0.1', port: 8080, username: 'u', password: 'p', name: 'p3' }];
   const remoteAccounts = [

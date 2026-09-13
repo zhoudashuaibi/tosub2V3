@@ -14,7 +14,8 @@
     "build": "npm --workspace web run build",
     "start": "node server/index.js",
     "check": "npm --workspace server run check && npm --workspace web run check",
-    "test": "npm --workspace server run test"
+    "test": "npm --workspace server run test",
+    "dedupe-remote": "node scripts/dedupe-remote-accounts.mjs"
   },
   "engines": {
     "node": ">=20"
