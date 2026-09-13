@@ -11,6 +11,12 @@ import { uploadOrderExpr } from '../../lib/upload-order.js';
  *  - OAuth 号限流不写 status=error，用 rate_limited_at 判定：重置时间超过阈值 → 移废弃池，否则保留观察
  *  - 401/会话过期 → 自动修复：有 refresh_token 先刷新（失败自动转完整登录），没有直接发完整登录；
  *    连续失败 max_repair_attempts 次暂停保留待重授（needs_reauth + 停自动修复 + 暂停远端调度，不再废弃）
+ *  - 修复结果回执：发起修复只写「已发起」，任务终态由 noteRepairOutcome 写回同一行明细
+ *    （outcome=ok/failed/parked/followup），日志必须能回答「修好了还是修废了」
+ *  - 摘要里两种量必须分清（前端 chip 也按此标注，避免误读）：
+ *    状态量（每轮都会重复出现的当前状态）：error_accounts / rate_limited / ban_unconfirmed / repair_pending
+ *    动作量（只统计本轮真正发生的事）：discarded / discard_failed / repairing / repair_ok / repair_failed /
+ *    repair_parked / uploaded / replenished
  *  - 封禁关键词（deactivated/banned/suspended 等）→ 必须邮箱辅证证实才移废弃池；
  *    未证实只暂停远端调度保留观察，绝不凭远端一句错误信息直接废弃
  *  - 自动补号（同一阈值双重约束，支持两种口径 replenish_mode）：
@@ -152,6 +158,9 @@ export function createMonitor({ db, crypto, client, getConfig, pools, engine, up
         action: row.action,
         reason: row.reason,
         detail: row.detail,
+        outcome: row.outcome ?? null,
+        outcome_at: row.outcome_at ?? null,
+        outcome_detail: row.outcome_detail ?? null,
       });
     }
     return logs.map((row) => ({
@@ -166,6 +175,82 @@ export function createMonitor({ db, crypto, client, getConfig, pools, engine, up
     }));
   }
 
+  /**
+   * 修复结果回执：把任务终态写回本轮巡检日志里那条「修复中」明细，
+   * 否则日志永远停在「已发起」，看不出修复成功还是失败。
+   * 只认最近一条未回执（或已转完整登录）的 repairing 明细；回执可能发生在好几轮之后。
+   */
+  function markRepairOutcome(email, outcome, detail = '') {
+    if (!email) return false;
+    const target = db
+      .prepare(
+        `SELECT id FROM monitor_log_items
+         WHERE email = ? COLLATE NOCASE AND action = 'repairing' AND (outcome IS NULL OR outcome = 'followup')
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(String(email));
+    if (!target) return false;
+    db.prepare('UPDATE monitor_log_items SET outcome=?, outcome_at=?, outcome_detail=? WHERE id=?').run(
+      outcome,
+      new Date().toISOString(),
+      String(detail || '').slice(0, 300),
+      target.id,
+    );
+    return true;
+  }
+
+  /** 距上轮成功巡检以来落地的修复回执计数（动作量）；首轮无锚点（null）时只报状态量。 */
+  function repairOutcomeCounts(sinceIso) {
+    const counts = { repair_ok: 0, repair_failed: 0, repair_parked: 0 };
+    if (!sinceIso) return counts;
+    const rows = db
+      .prepare(`SELECT outcome, COUNT(*) AS n FROM monitor_log_items WHERE outcome_at >= ? GROUP BY outcome`)
+      .all(sinceIso);
+    for (const row of rows) {
+      if (row.outcome === 'ok') counts.repair_ok = row.n;
+      else if (row.outcome === 'failed') counts.repair_failed = row.n;
+      else if (row.outcome === 'parked') counts.repair_parked = row.n;
+    }
+    return counts;
+  }
+
+  /**
+   * 在途自动修复数（状态量）：主池、最近发起过自动修复、且登录/刷新任务还没落地。
+   * 有这个数，「本轮发起修复 0」才不会被误读成「没有号在修」。
+   */
+  function countInFlightRepairs() {
+    return db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM accounts a
+         WHERE a.pool='main' AND a.status='authorizing' AND a.last_auto_repair_at IS NOT NULL
+           AND EXISTS (
+             SELECT 1 FROM jobs j WHERE j.account_id=a.id AND j.type IN ('login','refresh')
+               AND j.status IN ('queued','running','awaiting_input')
+           )`,
+      )
+      .get().n;
+  }
+
+  /** 本轮结果骨架：状态量每轮都会重复出现，动作量只记本轮真正发生的事。 */
+  function emptyResult() {
+    return {
+      // 状态量（当前状态，重复出现属正常）
+      error_accounts: 0, // 远端 status=error 的号数
+      rate_limited: 0, // 本轮观察到限流的号数（超阈值会被同时计入 discarded）
+      ban_unconfirmed: 0, // 疑似封禁、等邮件辅证的号数
+      repair_pending: 0, // 修复任务在途、还没回执的号数
+      // 动作量（本轮真正发生的事）
+      discarded: 0,
+      discard_failed: 0,
+      repairing: 0, // 本轮新发起的自动修复
+      repair_ok: 0, // 距上轮以来回执成功的修复
+      repair_failed: 0, // 距上轮以来回执失败的修复
+      repair_parked: 0, // 距上轮以来因连败暂停待重授
+      uploaded: 0,
+      replenished: 0,
+    };
+  }
+
   async function runCheck({ source = 'manual' } = {}) {
     if (state.running) return view();
     const config = getConfig();
@@ -175,7 +260,9 @@ export function createMonitor({ db, crypto, client, getConfig, pools, engine, up
     state.running = true;
     const logId = startLog(source);
     const items = [];
-    const result = { error_accounts: 0, rate_limited: 0, discarded: 0, ban_unconfirmed: 0, repairing: 0, uploaded: 0, replenished: 0 };
+    const result = emptyResult();
+    // 回执锚点：上一轮成功巡检的结束时间；首轮无锚点，只报状态量
+    const outcomeSince = state.lastCheckAt;
     let accounts = null;
     try {
       const monitor = monitorConfig();
@@ -242,14 +329,15 @@ export function createMonitor({ db, crypto, client, getConfig, pools, engine, up
             ? `${new Date(resetAt).toLocaleString('zh-CN', { hour12: false })}（约 ${formatDuration(resetMs)}）`
             : '未知时间';
           if (!Number.isFinite(resetMs) || resetMs > resetThresholdMs) {
-            await discardLocal(local, 'rate_limited_429', `限流至 ${resetDesc}`, remote, monitor);
-            result.discarded += 1;
-            items.push({
+            await discardAndLog({
+              local,
               email,
-              remote_id: remote?.id,
-              action: 'discarded',
+              remote,
+              monitor,
               reason: 'rate_limited_429',
               detail: `限流至 ${resetDesc}`,
+              result,
+              items,
             });
           } else {
             items.push({
@@ -277,14 +365,15 @@ export function createMonitor({ db, crypto, client, getConfig, pools, engine, up
               new Date().toISOString(),
               local.id,
             );
-            await discardLocal(local, 'banned_401', errorMessage, remote, monitor);
-            result.discarded += 1;
-            items.push({
+            await discardAndLog({
+              local,
               email,
-              remote_id: remote?.id,
-              action: 'discarded',
+              remote,
+              monitor,
               reason: 'banned_401',
               detail: `${errorMessage}（邮件辅证证实：${verdict.reason || '封禁邮件命中'}）`,
+              result,
+              items,
             });
           } else {
             await pauseRemote(remote, monitor, '疑似封禁待辅证');
@@ -300,18 +389,40 @@ export function createMonitor({ db, crypto, client, getConfig, pools, engine, up
           continue;
         }
         if (rateLimitPatterns.some((re) => re.test(errorMessage))) {
-          await discardLocal(local, 'rate_limited_429', errorMessage, remote, monitor);
-          result.discarded += 1;
-          items.push({ email, remote_id: remote?.id, action: 'discarded', reason: 'rate_limited_429', detail: errorMessage });
+          await discardAndLog({
+            local,
+            email,
+            remote,
+            monitor,
+            reason: 'rate_limited_429',
+            detail: errorMessage,
+            result,
+            items,
+          });
           continue;
         }
 
-        // 临时错误 → 自动重登修复
-        if (monitor.auto_repair !== false && (await tryAutoRepair(local, monitor, remote))) {
+        // 临时错误 → 自动重登修复（发起只写「已发起」，终态由 noteRepairOutcome 回执到本行）
+        const repair = await tryAutoRepair(local, monitor, remote);
+        if (repair.ok) {
           result.repairing += 1;
-          items.push({ email, remote_id: remote?.id, action: 'repairing', reason: 'auto_repair', detail: errorMessage });
+          items.push({
+            email,
+            remote_id: remote?.id,
+            action: 'repairing',
+            reason: 'auto_repair',
+            detail: `${errorMessage}｜已发起${repair.repairType === 'login' ? '完整登录' : '令牌刷新'}修复，结果落地后回写本行`,
+          });
         } else {
-          items.push({ email, remote_id: remote?.id, action: 'ignored', reason: 'temp_error', detail: errorMessage });
+          // 没发起也要说清为什么：在途/冷却/熔断/缺凭据，避免日志只写「未处理」让人以为修复没下文
+          const skip = repairSkipMeta(repair);
+          items.push({
+            email,
+            remote_id: remote?.id,
+            action: skip.action,
+            reason: skip.reason,
+            detail: `${errorMessage}｜${skip.note}`,
+          });
         }
       }
 
@@ -361,6 +472,10 @@ export function createMonitor({ db, crypto, client, getConfig, pools, engine, up
         if (replenish.fleet_initial_balance != null) result.fleet_initial_balance = replenish.fleet_initial_balance;
       }
 
+      // 修复回执（上一轮之后落地的终态）+ 在途修复状态量：回答「修好了还是修废了」
+      Object.assign(result, repairOutcomeCounts(outcomeSince));
+      result.repair_pending = countInFlightRepairs();
+
       state.lastCheckAt = new Date().toISOString();
       state.lastError = null;
       state.lastResult = result;
@@ -368,6 +483,8 @@ export function createMonitor({ db, crypto, client, getConfig, pools, engine, up
       writeLogItems(logId, items);
       logger.info({ source, ...result }, 'sub2api monitor check done');
     } catch (error) {
+      // 失败的轮次也要让界面看到错误：定时器路径由 setInterval 的 catch 兜底，手动巡检只有这里
+      state.lastError = sanitizeText(String(error.message || error)).slice(0, 400);
       finishLog(logId, 'failed', result, String(error.message || error));
       writeLogItems(logId, items);
       throw error;
@@ -377,14 +494,20 @@ export function createMonitor({ db, crypto, client, getConfig, pools, engine, up
     return view();
   }
 
+  /**
+   * main → discard（best-effort）。返回 { ok, error }：调用方必须据此决定是否计入「废弃」，
+   * 否则状态冲突（账号已不在可废弃池）时日志会谎报「本轮废弃 1」，而且下轮还会重复报同一个号。
+   */
   async function discardLocal(local, reason, detail, remote, monitor) {
     try {
-      // 用量快照不在这里做：pools.moveToDiscard 落库后会统一触发 onDiscarded 钩子，
-      // 所有废弃入口（手动/巡检/登录终局失败）走同一条 best-effort 通道
-      pools.moveToDiscard(local.id, reason, detail);
+      // 用量/出口代理快照不在这里做：pools.moveToDiscard 落库后会统一触发 onDiscarded 钩子，
+      // 所有废弃入口（手动/巡检/登录终局失败）走同一条 best-effort 通道。
+      // remote 必须一起传下去：代理绑定只在「废弃这一刻」可靠，事务提交后这个号
+      // 会被暂停调度、也可能被改绑或删除，事后再查就取不到真正的出口 IP 了。
+      pools.moveToDiscard(local.id, reason, detail, { proxy: remote ?? null });
     } catch (error) {
       logger.debug({ accountId: local.id }, `monitor discard skipped: ${error.message}`);
-      return;
+      return { ok: false, error: sanitizeText(String(error.message || error)).slice(0, 200) };
     }
     if (monitor.pause_on_discard !== false && Number.isInteger(Number(remote?.id))) {
       try {
@@ -393,6 +516,26 @@ export function createMonitor({ db, crypto, client, getConfig, pools, engine, up
         logger.warn({ accountId: local.id, err: error.message }, 'pause remote on discard failed');
       }
     }
+    return { ok: true };
+  }
+
+  /** 废弃 + 计数 + 记日志：只有真进了废弃池才算「废弃」，失败单独记一条 discard_failed。 */
+  async function discardAndLog({ local, email, remote, monitor, reason, detail, result, items }) {
+    const outcome = await discardLocal(local, reason, detail, remote, monitor);
+    if (!outcome.ok) {
+      result.discard_failed += 1;
+      items.push({
+        email,
+        remote_id: remote?.id,
+        action: 'discard_failed',
+        reason,
+        detail: `${detail}｜废弃失败：${outcome.error}`,
+      });
+      return false;
+    }
+    result.discarded += 1;
+    items.push({ email, remote_id: remote?.id, action: 'discarded', reason, detail });
+    return true;
   }
 
   /**
@@ -438,29 +581,35 @@ export function createMonitor({ db, crypto, client, getConfig, pools, engine, up
   }
 
   /**
-   * 自动修复资格：无活跃任务、未封禁、不在冷却期、修复失败次数未达上限。
+   * 自动修复资格：未关闭、无活跃任务、未封禁、不在冷却期、修复失败次数未达上限。
    * 修复方式：有 refresh_token 先刷新（401 失败由引擎自动转完整登录）；
    * 没有 refresh_token 但凭据支持完整登录（密码/Outlook 取件/邮箱 API）→ 直接发完整登录。
    * 修复连败达上限不再废弃：暂停保留待重授（见 parkForReauth）。
+   *
+   * 返回结构化结果：{ ok: true, repairType } 或 { ok: false, code }
+   * code ∈ auto_repair_off | blocked | ineligible | active | parked | cooldown |
+   *        no_credentials | state_changed
+   * —— 让巡检日志能写明「这轮为什么没发起修复」，而不是笼统的「未处理」。
    */
   async function tryAutoRepair(local, monitor, remote = null) {
-    if (local.auto_repair_blocked) return false;
-    if (local.pool !== 'main') return false;
+    if (monitor.auto_repair === false) return { ok: false, code: 'auto_repair_off' };
+    if (local.auto_repair_blocked) return { ok: false, code: 'blocked' };
+    if (local.pool !== 'main') return { ok: false, code: 'ineligible' };
     // 收编保险门：远端健康的收编号绝不自动登录（自动修复本就只对 error 号触发，双保险）；
     // 远端 error（如 token 撤销 401）时收编号照常修复——无本地 tokens 直接走完整登录
-    if (local.adopted_remote && remote && String(remote.status || '') !== 'error') return false;
+    if (local.adopted_remote && remote && String(remote.status || '') !== 'error') return { ok: false, code: 'ineligible' };
     const active = db
-      .prepare(`SELECT id FROM jobs WHERE account_id=? AND status IN ('queued','running','awaiting_input')`)
+      .prepare(`SELECT type, status, stage FROM jobs WHERE account_id=? AND status IN ('queued','running','awaiting_input')`)
       .get(local.id);
-    if (active) return false;
+    if (active) return { ok: false, code: 'active', job: active };
     const maxAttempts = Number(monitor.max_repair_attempts) || 2;
     if ((local.repair_fail_count || 0) >= maxAttempts) {
       await parkForReauth(local, remote?.id ?? local.sub2api_account_id, `自动修复连续失败 ${local.repair_fail_count} 次`);
-      return false;
+      return { ok: false, code: 'parked' };
     }
     const cooldownMs = Math.max(0, Number(monitor.cooldown_minutes ?? 5)) * 60_000;
     if (local.last_auto_repair_at && Date.now() - Date.parse(local.last_auto_repair_at) < cooldownMs) {
-      return false;
+      return { ok: false, code: 'cooldown' };
     }
     const tokens = local.tokens_enc ? crypto.tryDecryptJson(local.tokens_enc, 'accounts.tokens_enc') : null;
     const credentials = local.credentials_enc
@@ -469,29 +618,42 @@ export function createMonitor({ db, crypto, client, getConfig, pools, engine, up
     let repairType = null;
     if (tokens?.refresh_token) repairType = 'refresh';
     else if (credentials?.password || credentials?.outlook?.refresh_token || credentials?.mail_api_url) repairType = 'login';
-    if (!repairType) return false;
+    if (!repairType) return { ok: false, code: 'no_credentials' };
 
     const now = new Date().toISOString();
+    const previousStatus = ['active', 'needs_reauth'].includes(local.status) ? local.status : 'active';
     const cas = db
       .prepare(`UPDATE accounts SET status='authorizing', last_auto_repair_at=?, updated_at=? WHERE id=? AND pool='main' AND status IN ('active','needs_reauth')`)
       .run(now, now, local.id);
-    if (cas.changes === 0) return false;
-    engine.submitJob({ accountId: local.id, type: repairType, note: 'sub2api 自动修复' });
+    if (cas.changes === 0) return { ok: false, code: 'state_changed' };
+    let job = null;
+    try {
+      job = engine.submitJob({ accountId: local.id, type: repairType, note: 'sub2api 自动修复' });
+    } catch (error) {
+      // 任务没建成必须回滚 CAS：否则账号卡在 authorizing，之后每轮都因「无凭据变更」被跳过
+      db.prepare(`UPDATE accounts SET status=?, updated_at=? WHERE id=? AND pool='main' AND status='authorizing'`).run(
+        previousStatus,
+        new Date().toISOString(),
+        local.id,
+      );
+      logger.warn({ accountId: local.id, err: error.message }, 'submit auto repair job failed');
+      return { ok: false, code: 'state_changed' };
+    }
     pools.recordEvent(local.id, 'auto_repair_started', { source: 'monitor', type: repairType });
-    return true;
+    return { ok: true, repairType, jobId: job?.id ?? null };
   }
 
   /**
    * 自动修复任务终态回写（由引擎 onLoginFinished 钩子调用）：
-   *  - 成功 → repair_fail_count 清零
-   *  - 失败 → 计数 +1，达到 max_repair_attempts 暂停保留待重授（不再直接废弃）
-   *  - refresh 失败已自动转完整登录的（followUpJobId）不计数，等派生登录任务的终态
+   *  - 成功 → repair_fail_count 清零 + 巡检日志回执 ok
+   *  - 失败 → 计数 +1，达到 max_repair_attempts 暂停保留待重授（不再直接废弃）；回执 failed / parked
+   *  - refresh 失败已自动转完整登录的（followUpJobId）不计数，回执 followup，等派生登录任务的终态
    */
-  function noteRepairOutcome(job, { ok, followUpJobId = null } = {}) {
+  function noteRepairOutcome(job, { ok, followUpJobId = null, message = '' } = {}) {
     try {
       if (!job?.account_id || !['refresh', 'login'].includes(job.type)) return;
       const row = db
-        .prepare(`SELECT pool, last_auto_repair_at, repair_fail_count, sub2api_account_id FROM accounts WHERE id=?`)
+        .prepare(`SELECT email, pool, last_auto_repair_at, repair_fail_count, sub2api_account_id FROM accounts WHERE id=?`)
         .get(job.account_id);
       if (!row || row.pool !== 'main' || !row.last_auto_repair_at) return;
       // 只统计自动修复链路（30 分钟内发起过修复）；手动授权不受影响
@@ -501,17 +663,29 @@ export function createMonitor({ db, crypto, client, getConfig, pools, engine, up
         if (row.repair_fail_count > 0) {
           db.prepare('UPDATE accounts SET repair_fail_count=0, updated_at=? WHERE id=?').run(now, job.account_id);
         }
+        markRepairOutcome(row.email, 'ok', '修复成功：新凭据已回推远端并恢复调度');
         return;
       }
-      if (followUpJobId) return; // 已转完整登录，本链路未结束
+      if (followUpJobId) {
+        // 已转完整登录，本链路未结束：回执成「在途」，派生任务的终态会再写回这一行
+        markRepairOutcome(row.email, 'followup', `令牌刷新失败${message ? `（${message}）` : ''}，已自动转完整登录`);
+        return;
+      }
       const maxAttempts = Number(monitorConfig().max_repair_attempts) || 2;
       const count = (row.repair_fail_count || 0) + 1;
       db.prepare('UPDATE accounts SET repair_fail_count=?, updated_at=? WHERE id=?').run(count, now, job.account_id);
       pools.recordEvent(job.account_id, 'repair_failed_attempt', { count, job_id: job.id });
       if (count >= maxAttempts) {
+        markRepairOutcome(row.email, 'parked', `修复连续失败 ${count} 次，已暂停保留待重授`);
         parkForReauth({ id: job.account_id }, row.sub2api_account_id, `自动修复连续失败 ${count} 次`).catch((error) => {
           logger.warn({ accountId: job.account_id, err: error.message }, 'repair park failed');
         });
+      } else {
+        markRepairOutcome(
+          row.email,
+          'failed',
+          `修复失败（第 ${count}/${maxAttempts} 次）${message ? `：${message}` : ''}，下轮冷却结束后重试`,
+        );
       }
     } catch (error) {
       logger.warn({ jobId: job?.id, err: error.message }, 'note repair outcome failed');
@@ -839,6 +1013,33 @@ function safeParseSummary(text) {
   } catch {
     return {};
   }
+}
+
+/**
+ * 未发起自动修复时的日志动作与说明（按 tryAutoRepair 的 code）：
+ * 「修复中」只能说明任务已提交，这些状态才说明为什么这一轮没发起、以及修复有没有下文。
+ */
+const REPAIR_SKIP_META = {
+  active: { action: 'repair_pending', reason: 'repair_in_flight', note: '修复任务在途，结果落地后回写本行' },
+  cooldown: { action: 'repair_cooldown', reason: 'repair_cooldown', note: '修复冷却期内，下轮再试' },
+  parked: { action: 'repair_parked', reason: 'repair_parked', note: '修复连败达上限，已暂停保留待重授' },
+  blocked: { action: 'repair_parked', reason: 'repair_parked', note: '自动修复已封锁，待重新授权解锁' },
+  no_credentials: {
+    action: 'repair_no_credentials',
+    reason: 'repair_no_credentials',
+    note: '无 refresh_token／密码／邮箱凭据，无法自动修复',
+  },
+  auto_repair_off: { action: 'ignored', reason: 'auto_repair_off', note: '自动修复未开启，仅记录不处理' },
+  state_changed: { action: 'ignored', reason: 'state_changed', note: '账号状态已变化，本轮跳过' },
+  ineligible: { action: 'ignored', reason: 'temp_error', note: '不符合自动修复条件' },
+};
+
+/** code → 日志动作；在途修复带上任务类型/阶段，便于判断是卡在排队还是真在跑。 */
+function repairSkipMeta(repair) {
+  const base = REPAIR_SKIP_META[repair?.code] || REPAIR_SKIP_META.ineligible;
+  if (repair?.code !== 'active' || !repair.job) return base;
+  const stage = repair.job.stage ? `·${repair.job.stage}` : '';
+  return { ...base, note: `修复任务在途（${repair.job.type}${stage}），结果落地后回写本行` };
 }
 
 function formatDuration(ms) {

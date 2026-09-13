@@ -222,7 +222,7 @@ export function Sub2ApiPage() {
       const r = view?.last_result;
       toast.success(
         r
-          ? `巡检完成：扫描 ${r.scanned ?? 0} · 异常 ${r.error_accounts} · 限流 ${r.rate_limited ?? 0} · 废弃 ${r.discarded} · 待辅证 ${r.ban_unconfirmed ?? 0} · 修复中 ${r.repairing} · 上传 ${r.uploaded ?? 0} · 补号 ${r.replenished} · 余额 ${r.balance_queued ?? 0}${r.available_count != null ? ` · 可用 ${r.available_count}` : ''}`
+          ? `巡检完成：扫描 ${r.scanned ?? 0} · 异常 ${r.error_accounts} · 限流中 ${r.rate_limited ?? 0} · 待辅证 ${r.ban_unconfirmed ?? 0} · 在途修复 ${r.repair_pending ?? 0} · 废弃 ${r.discarded} · 发起修复 ${r.repairing} · 修复成功 ${r.repair_ok ?? 0} · 修复失败 ${r.repair_failed ?? 0} · 上传 ${r.uploaded ?? 0} · 补号 ${r.replenished} · 余额 ${r.balance_queued ?? 0}${r.available_count != null ? ` · 可用 ${r.available_count}` : ''}`
           : '巡检完成',
       );
       queryClient.invalidateQueries({ queryKey: ['sub2api', 'monitor'] });
@@ -402,7 +402,7 @@ export function Sub2ApiPage() {
               : monitor?.last_check_at
                 ? `上次巡检 ${formatRelativeTime(monitor.last_check_at)} · ${
                     monitor.last_result
-                      ? `上轮：扫描 ${monitor.last_result.scanned ?? 0} / 异常 ${monitor.last_result.error_accounts} / 限流 ${monitor.last_result.rate_limited ?? 0} / 待辅证 ${monitor.last_result.ban_unconfirmed ?? 0} / 废弃 ${monitor.last_result.discarded} / 修复中 ${monitor.last_result.repairing} / 上传 ${monitor.last_result.uploaded ?? 0} / 补号 ${monitor.last_result.replenished}${monitor.last_result.available_count != null ? ` / 可用 ${monitor.last_result.available_count}` : ''}${monitor.last_result.stock_count != null ? ` / 主池库存 ${monitor.last_result.stock_count}` : ''}${monitor.last_result.fleet_concurrency != null ? ` / 在架并发 ${monitor.last_result.fleet_concurrency}` : ''}${monitor.last_result.fleet_initial_balance != null ? ` / 初始余额 $${monitor.last_result.fleet_initial_balance}` : ''}`
+                      ? `上轮：扫描 ${monitor.last_result.scanned ?? 0} / 异常 ${monitor.last_result.error_accounts} / 限流中 ${monitor.last_result.rate_limited ?? 0} / 待辅证 ${monitor.last_result.ban_unconfirmed ?? 0} / 在途修复 ${monitor.last_result.repair_pending ?? 0} / 废弃 ${monitor.last_result.discarded} / 发起修复 ${monitor.last_result.repairing} / 修复成功 ${monitor.last_result.repair_ok ?? 0} / 修复失败 ${monitor.last_result.repair_failed ?? 0} / 上传 ${monitor.last_result.uploaded ?? 0} / 补号 ${monitor.last_result.replenished}${monitor.last_result.available_count != null ? ` / 可用 ${monitor.last_result.available_count}` : ''}${monitor.last_result.stock_count != null ? ` / 主池库存 ${monitor.last_result.stock_count}` : ''}${monitor.last_result.fleet_concurrency != null ? ` / 在架并发 ${monitor.last_result.fleet_concurrency}` : ''}${monitor.last_result.fleet_initial_balance != null ? ` / 初始余额 $${monitor.last_result.fleet_initial_balance}` : ''}`
                       : '暂无结果'
                   }`
                 : '尚未巡检'}
@@ -779,12 +779,25 @@ function ReplaceResultView({ result }: { result: Sub2ApiProxyReplaceResult }) {
 
 const MONITOR_ACTION_META: Record<string, { label: string; variant: 'danger' | 'warning' | 'info' | 'success' | 'muted' }> = {
   discarded: { label: '移入废弃池', variant: 'danger' },
+  discard_failed: { label: '废弃失败', variant: 'danger' },
   ban_unconfirmed: { label: '待邮件辅证', variant: 'warning' },
   rate_limited_waiting: { label: '限流观察', variant: 'warning' },
-  repairing: { label: '修复中', variant: 'info' },
+  repairing: { label: '已发起修复', variant: 'info' },
+  repair_pending: { label: '修复中·任务在途', variant: 'info' },
+  repair_cooldown: { label: '修复冷却中', variant: 'muted' },
+  repair_parked: { label: '已暂停·待重授', variant: 'warning' },
+  repair_no_credentials: { label: '缺凭据·无法修复', variant: 'warning' },
   uploaded: { label: '已上传', variant: 'success' },
   upload_failed: { label: '上传失败', variant: 'danger' },
   ignored: { label: '未处理', variant: 'muted' },
+};
+
+/** 修复终态回执徽章：让「已发起修复」这一行有下文，能看出修好了还是修废了 */
+const MONITOR_OUTCOME_META: Record<string, { label: string; variant: 'danger' | 'warning' | 'info' | 'success' | 'muted' }> = {
+  ok: { label: '修复成功', variant: 'success' },
+  failed: { label: '修复失败', variant: 'danger' },
+  parked: { label: '转待重授', variant: 'warning' },
+  followup: { label: '已转完整登录', variant: 'info' },
 };
 
 const MONITOR_REASON_LABELS: Record<string, string> = {
@@ -794,23 +807,32 @@ const MONITOR_REASON_LABELS: Record<string, string> = {
   rate_limited_429: '限流/429',
   auto_repair: '临时错误',
   temp_error: '临时错误',
+  auto_repair_off: '未开启自动修复',
+  state_changed: '状态已变',
+  repair_in_flight: '修复任务在途',
+  repair_cooldown: '修复冷却',
+  repair_parked: '连败熔断',
+  repair_no_credentials: '缺凭据',
   replenish: '补号上传',
 };
 
-/** 摘要指标：>0 时按语义着色，=0 灰色弱化，一眼扫出本轮干了什么 */
+/** 摘要指标：状态量每轮都会重复出现，动作量只记本轮真正发生的事，chip 上标注清楚免得误读 */
 function MonitorSummaryChips({ summary }: { summary: Sub2ApiMonitorLog['summary'] }) {
   type Tone = 'neutral' | 'warn' | 'danger' | 'info' | 'success';
-  const chips: { label: string; value: number | null | undefined; tone: Tone }[] = [
-    { label: '扫描', value: summary.scanned, tone: 'neutral' },
-    { label: '异常', value: summary.error_accounts, tone: 'warn' },
-    { label: '限流', value: summary.rate_limited, tone: 'warn' },
-    { label: '待辅证', value: summary.ban_unconfirmed, tone: 'warn' },
-    { label: '废弃', value: summary.discarded, tone: 'danger' },
-    { label: '修复', value: summary.repairing, tone: 'info' },
-    { label: '上传', value: summary.uploaded, tone: 'success' },
-    { label: '补号', value: summary.replenished, tone: 'success' },
-    { label: '可用', value: summary.available_count, tone: 'neutral' },
-    { label: '库存', value: summary.stock_count, tone: 'neutral' },
+  const chips: { label: string; value: number | null | undefined; tone: Tone; hint: string }[] = [
+    { label: '扫描', value: summary.scanned, tone: 'neutral', hint: '本轮跟踪的号数（主池/备用池中在远端监控分组内的 OAuth 号）' },
+    { label: '异常', value: summary.error_accounts, tone: 'warn', hint: '状态量：远端 status=error 的号数（可能正在修复中）' },
+    { label: '限流中', value: summary.rate_limited, tone: 'warn', hint: '状态量：本轮观察到限流的号数；超过阈值会被废弃，同时计入「废弃」' },
+    { label: '待辅证', value: summary.ban_unconfirmed, tone: 'warn', hint: '状态量：疑似封禁但未获邮件辅证，保留观察' },
+    { label: '在途修复', value: summary.repair_pending, tone: 'info', hint: '状态量：修复任务在途、还没回执的号数' },
+    { label: '废弃', value: summary.discarded, tone: 'danger', hint: '动作量：本轮真正移入废弃池的号数' },
+    { label: '发起修复', value: summary.repairing, tone: 'info', hint: '动作量：本轮新提交的自动修复任务数（结果异步回执，见明细行）' },
+    { label: '修复成功', value: summary.repair_ok, tone: 'success', hint: '动作量：距上轮以来回执成功的修复数' },
+    { label: '修复失败', value: summary.repair_failed, tone: 'danger', hint: '动作量：距上轮以来回执失败的修复数（未达上限会冷却后重试）' },
+    { label: '上传', value: summary.uploaded, tone: 'success', hint: '动作量：本轮从主池库存上传到远端的号数' },
+    { label: '补号', value: summary.replenished, tone: 'success', hint: '动作量：本轮从备用池发起登录补入主池的号数' },
+    { label: '可用', value: summary.available_count, tone: 'neutral', hint: '主池在远端非 error/非限流的号数 + 在途补号' },
+    { label: '库存', value: summary.stock_count, tone: 'neutral', hint: '主池库存：未上传远端的 active 号数' },
   ];
   const toneClass = (tone: Tone, value: number) => {
     if (tone === 'neutral' || value <= 0) return 'text-muted-foreground';
@@ -824,7 +846,7 @@ function MonitorSummaryChips({ summary }: { summary: Sub2ApiMonitorLog['summary'
       {chips
         .filter((chip) => chip.value != null)
         .map((chip) => (
-          <span key={chip.label} className="inline-flex items-baseline gap-1">
+          <span key={chip.label} className="inline-flex items-baseline gap-1" title={chip.hint}>
             <span className="text-xs text-muted-foreground">{chip.label}</span>
             <span className={cn('text-sm font-semibold tabular-nums', toneClass(chip.tone, chip.value ?? 0))}>
               {chip.value}
@@ -843,18 +865,23 @@ function MonitorLogStatusBadge({ status }: { status: string }) {
 
 function MonitorLogItemRow({ item }: { item: Sub2ApiMonitorLogItem }) {
   const meta = MONITOR_ACTION_META[item.action] ?? { label: item.action, variant: 'muted' as const };
+  const outcome = item.outcome ? MONITOR_OUTCOME_META[item.outcome] : null;
+  // 有回执时优先展示结论（修复成功/失败），触发原因留在 title 里
+  const text = item.outcome_detail || item.detail;
+  const tip = item.outcome_detail && item.detail ? `${item.detail}\n→ ${item.outcome_detail}` : text;
   return (
     <div className="flex flex-wrap items-center gap-2 rounded-md bg-muted/40 px-2.5 py-1.5">
       <Badge variant={meta.variant}>{meta.label}</Badge>
+      {outcome && <Badge variant={outcome.variant}>{outcome.label}</Badge>}
       <span className="font-mono text-xs">{item.email ?? `远端#${item.remote_id ?? '?'}`}</span>
       {item.reason && (
         <span className="rounded bg-background px-1.5 py-0.5 text-[11px] text-muted-foreground">
           {MONITOR_REASON_LABELS[item.reason] ?? item.reason}
         </span>
       )}
-      {item.detail && (
-        <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground" title={item.detail}>
-          {item.detail}
+      {text && (
+        <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground" title={tip}>
+          {text}
         </span>
       )}
     </div>

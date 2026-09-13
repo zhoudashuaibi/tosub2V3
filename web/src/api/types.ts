@@ -294,9 +294,26 @@ export interface Sub2ApiMonitorConfig {
 export interface Sub2ApiMonitorLogItem {
   email: string | null;
   remote_id: number | null;
-  action: 'discarded' | 'repairing' | 'ban_unconfirmed' | 'rate_limited_waiting' | 'uploaded' | 'upload_failed' | 'ignored' | string;
+  action:
+    | 'discarded'
+    | 'discard_failed'
+    | 'repairing'
+    | 'repair_pending'
+    | 'repair_cooldown'
+    | 'repair_parked'
+    | 'repair_no_credentials'
+    | 'ban_unconfirmed'
+    | 'rate_limited_waiting'
+    | 'uploaded'
+    | 'upload_failed'
+    | 'ignored'
+    | string;
   reason: string;
   detail: string;
+  /** 修复终态回执：ok 成功 / failed 失败 / parked 暂停待重授 / followup 已转完整登录（仍在途） */
+  outcome?: 'ok' | 'failed' | 'parked' | 'followup' | string | null;
+  outcome_at?: string | null;
+  outcome_detail?: string | null;
 }
 
 export interface Sub2ApiMonitorLog {
@@ -308,11 +325,18 @@ export interface Sub2ApiMonitorLog {
   error: string | null;
   summary: {
     scanned?: number;
+    // 状态量：每轮都会重复出现的当前状态
     error_accounts?: number;
     rate_limited?: number;
-    discarded?: number;
     ban_unconfirmed?: number;
+    repair_pending?: number;
+    // 动作量：只统计本轮真正发生的事
+    discarded?: number;
+    discard_failed?: number;
     repairing?: number;
+    repair_ok?: number;
+    repair_failed?: number;
+    repair_parked?: number;
     uploaded?: number;
     replenished?: number;
     available_count?: number | null;
@@ -384,6 +408,11 @@ export interface Sub2ApiMonitorView {
     discarded: number;
     ban_unconfirmed?: number;
     repairing: number;
+    repair_pending?: number;
+    discard_failed?: number;
+    repair_ok?: number;
+    repair_failed?: number;
+    repair_parked?: number;
     uploaded?: number;
     replenished: number;
     available_count?: number | null;

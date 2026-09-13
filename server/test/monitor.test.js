@@ -79,6 +79,7 @@ function buildMonitor({
   banMailCheck = null,
   monitorConfig: monitorOverrides = {},
   uploadDefaults = {},
+  failDiscard = false,
 } = {}) {
   const client = {
     listAllOpenAiAccounts: async () => remoteAccounts,
@@ -118,7 +119,14 @@ function buildMonitor({
     crypto: ctx.crypto,
     client,
     getConfig,
-    pools: ctx.pools,
+    pools: failDiscard
+      ? {
+          ...ctx.pools,
+          moveToDiscard: () => {
+            throw new Error('账号不在可废弃的状态');
+          },
+        }
+      : ctx.pools,
     engine: { submitJob: (job) => ctx.submitted.push(job) },
     uploader: {
       uploadAccounts: async (ids, options) => {
@@ -879,3 +887,168 @@ test('远端同邮箱重复条目只跟踪一条（优先本地关联 ID），er
 
   assert.equal(view.last_result.scanned, 1);
 });
+
+// ---- 修复结果回执（日志必须能回答「修好了还是修废了」）----
+
+test('修复回执：401 发起修复，任务成功 → 同一行明细回执 ok', async () => {
+  const id = insertAccount(ctx.db, ctx.crypto, { email: 'expired@test.local', tokens: { refresh_token: 'rt' } });
+  const monitor = buildMonitor({
+    autoRepair: true,
+    remoteAccounts: [remoteAccount({ id: 1, email: 'expired@test.local', status: 'error' })],
+  });
+
+  await monitor.runCheck();
+  const [item] = monitor.recentLogs(1)[0].items;
+  assert.equal(item.action, 'repairing');
+  assert.equal(item.outcome, null);
+
+  monitor.noteRepairOutcome({ id: 'job-1', account_id: id, type: 'refresh' }, { ok: true });
+
+  const [done] = monitor.recentLogs(1)[0].items;
+  assert.equal(done.outcome, 'ok');
+  assert.ok(done.outcome_at);
+  assert.match(done.outcome_detail, /修复成功/);
+});
+
+test('修复回执：refresh 失败转登录 → followup（仍算在途），派生登录失败 → failed', async () => {
+  const id = insertAccount(ctx.db, ctx.crypto, { email: 'expired@test.local', tokens: { refresh_token: 'rt' } });
+  const monitor = buildMonitor({
+    autoRepair: true,
+    remoteAccounts: [remoteAccount({ id: 1, email: 'expired@test.local', status: 'error' })],
+  });
+
+  await monitor.runCheck();
+  monitor.noteRepairOutcome(
+    { id: 'job-1', account_id: id, type: 'refresh' },
+    { ok: false, followUpJobId: 'job-2', message: 'REFRESH_TOKEN_INVALID' },
+  );
+  assert.equal(monitor.recentLogs(1)[0].items[0].outcome, 'followup');
+  assert.match(monitor.recentLogs(1)[0].items[0].outcome_detail, /已自动转完整登录/);
+
+  monitor.noteRepairOutcome({ id: 'job-2', account_id: id, type: 'login' }, { ok: false, message: 'MFA 403' });
+  const [item] = monitor.recentLogs(1)[0].items;
+  assert.equal(item.outcome, 'failed');
+  assert.match(item.outcome_detail, /第 1\/2 次/);
+  assert.match(item.outcome_detail, /MFA 403/);
+});
+
+test('修复回执：连败达上限 → parked（暂停保留待重授）', async () => {
+  const id = insertAccount(ctx.db, ctx.crypto, { email: 'flaky@test.local', tokens: { refresh_token: 'rt' } });
+  const monitor = buildMonitor({
+    autoRepair: true,
+    remoteAccounts: [remoteAccount({ id: 1, email: 'flaky@test.local', status: 'error' })],
+  });
+
+  await monitor.runCheck();
+  ctx.db.prepare(`UPDATE accounts SET repair_fail_count=1 WHERE id=?`).run(id);
+  monitor.noteRepairOutcome({ id: 'job-1', account_id: id, type: 'login' }, { ok: false });
+
+  const [item] = monitor.recentLogs(1)[0].items;
+  assert.equal(item.outcome, 'parked');
+  assert.equal(ctx.db.prepare(`SELECT status FROM accounts WHERE id=?`).get(id).status, 'needs_reauth');
+});
+
+test('修复在途：同账号已有活跃任务 → 动作标为「修复任务在途」，不发新任务且计入状态量', async () => {
+  const id = insertAccount(ctx.db, ctx.crypto, { email: 'busy@test.local', tokens: { refresh_token: 'rt' } });
+  ctx.db.prepare(`UPDATE accounts SET status='authorizing', last_auto_repair_at=? WHERE id=?`).run(new Date().toISOString(), id);
+  insertRunningJob(ctx.db, id);
+
+  const monitor = buildMonitor({
+    autoRepair: true,
+    monitorConfig: { cooldown_minutes: 0 },
+    remoteAccounts: [remoteAccount({ id: 1, email: 'busy@test.local', status: 'error' })],
+  });
+
+  const view = await monitor.runCheck();
+
+  assert.equal(view.last_result.repairing, 0);
+  assert.equal(view.last_result.repair_pending, 1);
+  assert.equal(ctx.submitted.filter((job) => job.type !== 'balance').length, 0);
+  const [item] = monitor.recentLogs(1)[0].items;
+  assert.equal(item.action, 'repair_pending');
+  assert.equal(item.reason, 'repair_in_flight');
+  assert.match(item.detail, /修复任务在途（login/);
+});
+
+test('修复未发起的原因分类：冷却中 / 缺凭据 / 自动修复关闭', async () => {
+  insertAccount(ctx.db, ctx.crypto, { email: 'cooling@test.local', tokens: { refresh_token: 'rt' } });
+  const coolingId = ctx.db.prepare(`SELECT id FROM accounts WHERE email='cooling@test.local'`).get().id;
+  ctx.db.prepare(`UPDATE accounts SET last_auto_repair_at=? WHERE id=?`).run(new Date().toISOString(), coolingId);
+  insertAccount(ctx.db, ctx.crypto, { email: 'bare@test.local' });
+  const monitor = buildMonitor({
+    autoRepair: true,
+    remoteAccounts: [
+      remoteAccount({ id: 1, email: 'cooling@test.local', status: 'error' }),
+      remoteAccount({ id: 2, email: 'bare@test.local', status: 'error' }),
+    ],
+  });
+
+  await monitor.runCheck();
+  const byEmail = new Map(monitor.recentLogs(1)[0].items.map((item) => [item.email, item]));
+  assert.equal(byEmail.get('cooling@test.local').action, 'repair_cooldown');
+  assert.equal(byEmail.get('bare@test.local').action, 'repair_no_credentials');
+
+  const off = buildMonitor({
+    autoRepair: false,
+    remoteAccounts: [remoteAccount({ id: 1, email: 'cooling@test.local', status: 'error' })],
+  });
+  await off.runCheck();
+  const [item] = off.recentLogs(1)[0].items;
+  assert.equal(item.action, 'ignored');
+  assert.equal(item.reason, 'auto_repair_off');
+});
+
+test('修复回执计数：上一轮之后落地的成败进入本轮动作量', async () => {
+  const healed = insertAccount(ctx.db, ctx.crypto, { email: 'healed@test.local', tokens: { refresh_token: 'rt' } });
+  const broken = insertAccount(ctx.db, ctx.crypto, { email: 'broken@test.local', tokens: { refresh_token: 'rt' } });
+  const monitor = buildMonitor({
+    autoRepair: true,
+    monitorConfig: { cooldown_minutes: 0 },
+    remoteAccounts: [
+      remoteAccount({ id: 1, email: 'healed@test.local', status: 'error' }),
+      remoteAccount({ id: 2, email: 'broken@test.local', status: 'error' }),
+    ],
+  });
+
+  await monitor.runCheck();
+  monitor.noteRepairOutcome({ id: 'job-1', account_id: healed, type: 'refresh' }, { ok: true });
+  monitor.noteRepairOutcome({ id: 'job-2', account_id: broken, type: 'login' }, { ok: false, message: 'boom' });
+
+  const view = await monitor.runCheck();
+
+  assert.equal(view.last_result.repair_ok, 1);
+  assert.equal(view.last_result.repair_failed, 1);
+  assert.equal(view.last_result.repair_parked, 0);
+});
+
+// ---- 废弃计数求真 ----
+
+test('废弃失败不再谎报「已废弃」：状态冲突单独记 discard_failed', async () => {
+  insertAccount(ctx.db, ctx.crypto, {
+    email: 'limited@test.local',
+    tokens: { refresh_token: 'rt' },
+  });
+  const monitor = buildMonitor({
+    failDiscard: true,
+    remoteAccounts: [
+      remoteAccount({
+        id: 1,
+        email: 'limited@test.local',
+        rateLimitedAt: new Date().toISOString(),
+        resetAt: new Date(Date.now() + 30 * 24 * 3600_000).toISOString(),
+      }),
+    ],
+  });
+
+  const view = await monitor.runCheck();
+
+  assert.equal(view.last_result.rate_limited, 1);
+  assert.equal(view.last_result.discarded, 0);
+  assert.equal(view.last_result.discard_failed, 1);
+  const [item] = monitor.recentLogs(1)[0].items;
+  assert.equal(item.action, 'discard_failed');
+  assert.match(item.detail, /废弃失败/);
+  const account = ctx.db.prepare(`SELECT pool FROM accounts WHERE email='limited@test.local'`).get();
+  assert.equal(account.pool, 'main');
+});
+

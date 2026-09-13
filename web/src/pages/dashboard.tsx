@@ -96,9 +96,10 @@ export function DashboardPage() {
             <div>上次巡检：{data.monitor.last_check_at ? formatRelativeTime(data.monitor.last_check_at) : '尚未巡检'}</div>
             {data.monitor.last_result && (
               <div>
-                上轮结果：废弃 {data.monitor.last_result.discarded ?? 0} · 修复中{' '}
-                {data.monitor.last_result.repairing ?? 0} · 上传 {data.monitor.last_result.uploaded ?? 0} · 补号{' '}
-                {data.monitor.last_result.replenished ?? 0}
+                上轮结果：在途修复 {data.monitor.last_result.repair_pending ?? 0} · 废弃{' '}
+                {data.monitor.last_result.discarded ?? 0} · 发起修复 {data.monitor.last_result.repairing ?? 0} · 修复成功{' '}
+                {data.monitor.last_result.repair_ok ?? 0} · 修复失败 {data.monitor.last_result.repair_failed ?? 0} · 上传{' '}
+                {data.monitor.last_result.uploaded ?? 0} · 补号 {data.monitor.last_result.replenished ?? 0}
               </div>
             )}
             {data.monitor.last_error && <div className="text-destructive">错误：{data.monitor.last_error}</div>}
