@@ -1,5 +1,6 @@
 import { errors } from '../../lib/http-errors.js';
 import { parsePagination } from '../../lib/db.js';
+import { normalizeCodexFingerprintMode } from '../sub2api/upload.js';
 import { createRedeemClient } from './redeem-client.js';
 import { createTeamService } from './service.js';
 import { createTeamUploader } from './upload.js';
@@ -272,6 +273,7 @@ export function createTeamModule({ logger }) {
         disable_auto_pause_5h: Boolean(input.disable_auto_pause_5h),
         disable_auto_pause_7d: Boolean(input.disable_auto_pause_7d),
         enable_long_context_billing: input.enable_long_context_billing !== false,
+        codex_fingerprint_mode: normalizeCodexFingerprintMode(input.codex_fingerprint_mode),
         auto_select_proxy: input.auto_select_proxy !== false,
         proxy_id:
           Number.isSafeInteger(Number(input.proxy_id)) && Number(input.proxy_id) > 0 ? Number(input.proxy_id) : null,

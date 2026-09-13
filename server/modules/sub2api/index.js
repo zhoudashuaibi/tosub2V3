@@ -1,7 +1,7 @@
 import { errors } from '../../lib/http-errors.js';
 import { maskSecret } from '../../lib/sanitize.js';
 import { createSub2apiClient } from './client.js';
-import { createUploader } from './upload.js';
+import { createUploader, normalizeCodexFingerprintMode } from './upload.js';
 import { createMonitor } from './monitor.js';
 import { createProxyReplacer } from './proxy-replace.js';
 import { createRemoteSync } from './remote-sync.js';
@@ -135,6 +135,7 @@ export function createSub2apiModule({ engine, logger }) {
         disable_auto_pause_5h: Boolean(input.disable_auto_pause_5h),
         disable_auto_pause_7d: Boolean(input.disable_auto_pause_7d),
         enable_long_context_billing: input.enable_long_context_billing !== false,
+        codex_fingerprint_mode: normalizeCodexFingerprintMode(input.codex_fingerprint_mode),
         auto_select_proxy: input.auto_select_proxy !== false,
         proxy_id: Number.isSafeInteger(Number(input.proxy_id)) && Number(input.proxy_id) > 0
           ? Number(input.proxy_id)

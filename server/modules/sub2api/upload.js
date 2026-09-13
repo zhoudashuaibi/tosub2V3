@@ -233,6 +233,13 @@ export function createUploader({ db, crypto, client, getConfig, settingsGet, dat
     else delete extra.auto_pause_7d_disabled;
     // sub2api 账号级长上下文计费开关（OpenAI 账号超 272K 上下文按官方倍率计费）；上游缺省 false，这里显式写布尔值
     extra.openai_long_context_billing_enabled = options.enable_long_context_billing !== false;
+    // Codex 指纹收敛（sub2api extra.codex_fingerprint_mode）：多人共享同一 OAuth 账号时把
+    // installation_id / session_id / thread_id 收敛为账号级恒定值，减少上游可见的设备数与会话数。
+    // off 不写键（与 sub2api 账号编辑页一致：缺省即透传），收敛种子 codex_fingerprint_seed 由
+    // sub2api 侧在创建/更新时自行生成并托管，这里只声明模式。
+    const fingerprintMode = normalizeCodexFingerprintMode(options.codex_fingerprint_mode);
+    if (fingerprintMode !== 'off') extra.codex_fingerprint_mode = fingerprintMode;
+    else delete extra.codex_fingerprint_mode;
 
     let proxyIdForAccount = options.proxy_id || 0;
     if (!proxyIdForAccount && proxySelection) {
@@ -398,6 +405,23 @@ export function balanceTierPriority(balance) {
   return 10;
 }
 
+/**
+ * Codex 指纹收敛档位（sub2api 账号 extra.codex_fingerprint_mode），取值与 sub2api 一一对应：
+ * off=原样透传客户端设备/会话标识（默认）｜device=仅收敛 installation_id（上游见 1 设备 + N 会话）｜
+ * session=再收敛 session_id（thread_id 按客户端原始会话派生，最接近正常用户）｜full=三类标识全收敛。
+ */
+export const CODEX_FINGERPRINT_MODES = ['off', 'device', 'session', 'full'];
+
+/**
+ * 归一化收敛档位：缺省、空值、非法值一律按 off（透传）处理。
+ * 收敛在上游是显式 opt-in——sub2api 读取侧对空值/非法值同样按 off，且其历史版本曾把缺省当 session
+ * 导致存量账号额度缩水，因此这里绝不放行未知值，避免把脏值写进远端 extra 后被当成收敛开启。
+ */
+export function normalizeCodexFingerprintMode(value) {
+  const mode = String(value ?? '').trim();
+  return CODEX_FINGERPRINT_MODES.includes(mode) ? mode : 'off';
+}
+
 export function mergeUploadOptions(defaults = {}, override = {}) {
   const merged = {
     group_ids: Array.isArray(defaults.group_ids)
@@ -412,7 +436,10 @@ export function mergeUploadOptions(defaults = {}, override = {}) {
     enable_long_context_billing: defaults.enable_long_context_billing !== false,
     auto_select_proxy: defaults.auto_select_proxy !== false,
     proxy_id: defaults.proxy_id ?? null,
+    codex_fingerprint_mode: normalizeCodexFingerprintMode(defaults.codex_fingerprint_mode),
     ...override,
   };
+  // 请求级覆盖也走白名单：弹窗漏传/传了旧值时收敛档位仍落在合法集合内
+  merged.codex_fingerprint_mode = normalizeCodexFingerprintMode(merged.codex_fingerprint_mode);
   return merged;
 }

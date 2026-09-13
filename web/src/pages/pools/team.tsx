@@ -19,7 +19,14 @@ import {
 import { toast } from 'sonner';
 import { sub2apiApi, teamApi } from '@/api';
 import { errorMessage } from '@/api/client';
-import type { TeamAccount, TeamCard, TeamCardImportResult, TeamConfigView, TeamSession } from '@/api/types';
+import type {
+  CodexFingerprintMode,
+  TeamAccount,
+  TeamCard,
+  TeamCardImportResult,
+  TeamConfigView,
+  TeamSession,
+} from '@/api/types';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -40,6 +47,11 @@ import { Switch } from '@/components/ui/switch';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { BatchActionBar } from '@/components/batch-action-bar';
+import {
+  CODEX_FINGERPRINT_MODE_HINT,
+  CodexFingerprintModeSelect,
+  normalizeCodexFingerprintMode,
+} from '@/components/codex-fingerprint-mode-select';
 import { ConfirmDialog } from '@/components/confirm-dialog';
 import { EmptyState } from '@/components/empty-state';
 import { cn, formatRelativeTime } from '@/lib/utils';
@@ -854,6 +866,7 @@ function TeamConfigSection() {
   const [disable5h, setDisable5h] = useState(false);
   const [disable7d, setDisable7d] = useState(false);
   const [longContextBilling, setLongContextBilling] = useState(true);
+  const [codexFingerprintMode, setCodexFingerprintMode] = useState<CodexFingerprintMode>('off');
 
   useEffect(() => {
     if (config && !loaded) {
@@ -870,6 +883,7 @@ function TeamConfigSection() {
       setDisable5h(Boolean(ud.disable_auto_pause_5h));
       setDisable7d(Boolean(ud.disable_auto_pause_7d));
       setLongContextBilling(ud.enable_long_context_billing !== false);
+      setCodexFingerprintMode(normalizeCodexFingerprintMode(ud.codex_fingerprint_mode));
       setLoaded(true);
     }
   }, [config, loaded]);
@@ -885,6 +899,7 @@ function TeamConfigSection() {
     disable_auto_pause_5h: disable5h,
     disable_auto_pause_7d: disable7d,
     enable_long_context_billing: longContextBilling,
+    codex_fingerprint_mode: codexFingerprintMode,
     auto_select_proxy: autoSelectProxy,
     proxy_id: proxyId ? Number(proxyId) : null,
   };
@@ -1018,6 +1033,11 @@ function TeamConfigSection() {
               <Switch checked={longContextBilling} onCheckedChange={setLongContextBilling} />
               API 长上下文计费
             </label>
+          </div>
+          <div className="space-y-1.5">
+            <Label>Codex 指纹收敛</Label>
+            <CodexFingerprintModeSelect value={codexFingerprintMode} onValueChange={setCodexFingerprintMode} />
+            <p className="text-xs text-muted-foreground">{CODEX_FINGERPRINT_MODE_HINT}</p>
           </div>
           <Button onClick={() => saveUploadDefaultsMutation.mutate()} disabled={saveUploadDefaultsMutation.isPending}>
             {saveUploadDefaultsMutation.isPending && <Loader2 className="animate-spin" />}

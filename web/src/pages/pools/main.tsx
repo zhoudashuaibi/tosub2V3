@@ -5,7 +5,14 @@ import { Archive, CloudDownload, Coins, Download, KeyRound, Loader2, Plus, Refre
 import { toast } from 'sonner';
 import { accountsApi, sub2apiApi } from '@/api';
 import { download, errorMessage } from '@/api/client';
-import type { MainAccount, MainBalanceEstimate, Sub2ApiConfigView, UploadOptions, UploadOrder } from '@/api/types';
+import type {
+  CodexFingerprintMode,
+  MainAccount,
+  MainBalanceEstimate,
+  Sub2ApiConfigView,
+  UploadOptions,
+  UploadOrder,
+} from '@/api/types';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
@@ -18,6 +25,11 @@ import { StatusBadge } from '@/components/status-badge';
 import { BatchActionBar } from '@/components/batch-action-bar';
 import { BatchResultDialog, type BatchResult } from '@/components/batch-result-dialog';
 import { ConfirmDialog } from '@/components/confirm-dialog';
+import {
+  CODEX_FINGERPRINT_MODE_HINT,
+  CodexFingerprintModeSelect,
+  normalizeCodexFingerprintMode,
+} from '@/components/codex-fingerprint-mode-select';
 import { ListShell, ListToolbar, ToolbarChip, ToolbarSearch, ToolbarSpacer, RefreshButton } from '@/components/data/list-shell';
 import { FilterSelect } from '@/components/filter-select';
 import { PaginationBar } from '@/components/data/pagination-bar';
@@ -639,6 +651,7 @@ function UploadConfigDialog({
   const [disable5h, setDisable5h] = useState(false);
   const [disable7d, setDisable7d] = useState(false);
   const [longContextBilling, setLongContextBilling] = useState(true);
+  const [codexFingerprintMode, setCodexFingerprintMode] = useState<CodexFingerprintMode>('off');
   const [loaded, setLoaded] = useState(false);
   const [order, setOrder] = useOrderPreference('pools.mainUploadOrder');
 
@@ -648,6 +661,7 @@ function UploadConfigDialog({
       setDisable5h(Boolean(defaults.disable_auto_pause_5h));
       setDisable7d(Boolean(defaults.disable_auto_pause_7d));
       setLongContextBilling(defaults.enable_long_context_billing !== false);
+      setCodexFingerprintMode(normalizeCodexFingerprintMode(defaults.codex_fingerprint_mode));
       setAutoSelectProxy(defaults.auto_select_proxy !== false);
       setConcurrency(defaults.concurrency != null ? String(defaults.concurrency) : '');
       setLoadFactor(defaults.load_factor != null ? String(defaults.load_factor) : '');
@@ -762,6 +776,11 @@ function UploadConfigDialog({
               API 长上下文计费
             </label>
           </div>
+          <div className="space-y-1.5">
+            <Label>Codex 指纹收敛</Label>
+            <CodexFingerprintModeSelect value={codexFingerprintMode} onValueChange={setCodexFingerprintMode} />
+            <p className="text-xs text-muted-foreground">{CODEX_FINGERPRINT_MODE_HINT}</p>
+          </div>
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={busy}>
@@ -784,6 +803,7 @@ function UploadConfigDialog({
                 disable_auto_pause_5h: disable5h,
                 disable_auto_pause_7d: disable7d,
                 enable_long_context_billing: longContextBilling,
+                codex_fingerprint_mode: codexFingerprintMode,
               }, order || undefined)
             }
           >

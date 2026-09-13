@@ -28,6 +28,8 @@ export const DEFAULT_SETTINGS = {
       disable_auto_pause_7d: false,
       // sub2api 账号级长上下文计费（extra.openai_long_context_billing_enabled），上游默认关闭，这里默认开启
       enable_long_context_billing: true,
+      // Codex 指纹收敛（extra.codex_fingerprint_mode）：off=透传（默认）/ device / session / full
+      codex_fingerprint_mode: 'off',
       auto_select_proxy: true,
       proxy_id: null,
     },
@@ -75,6 +77,7 @@ export const DEFAULT_SETTINGS = {
       disable_auto_pause_5h: false,
       disable_auto_pause_7d: false,
       enable_long_context_billing: true,
+      codex_fingerprint_mode: 'off',
       auto_select_proxy: true,
       proxy_id: null,
     },

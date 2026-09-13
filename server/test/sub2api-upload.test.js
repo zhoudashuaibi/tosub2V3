@@ -297,3 +297,36 @@ test('mergeUploadOptions：未显式覆盖时 priority 保持空，交给分档�
   const overridden = mergeUploadOptions({ priority: 5 }, { priority: null });
   assert.equal(overridden.priority, null); // 弹窗清空即显式取消默认值，与既有语义一致
 });
+
+test('mergeUploadOptions：Codex 指纹收敛只放行四档，缺省/非法值一律回落到 off', () => {
+  // 未配置 = off（透传），不是「未设置就随便收敛」
+  assert.equal(mergeUploadOptions({}, {}).codex_fingerprint_mode, 'off');
+  assert.equal(mergeUploadOptions({ codex_fingerprint_mode: 'session' }, {}).codex_fingerprint_mode, 'session');
+  // 脏值（空格/大小写/未知档位）不得进入 payload：收敛在上游是显式 opt-in，放行未知值等于静默开启
+  for (const dirty of ['', ' ', 'SESSION', 'on', 'true', null, undefined, 3, {}]) {
+    assert.equal(
+      mergeUploadOptions({ codex_fingerprint_mode: dirty }, {}).codex_fingerprint_mode,
+      'off',
+      `defaults=${JSON.stringify(dirty)}`,
+    );
+  }
+  // 请求级覆盖同样过白名单
+  assert.equal(mergeUploadOptions({}, { codex_fingerprint_mode: 'full' }).codex_fingerprint_mode, 'full');
+  assert.equal(mergeUploadOptions({ codex_fingerprint_mode: 'full' }, { codex_fingerprint_mode: 'bogus' }).codex_fingerprint_mode, 'off');
+});
+
+test('上传 payload：收敛模式写入 extra.codex_fingerprint_mode，off 不写键', async () => {
+  const ids = [insertAccount(ctx.db, ctx.crypto, { email: 'fp@test.local', balance: 20 })];
+  await ctx.uploader.uploadAccounts(ids, { codex_fingerprint_mode: 'session' });
+  assert.equal(ctx.created[0].extra.codex_fingerprint_mode, 'session');
+  // 账号导出文件里的 extra 原样保留，其余 extra 键不受影响
+  assert.equal(ctx.created[0].extra.openai_long_context_billing_enabled, true);
+
+  // off / 非法值：不写该键（远端缺省即透传，与 sub2api 账号编辑页「关闭」语义一致）
+  for (const mode of ['off', 'bogus', undefined]) {
+    ctx = setup();
+    const target = insertAccount(ctx.db, ctx.crypto, { email: 'fp2@test.local', balance: 20 });
+    await ctx.uploader.uploadAccounts([target], { codex_fingerprint_mode: mode });
+    assert.equal('codex_fingerprint_mode' in ctx.created[0].extra, false, `mode=${mode}`);
+  }
+});

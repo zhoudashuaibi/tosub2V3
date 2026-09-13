@@ -4,7 +4,12 @@ import { ArrowRightLeft, ChevronRight, Loader2, Play, Save } from 'lucide-react'
 import { toast } from 'sonner';
 import { sub2apiApi } from '@/api';
 import { errorMessage } from '@/api/client';
-import type { Sub2ApiMonitorLog, Sub2ApiMonitorLogItem, Sub2ApiProxyReplaceResult } from '@/api/types';
+import type { CodexFingerprintMode, Sub2ApiMonitorLog, Sub2ApiMonitorLogItem, Sub2ApiProxyReplaceResult } from '@/api/types';
+import {
+  CODEX_FINGERPRINT_MODE_HINT,
+  CodexFingerprintModeSelect,
+  normalizeCodexFingerprintMode,
+} from '@/components/codex-fingerprint-mode-select';
 import { UPLOAD_ORDER_OPTIONS } from '@/components/upload-order-select';
 import { Badge } from '@/components/ui/badge';
 import { ConfirmDialog } from '@/components/confirm-dialog';
@@ -59,6 +64,7 @@ export function Sub2ApiPage() {
   const [disable5h, setDisable5h] = useState(false);
   const [disable7d, setDisable7d] = useState(false);
   const [longContextBilling, setLongContextBilling] = useState(true);
+  const [codexFingerprintMode, setCodexFingerprintMode] = useState<CodexFingerprintMode>('off');
 
   const { data: groups } = useQuery({
     queryKey: ['sub2api', 'groups'],
@@ -90,6 +96,7 @@ export function Sub2ApiPage() {
       setDisable5h(Boolean(ud.disable_auto_pause_5h));
       setDisable7d(Boolean(ud.disable_auto_pause_7d));
       setLongContextBilling(ud.enable_long_context_billing !== false);
+      setCodexFingerprintMode(normalizeCodexFingerprintMode(ud.codex_fingerprint_mode));
       setLoaded(true);
     }
   }, [config, loaded]);
@@ -105,6 +112,7 @@ export function Sub2ApiPage() {
     disable_auto_pause_5h: disable5h,
     disable_auto_pause_7d: disable7d,
     enable_long_context_billing: longContextBilling,
+    codex_fingerprint_mode: codexFingerprintMode,
     auto_select_proxy: autoSelectProxy,
     proxy_id: proxyId ? Number(proxyId) : null,
   };
@@ -385,6 +393,11 @@ export function Sub2ApiPage() {
           <p className="text-xs text-muted-foreground">
             API 长上下文计费：账号超过 272K 上下文的请求按官方长上下文倍率计费（sub2api 账号级开关，默认开启）
           </p>
+          <div className="space-y-1.5">
+            <Label>Codex 指纹收敛</Label>
+            <CodexFingerprintModeSelect value={codexFingerprintMode} onValueChange={setCodexFingerprintMode} />
+            <p className="text-xs text-muted-foreground">{CODEX_FINGERPRINT_MODE_HINT}</p>
+          </div>
           <Button onClick={() => saveUploadDefaultsMutation.mutate()} disabled={saveUploadDefaultsMutation.isPending}>
             {saveUploadDefaultsMutation.isPending && <Loader2 className="animate-spin" />}
             <Save className="h-4 w-4" />

@@ -4,7 +4,7 @@
 
 - sub2api 后端连接配置（base_url + 管理员密钥，加密存储、读取脱敏）。
 - 上传管线：主号池账号 → sub2api（**远端没有的新增、已有的替换凭据**）。
-- 上传选项：禁用 5h/7d 自动暂停、并发数、优先级、负载因子、模型白名单、随机分配 sub2api 内已有代理。
+- 上传选项：禁用 5h/7d 自动暂停、并发数、优先级、负载因子、模型白名单、Codex 指纹收敛、随机分配 sub2api 内已有代理。
 - 号池监控巡检（默认 5 分钟）：发现 401/429 → 移废弃池；临时错误 → 自动重登修复；低于阈值 → 自动补号。
 
 ## 2. 客户端协议（client.js）
@@ -70,7 +70,9 @@ flowchart TD
   "extra": {
     ...账号 extra 原样保留（远端已有的 model_mapping 等不覆盖）,
     "auto_pause_5h_disabled": true,        // 仅勾选禁用 5h 时写入；不勾 = 不写该键
-    "auto_pause_7d_disabled": true         // 同上，两键独立
+    "auto_pause_7d_disabled": true,        // 同上，两键独立
+    "openai_long_context_billing_enabled": true,  // 账号级长上下文计费，始终显式写布尔值
+    "codex_fingerprint_mode": "session"    // Codex 指纹收敛：off(默认)=不写键（透传），device/session/full 才写
   },
   "group_ids": [1, 3],                     // 配置了才写
   "concurrency": 10,                       // 可空 = 不写（保留远端/默认值）

@@ -245,6 +245,12 @@ export interface Job {
   can_input: boolean;
 }
 
+/**
+ * Codex 指纹收敛（sub2api 账号 extra.codex_fingerprint_mode）：
+ * off=原样透传客户端设备/会话标识（默认）｜device=仅设备｜session=设备+会话｜full=完全收敛
+ */
+export type CodexFingerprintMode = 'off' | 'device' | 'session' | 'full';
+
 export interface UploadOptions {
   group_ids?: number[];
   concurrency?: number | null;
@@ -254,6 +260,7 @@ export interface UploadOptions {
   disable_auto_pause_5h?: boolean;
   disable_auto_pause_7d?: boolean;
   enable_long_context_billing?: boolean;
+  codex_fingerprint_mode?: CodexFingerprintMode;
   auto_select_proxy?: boolean;
   proxy_id?: number | null;
 }

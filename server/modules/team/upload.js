@@ -1,6 +1,6 @@
 import nodeCrypto from 'node:crypto';
 import { errors } from '../../lib/http-errors.js';
-import { mergeUploadOptions } from '../sub2api/upload.js';
+import { mergeUploadOptions, normalizeCodexFingerprintMode } from '../sub2api/upload.js';
 import { allocateShortName, extractAccountEmail } from './names.js';
 
 /**
@@ -85,6 +85,10 @@ export function createTeamUploader({ db, crypto, client, getSub2apiConfig, getTe
     if (options.disable_auto_pause_7d) extra.auto_pause_7d_disabled = true;
     else delete extra.auto_pause_7d_disabled;
     extra.openai_long_context_billing_enabled = options.enable_long_context_billing !== false;
+    // Codex 指纹收敛：与 sub2api/upload.js 同一语义（off 不写键，收敛种子由 sub2api 侧托管）
+    const fingerprintMode = normalizeCodexFingerprintMode(options.codex_fingerprint_mode);
+    if (fingerprintMode !== 'off') extra.codex_fingerprint_mode = fingerprintMode;
+    else delete extra.codex_fingerprint_mode;
 
     let proxyIdForAccount = options.proxy_id || 0;
     if (!proxyIdForAccount && proxySelection) proxyIdForAccount = pickLeastBoundProxy(proxySelection);
