@@ -359,7 +359,7 @@ test('服务闪断清空队列（实测形态）：run 确认入队后 status �
     assert.equal(code, 0, `events=${JSON.stringify(events)}`);
     // 初始 run + 3 次补提交
     assert.equal(mock.calls.run.length, 4);
-    const resubmitLogs = events.filter((e) => e.type === 'log' && /补提交 run（第 3\/3 次）/.test(e.message));
+    const resubmitLogs = events.filter((e) => e.type === 'log' && /第 3\/6 次/.test(e.message));
     assert.equal(resubmitLogs.length, 1, '应有第 3/3 次补提交日志');
     const data = JSON.parse(fs.readFileSync(outPath, 'utf8'));
     assert.equal(data.accounts[0].credentials.email, EMAIL);
@@ -383,7 +383,7 @@ test('服务持续闪断：补提交耗尽 → 错误明确指出队列被清空
       { REDEEM401_POLL_INTERVAL_MS: '50', REDEEM401_TIMEOUT_MINUTES: '2' },
     );
     assert.equal(code, 1);
-    assert.equal(mock.calls.run.length, 4, '初始 + 3 次补提交后放弃');
+    assert.equal(mock.calls.run.length, 7, '初始 + 6 次补提交后放弃');
     const error = events.find((e) => e.type === 'error');
     assert.equal(error.code, 'REDEEM401_FAILED');
     assert.match(error.message, /队列随即被清空/);

@@ -321,7 +321,7 @@ async function run() {
     Number.parseInt(process.env.REDEEM401_TIMEOUT_MINUTES || String(DEFAULT_TIMEOUT_MINUTES), 10) || DEFAULT_TIMEOUT_MINUTES,
   );
   const pollIntervalMs = Math.max(
-    500,
+    50,
     Number.parseInt(process.env.REDEEM401_POLL_INTERVAL_MS || String(DEFAULT_POLL_INTERVAL_MS), 10) || DEFAULT_POLL_INTERVAL_MS,
   );
   const sub2apiOutPath = path.resolve(args.sub2apiOut);
@@ -347,10 +347,12 @@ async function run() {
   }
 
   // 2. 轮询直到本邮箱终态或超时；服务空闲却始终没见到本账号时补提交 run。
-  //    服务闪断重启会清空队列（实测 1 秒内即丢），单次补提交不够，最多重试 3 次
+  //    实测（2026-09-16）：服务端 worker 故障时会接收任务后静默丢弃（队列 1 秒内清空、
+  //    tracks/history 无痕），且故障呈小时级间歇——补提交次数与间隔递增（5s→60s，
+  //    共约 3 分钟），专门捕捉不稳定时段里的健康窗口
   let lastSignature = "";
   let resubmissions = 0;
-  const MAX_RESUBMISSIONS = 3;
+  const MAX_RESUBMISSIONS = 6;
   const startedAt = Date.now();
   const state = await pollUntilTerminal(client, email, { deadline, startedAt, pollIntervalMs, isEnqueueConfirmed: () => enqueueConfirmed, onProgress: (snapshot) => {
     const signature = `${snapshot.phase}|${snapshot.detail}`;
@@ -363,7 +365,9 @@ async function run() {
   }, onMissing: async () => {
     if (resubmissions >= MAX_RESUBMISSIONS) return false;
     resubmissions += 1;
-    emitLogEvent(`服务空闲且未见本账号，补提交 run（第 ${resubmissions}/${MAX_RESUBMISSIONS} 次）`);
+    const backoffMs = Math.min(60_000, pollIntervalMs * 2 ** (resubmissions - 1));
+    emitLogEvent(`服务空闲且未见本账号，${Math.round(backoffMs / 1000)}s 后补提交 run（第 ${resubmissions}/${MAX_RESUBMISSIONS} 次）`);
+    await sleep(backoffMs);
     try {
       const runState = await client.run(email);
       if (findTrack(runState?.state, email)) enqueueConfirmed = true;
