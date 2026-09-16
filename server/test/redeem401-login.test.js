@@ -91,7 +91,7 @@ function sub2apiAccount(email, overrides = {}) {
 }
 
 /** redeem /401processing 三端点 mock：status 按剧本序列逐次返回，export 返回真 ZIP。 */
-function createRedeemMock({ email, statusScript, exportAccounts, exportResponse = null }) {
+function createRedeemMock({ email, statusScript, exportAccounts, exportResponse = null, statusFlapTimes = 0 }) {
   const calls = { run: [], export: [] };
   let statusIndex = 0;
   const server = http.createServer((req, res) => {
@@ -101,12 +101,23 @@ function createRedeemMock({ email, statusScript, exportAccounts, exportResponse 
       req.on('data', (chunk) => (body += chunk));
       req.on('end', () => {
         calls.run.push(JSON.parse(body || '{}'));
+        // 与真实服务一致：run 响应自带 state，本邮箱以 pending track 确认入队
         res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, state: { running: true } }));
+        res.end(JSON.stringify({
+          ok: true,
+          state: { running: true, phase: 'running', accounts: [{ email, status: '待处理', error: '', plan: '', kind: 'mail' }], tracks: [{ email, phase: 'pending', otp: '', detail: '排队中' }], totals: { queue: 1 } },
+        }));
       });
       return;
     }
     if (req.method === 'GET' && url.pathname === '/401processing/api/status') {
+      // 闪断模拟：前 statusFlapTimes 次 502（Envoy upstream 断连文案）
+      if (statusFlapTimes > 0) {
+        statusFlapTimes -= 1;
+        res.writeHead(502, { 'content-type': 'text/plain' });
+        res.end('upstream connect error or disconnect/reset before headers. retried 5 times');
+        return;
+      }
       const state = statusScript[Math.min(statusIndex, statusScript.length - 1)];
       statusIndex += 1;
       res.writeHead(200, { 'content-type': 'application/json' });
@@ -304,6 +315,104 @@ test('export 归档无 JSON 成员 → REDEEM401_EXPORT_INVALID', async () => {
     const error = events.find((e) => e.type === 'error');
     assert.equal(error.code, 'REDEEM401_EXPORT_INVALID');
     assert.match(error.message, /没有 JSON 成员/);
+  } finally {
+    mock.server.close();
+    cleanupDir(dataDir);
+  }
+});
+
+const IDLE_EMPTY = () => ({
+  running: false,
+  current: '',
+  phase: 'idle',
+  error: '',
+  tracks: [],
+  history: [],
+  exportable: { count: 0, emails: [] },
+  totals: { oauth: 0, queue: 0, forbidden: 0 },
+});
+
+const DONE_OK = () => ({
+  running: false,
+  tracks: [{ email: EMAIL, phase: 'ok', otp: '535003', detail: '可导出 CPA / sub2' }],
+  history: [{ email: EMAIL, state: 'ok', detail: '可导出 CPA / sub2', ts: '2026-09-16T15:51:50+00:00' }],
+  exportable: { count: 1, emails: [EMAIL] },
+  totals: { queue: 0 },
+});
+
+test('服务闪断清空队列（实测形态）：run 确认入队后 status 全空 → 补提交 3 次后成功', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tosub2-redeem401-'));
+  const mock = createRedeemMock({
+    email: EMAIL,
+    // 前三次轮询：服务重启后队列被清空、tracks 无痕；第四次：补提交的任务跑完
+    statusScript: [IDLE_EMPTY(), IDLE_EMPTY(), IDLE_EMPTY(), DONE_OK()],
+    exportAccounts: [sub2apiAccount(EMAIL)],
+  });
+  const baseUrl = await mock.ready;
+  try {
+    const outPath = path.join(dataDir, 'results', 'flap-ok.json');
+    const { code, events } = await runScript(
+      ['--email', EMAIL, '--sub2api-out', outPath, '--json-events', '--redeem-base', baseUrl],
+      { REDEEM401_POLL_INTERVAL_MS: '50', REDEEM401_TIMEOUT_MINUTES: '2' },
+    );
+
+    assert.equal(code, 0, `events=${JSON.stringify(events)}`);
+    // 初始 run + 3 次补提交
+    assert.equal(mock.calls.run.length, 4);
+    const resubmitLogs = events.filter((e) => e.type === 'log' && /补提交 run（第 3\/3 次）/.test(e.message));
+    assert.equal(resubmitLogs.length, 1, '应有第 3/3 次补提交日志');
+    const data = JSON.parse(fs.readFileSync(outPath, 'utf8'));
+    assert.equal(data.accounts[0].credentials.email, EMAIL);
+  } finally {
+    mock.server.close();
+    cleanupDir(dataDir);
+  }
+});
+
+test('服务持续闪断：补提交耗尽 → 错误明确指出队列被清空（而非笼统的未产出凭据）', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tosub2-redeem401-'));
+  const mock = createRedeemMock({
+    email: EMAIL,
+    statusScript: [IDLE_EMPTY()],
+    exportAccounts: [],
+  });
+  const baseUrl = await mock.ready;
+  try {
+    const { code, events } = await runScript(
+      ['--email', EMAIL, '--sub2api-out', path.join(dataDir, 'out.json'), '--json-events', '--redeem-base', baseUrl],
+      { REDEEM401_POLL_INTERVAL_MS: '50', REDEEM401_TIMEOUT_MINUTES: '2' },
+    );
+    assert.equal(code, 1);
+    assert.equal(mock.calls.run.length, 4, '初始 + 3 次补提交后放弃');
+    const error = events.find((e) => e.type === 'error');
+    assert.equal(error.code, 'REDEEM401_FAILED');
+    assert.match(error.message, /队列随即被清空/);
+    assert.match(error.message, /闪断/);
+  } finally {
+    mock.server.close();
+    cleanupDir(dataDir);
+  }
+});
+
+test('status 轮询闪断容忍：连续 2 次 502 不放弃，恢复后正常完成', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tosub2-redeem401-'));
+  const mock = createRedeemMock({
+    email: EMAIL,
+    statusFlapTimes: 2,
+    statusScript: [{ running: true, tracks: [{ email: EMAIL, phase: 'login', detail: '正在网页登录' }], totals: { queue: 1 } }, DONE_OK()],
+    exportAccounts: [sub2apiAccount(EMAIL)],
+  });
+  const baseUrl = await mock.ready;
+  try {
+    const outPath = path.join(dataDir, 'results', 'flap502.json');
+    const { code, events } = await runScript(
+      ['--email', EMAIL, '--sub2api-out', outPath, '--json-events', '--redeem-base', baseUrl],
+      { REDEEM401_POLL_INTERVAL_MS: '50', REDEEM401_TIMEOUT_MINUTES: '2' },
+    );
+    assert.equal(code, 0, `events=${JSON.stringify(events)}`);
+    const flapLogs = events.filter((e) => e.type === 'log' && /status 轮询失败（[12]\/3）/.test(e.message));
+    assert.equal(flapLogs.length, 2, '应有两次 502 容忍日志');
+    assert.ok(fs.existsSync(outPath));
   } finally {
     mock.server.close();
     cleanupDir(dataDir);

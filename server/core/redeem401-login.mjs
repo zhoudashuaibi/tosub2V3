@@ -332,20 +332,27 @@ async function run() {
   log(`remote login via ${baseUrl}/401processing (timeout ${timeoutMinutes}m)`);
 
   // 1. 入队。服务端是全局单队列：若正有任务在跑导致 run 被拒，退化为纯轮询，
-  //    等本邮箱出现在 tracks / history（并发提交多个账号时必然走到这条路径）
+  //    等本邮箱出现在 tracks / history（并发提交多个账号时必然走到这条路径）。
+  //    run 响应自带全量 state：若本邮箱出现在其中，说明服务已确认入队，
+  //    之后凭空消失即可归因为服务闪断重启清空了队列（而非提交未达）
   emitStageEvent("web_login");
+  let enqueueConfirmed = false;
   try {
-    await client.run(email);
+    const runState = await client.run(email);
+    const track = findTrack(runState?.state, email);
+    enqueueConfirmed = Boolean(track);
     log(`run accepted: ${email}`);
   } catch (error) {
     emitLogEvent(`run 提交未确认（${String(error.message).slice(0, 160)}），转入轮询等待`);
   }
 
-  // 2. 轮询直到本邮箱终态或超时；服务空闲却始终没见到本账号时补提交一次 run
+  // 2. 轮询直到本邮箱终态或超时；服务空闲却始终没见到本账号时补提交 run。
+  //    服务闪断重启会清空队列（实测 1 秒内即丢），单次补提交不够，最多重试 3 次
   let lastSignature = "";
-  let resubmitted = false;
+  let resubmissions = 0;
+  const MAX_RESUBMISSIONS = 3;
   const startedAt = Date.now();
-  const state = await pollUntilTerminal(client, email, { deadline, startedAt, pollIntervalMs, onProgress: (snapshot) => {
+  const state = await pollUntilTerminal(client, email, { deadline, startedAt, pollIntervalMs, isEnqueueConfirmed: () => enqueueConfirmed, onProgress: (snapshot) => {
     const signature = `${snapshot.phase}|${snapshot.detail}`;
     if (signature !== lastSignature) {
       lastSignature = signature;
@@ -354,11 +361,12 @@ async function run() {
       emitLogEvent(snapshot.detail || `阶段：${snapshot.phase || "unknown"}`);
     }
   }, onMissing: async () => {
-    if (resubmitted) return false;
-    resubmitted = true;
-    emitLogEvent("服务空闲但未见本账号，重新提交 run");
+    if (resubmissions >= MAX_RESUBMISSIONS) return false;
+    resubmissions += 1;
+    emitLogEvent(`服务空闲且未见本账号，补提交 run（第 ${resubmissions}/${MAX_RESUBMISSIONS} 次）`);
     try {
-      await client.run(email);
+      const runState = await client.run(email);
+      if (findTrack(runState?.state, email)) enqueueConfirmed = true;
     } catch {}
     return true;
   } });
@@ -422,14 +430,28 @@ async function run() {
   });
 }
 
-async function pollUntilTerminal(client, email, { deadline, startedAt, pollIntervalMs, onProgress, onMissing }) {
+async function pollUntilTerminal(client, email, { deadline, startedAt, pollIntervalMs, isEnqueueConfirmed = () => false, onProgress, onMissing }) {
   let sawTrack = false;
+  // 服务闪断容忍：轮询中途的网络/5xx 错误连续 MAX_STATUS_FAILURES 次才放弃，
+  // 单次失败按原间隔重试（服务端 Envoy 网关瞬时 502 是常态）
+  const MAX_STATUS_FAILURES = 3;
+  let statusFailures = 0;
   while (true) {
     if (Date.now() > deadline) {
       const elapsedMinutes = Math.max(1, Math.round((Date.now() - startedAt) / 60000));
       throw new Redeem401Error(`redeem 登录 ${elapsedMinutes} 分钟未完成`, "REDEEM401_TIMEOUT");
     }
-    const state = await client.status();
+    let state;
+    try {
+      state = await client.status();
+      statusFailures = 0;
+    } catch (error) {
+      statusFailures += 1;
+      if (statusFailures >= MAX_STATUS_FAILURES) throw error;
+      emitLogEvent(`status 轮询失败（${statusFailures}/${MAX_STATUS_FAILURES}）：${String(error.message).slice(0, 120)}，重试`);
+      await sleep(pollIntervalMs);
+      continue;
+    }
     const track = findTrack(state, email);
     if (track) {
       sawTrack = true;
@@ -452,10 +474,19 @@ async function pollUntilTerminal(client, email, { deadline, startedAt, pollInter
       if (exportable.includes(email.toLowerCase())) return { ok: true, state };
       const queueEmpty = !state?.totals || Number(state.totals.queue) === 0;
       if (sawTrack || queueEmpty) {
-        // 从未见过本账号且队列已空：多半是 run 提交被拒（服务忙碌窗口），补提交后继续等
+        // 从未见过本账号且队列已空：服务闪断重启会清空内存队列（实测 run 确认入队后
+        // 1 秒内队列即被清空、tracks 无痕），也可能是 run 提交被拒（忙碌窗口）——补提交重试
         if (!sawTrack && queueEmpty && onMissing && (await onMissing())) {
           await sleep(pollIntervalMs);
           continue;
+        }
+        // 曾确认入队却始终无处理痕迹：闪断窗口内多次补提交仍被清空
+        if (!sawTrack && queueEmpty && isEnqueueConfirmed()) {
+          return {
+            ok: false,
+            state,
+            detail: "服务接受了请求但队列随即被清空（服务闪断/重启丢弃任务，且无失败记录），多次补提交仍未处理",
+          };
         }
         return {
           ok: false,
