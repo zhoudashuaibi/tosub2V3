@@ -2,7 +2,7 @@ services:
   tosub2:
     build: .
     # 服务器部署可直接用 CI 构建好的镜像（GitHub Actions 自动推送到 GHCR）：
-    # image: ghcr.io/zhoudashuaibi/tosubv2:latest
+    # image: ghcr.io/zhoudashuaibi/tosub2V3:latest
     restart: unless-stopped
     ports:
       - "127.0.0.1:1999:1999"       # 只绑本机，由反代转发；确需直连再改 0.0.0.0

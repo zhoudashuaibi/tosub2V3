@@ -6,6 +6,13 @@
 const SECRET_KEYS = new Set(['console.password', 'sub2api.config', 'sms.providers']);
 
 export const DEFAULT_SETTINGS = {
+  // 登录方式：protocol=本地协议登录（网页登录+Codex OAuth）；redeem401=redeem 服务 /401processing
+  // 远程登录（run→轮询→export，产物同 sub2api JSON）。refresh / totp_setup 任务不受此开关影响。
+  'login.provider': {
+    mode: 'redeem401',
+    redeem401_base_url: 'https://redeem.lazmeow.com',
+    redeem401_timeout_minutes: 15,
+  },
   // 2FA 在线取件（2fa.show 风格）：{code} 占位符替换为账号取件码
   'twofa.fetch': { template: 'https://2fa.show/2fa/{code}' },
   'engine.config': {

@@ -6,11 +6,15 @@ export function createSettingsModule({ logger }) {
     const db = app.db;
 
     function view() {
+      const loginProvider = app.settings.get('login.provider') || {};
       const twofa = app.settings.get('twofa.fetch') || {};
       const engineConfig = app.settings.get('engine.config');
       const sms = app.settings.get('sms.providers') || {};
       const sub2api = app.settings.get('sub2api.config') || {};
       return {
+        login_provider_mode: loginProvider.mode === 'protocol' ? 'protocol' : 'redeem401',
+        redeem401_base_url: loginProvider.redeem401_base_url || 'https://redeem.lazmeow.com',
+        redeem401_timeout_minutes: loginProvider.redeem401_timeout_minutes ?? 15,
         outlook_fetch_mode: 'microsoft_direct',
         twofa_fetch_template: twofa.template || 'https://2fa.show/2fa/{code}',
         max_concurrent_jobs: engineConfig.max_concurrent_jobs,
@@ -76,6 +80,38 @@ export function createSettingsModule({ logger }) {
             body.strict_proxy !== undefined ? Boolean(body.strict_proxy) : current.strict_proxy !== false,
         };
         app.settings.set('engine.config', next);
+      }
+      if (
+        body.login_provider_mode !== undefined ||
+        body.redeem401_base_url !== undefined ||
+        body.redeem401_timeout_minutes !== undefined
+      ) {
+        const current = app.settings.get('login.provider') || {};
+        const mode = body.login_provider_mode !== undefined ? String(body.login_provider_mode) : current.mode;
+        if (!['protocol', 'redeem401'].includes(mode)) {
+          throw errors.validation('登录方式只支持 protocol / redeem401');
+        }
+        const baseUrlInput = body.redeem401_base_url !== undefined
+          ? String(body.redeem401_base_url || '').trim()
+          : current.redeem401_base_url;
+        if (baseUrlInput) {
+          try {
+            const parsed = new URL(baseUrlInput);
+            if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('bad');
+          } catch {
+            throw errors.validation('redeem 服务地址必须是有效的 HTTP/HTTPS 地址');
+          }
+        }
+        app.settings.set('login.provider', {
+          mode,
+          redeem401_base_url: baseUrlInput || 'https://redeem.lazmeow.com',
+          redeem401_timeout_minutes: clampInt(
+            body.redeem401_timeout_minutes !== undefined ? body.redeem401_timeout_minutes : current.redeem401_timeout_minutes,
+            current.redeem401_timeout_minutes ?? 15,
+            1,
+            120,
+          ),
+        });
       }
       if (body.join_auto_upload !== undefined) {
         const current = app.settings.get('sub2api.config');

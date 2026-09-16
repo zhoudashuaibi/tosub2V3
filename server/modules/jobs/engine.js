@@ -290,13 +290,23 @@ export function createJobsEngine({ config, db, logger }) {
   // ------------------------------------------------------------------
   // 启动子进程任务
   // ------------------------------------------------------------------
+  function redeemLoginEnabled(job) {
+    if (job.type !== 'login') return false;
+    const provider = config.settingsGet?.('login.provider') || {};
+    return provider.mode !== 'protocol'; // 默认 redeem401（缺省视为开启）
+  }
+
   function launchJob(job, { preserveAttempt = false } = {}) {
     const account = stmt.getAccount.get(job.account_id);
     const credentials = config.cryptoTryDecryptJson(account?.credentials_enc, 'accounts.credentials_enc') || {};
     const accountView = { ...account, credentials };
 
-    const proxy = selectProxyForJob(job, credentials);
-    if (!proxy.url && strictProxyEnabled()) {
+    // redeem401 远程登录由服务端完成登录与收码，本机不需要出口代理，
+    // 也不受 strict_proxy（禁止直连）约束——这里根本没有到上游的直连请求
+    const redeemLogin = redeemLoginEnabled(job);
+    const provider = redeemLogin ? config.settingsGet?.('login.provider') || {} : null;
+    const proxy = redeemLogin ? { id: null, url: '' } : selectProxyForJob(job, credentials);
+    if (!redeemLogin && !proxy.url && strictProxyEnabled()) {
       // 服务器 IP 一旦被上游拉黑，本机直连登录即封号：无可用代理时直接失败，绝不直连
       const message = '无可用代理（已开启禁止直连），任务未启动';
       appendJobLog(job, 'no alive proxy and strict_proxy on, refuse direct connection');
@@ -307,9 +317,12 @@ export function createJobsEngine({ config, db, logger }) {
     }
     patchJob(job.id, {
       status: 'running',
-      proxy_id: proxy.id,
+      proxy_id: redeemLogin ? null : proxy.id,
       ...(preserveAttempt ? {} : {}),
     });
+    if (redeemLogin) {
+      appendJobLog(job, `redeem401 remote login (base=${provider.redeem401_base_url || 'https://redeem.lazmeow.com'})`);
+    }
 
     const runtime = {
       jobId: job.id,

@@ -21,6 +21,8 @@ function setup() {
   settings.ensureDefaults();
   // 引擎流程测试沿用无代理直连；strict_proxy 拦截行为由专门用例覆盖
   settings.set('engine.config', { ...settings.get('engine.config'), strict_proxy: false });
+  // 本文件测本地协议登录流程；redeem401 远程登录路径由 redeem401-engine.test.js 覆盖
+  settings.set('login.provider', { ...settings.get('login.provider'), mode: 'protocol' });
   const config = {
     dataDir,
     serverRoot: path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..'),

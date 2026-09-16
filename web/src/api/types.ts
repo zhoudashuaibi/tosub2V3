@@ -540,6 +540,9 @@ export interface TeamConfigView {
 }
 
 export interface SettingsView {
+  login_provider_mode: 'protocol' | 'redeem401';
+  redeem401_base_url: string;
+  redeem401_timeout_minutes: number;
   outlook_fetch_mode: 'microsoft_direct';
   twofa_fetch_template: string;
   max_concurrent_jobs: number;

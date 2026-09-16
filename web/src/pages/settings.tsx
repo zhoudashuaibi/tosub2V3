@@ -6,11 +6,11 @@ import { authApi, settingsApi } from '@/api';
 import { errorMessage } from '@/api/client';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import { Input } from '@/components/ui/input';
+import { Input, Textarea } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Switch } from '@/components/ui/switch';
-import { Textarea } from '@/components/ui/input';
 import { formatDateTime, formatRelativeTime } from '@/lib/utils';
 
 export function SettingsPage() {
@@ -54,6 +54,9 @@ export function SettingsPage() {
   const [timeoutMin, setTimeoutMin] = useState('');
   const [failThreshold, setFailThreshold] = useState('');
   const [strictProxy, setStrictProxy] = useState(true);
+  const [loginProvider, setLoginProvider] = useState<'protocol' | 'redeem401'>('redeem401');
+  const [redeemBaseUrl, setRedeemBaseUrl] = useState('');
+  const [redeemTimeout, setRedeemTimeout] = useState('');
   useEffect(() => {
     if (settings) {
       setTwofaTemplate(settings.twofa_fetch_template);
@@ -61,6 +64,9 @@ export function SettingsPage() {
       setTimeoutMin(String(settings.job_timeout_minutes));
       setFailThreshold(String(settings.proxy_fail_threshold));
       setStrictProxy(settings.strict_proxy !== false);
+      setLoginProvider(settings.login_provider_mode === 'protocol' ? 'protocol' : 'redeem401');
+      setRedeemBaseUrl(settings.redeem401_base_url || 'https://redeem.lazmeow.com');
+      setRedeemTimeout(String(settings.redeem401_timeout_minutes ?? 15));
     }
   }, [settings]);
 
@@ -72,6 +78,9 @@ export function SettingsPage() {
         job_timeout_minutes: Number(timeoutMin),
         proxy_fail_threshold: Number(failThreshold),
         strict_proxy: strictProxy,
+        login_provider_mode: loginProvider,
+        redeem401_base_url: redeemBaseUrl,
+        redeem401_timeout_minutes: Number(redeemTimeout),
       }),
     onSuccess: () => {
       toast.success('设置已保存');
@@ -189,6 +198,41 @@ export function SettingsPage() {
               登录遇到两步验证时，按此地址获取 6 位验证码；{`{code}`} 会替换为账号的 2FA 取件码（也支持以 xxx 结尾），留空恢复默认
             </p>
           </div>
+          <div className="space-y-1.5">
+            <Label>登录方式</Label>
+            <Select value={loginProvider} onValueChange={(value) => setLoginProvider(value === 'protocol' ? 'protocol' : 'redeem401')}>
+              <SelectTrigger className="w-full md:w-[280px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectItem value="redeem401">redeem401 远程登录（401 处理服务）</SelectItem>
+                  <SelectItem value="protocol">本地协议登录（网页登录 + Codex OAuth）</SelectItem>
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-muted-foreground">
+              redeem401：把登录交给远程 401 处理服务（提交邮箱 → 服务端网页登录并自动收验证码 →
+              导出授权文件），不占用本机代理；本地协议登录：在本机完成完整登录流程，需要可用代理。刷新 /
+              2FA 设置任务始终走本地协议登录
+            </p>
+          </div>
+          {loginProvider === 'redeem401' && (
+            <div className="grid grid-cols-2 gap-4">
+              <div className="space-y-1.5">
+                <Label>redeem 服务地址</Label>
+                <Input
+                  value={redeemBaseUrl}
+                  onChange={(e) => setRedeemBaseUrl(e.target.value)}
+                  placeholder="https://redeem.lazmeow.com"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label>远程登录超时（分钟）</Label>
+                <Input value={redeemTimeout} onChange={(e) => setRedeemTimeout(e.target.value)} />
+              </div>
+            </div>
+          )}
           <div className="grid grid-cols-3 gap-4">
             <div className="space-y-1.5">
               <Label>最大并发任务数</Label>

@@ -173,6 +173,8 @@ test('引擎集成：2FA 取件码账号 → mfa_otp 自动取码作答 + launch
   settings.ensureDefaults();
   // 集成测试沿用无代理直连跑 mock 流程，不受 strict_proxy 拦截影响
   settings.set('engine.config', { ...settings.get('engine.config'), strict_proxy: false });
+  // mock 流程为本地协议登录；redeem401 路径由 redeem401-engine.test.js 覆盖
+  settings.set('login.provider', { ...settings.get('login.provider'), mode: 'protocol' });
   const serverRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..');
 
   // 本地 mock 2fa.show：/{code} 返回纯文本 6 位码

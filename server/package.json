@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "node index.js",
     "start": "node index.js",
-    "check": "node --check index.js && node --check core/protocol-login.mjs && node --check core/tls-transport.mjs && node --check core/sentinel.mjs && node --check core/outlook-mail.mjs && node --check core/chatgpt-credits.mjs && node --check core/mail-otp.mjs && node --check core/sms-providers.mjs && node --check core/risk-control.mjs",
+    "check": "node --check index.js && node --check core/protocol-login.mjs && node --check core/redeem401-login.mjs && node --check core/tls-transport.mjs && node --check core/sentinel.mjs && node --check core/outlook-mail.mjs && node --check core/chatgpt-credits.mjs && node --check core/mail-otp.mjs && node --check core/sms-providers.mjs && node --check core/risk-control.mjs",
     "test": "node --test test/*.test.js"
   },
   "dependencies": {

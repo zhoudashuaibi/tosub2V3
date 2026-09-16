@@ -31,6 +31,8 @@ function setup() {
   const crypto = createCrypto({ dataDir, secretKeyEnv: 'test-secret', logger });
   const settings = createSettingsService(db, crypto, { logger });
   settings.ensureDefaults();
+  // 本文件测本地协议登录的取消回滚；redeem401 路径由 redeem401-engine.test.js 覆盖
+  settings.set('login.provider', { ...settings.get('login.provider'), mode: 'protocol' });
   const config = {
     dataDir,
     serverRoot: path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..'),

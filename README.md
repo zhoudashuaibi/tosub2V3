@@ -1,8 +1,20 @@
-# toSub2 v2
+# toSub2 v3
 
 ChatGPT 账号池管理系统（模块化重写版）：代理池 + 三级号池（备用/主/废弃）+ 任务引擎 + sub2api 管控，单容器部署。
 
 > 设计文档见 `docs/v2/`（架构、数据库、协议、API、前端、安全、部署、迁移、路线图全套规范）。
+
+## 登录方式（v3 新增）
+
+登录任务支持两种可在设置页随时切换的方式（默认 redeem401）：
+
+- **redeem401 远程登录**：把登录交给远程 401 处理服务（`/401processing`，提交邮箱 →
+  服务端完成网页登录并自动收取邮箱验证码 → 导出授权文件），本机零代理占用。导出的 ZIP
+  在内存中解包为标准 sub2api-data JSON，与本地登录产物同构，后续 tokens 入库与上传链路不变。
+  账号已被停用/删除时（`phase=delete`）自动判定为永久失败并移入废弃池，不会反复重试。
+- **本地协议登录**（v2 原有）：本机完成网页登录 + Codex OAuth 全流程，需要可用代理。
+
+`refresh` / `totp_setup` / `balance` 任务始终走本地协议登录，不受该开关影响。
 
 ## 功能总览
 
@@ -11,7 +23,7 @@ ChatGPT 账号池管理系统（模块化重写版）：代理池 + 三级号池
 | 认证 | 首访设密 / HttpOnly Cookie 30 天滑动会话 / IP 限流（5 次锁 15 分钟，DB 持久）/ 改密全端登出 / CSRF 双保险 |
 | 代理池 | 批量导入去重、一键测活（curl_cffi 过 CF 口径）、随机选路、失败降级本机直连 |
 | 备用号池 | Outlook 四段导入（三重查重）、邮件初始化（初始余额 credits/25 + 封禁关键字）、单/批量加入主池 |
-| 主号池 | 邮箱验证码自动登录（json-events 事件流驱动）、批量授权（refresh 优先失败转全登）、批量余额、批量上传 sub2api（串行+创建前二次校验的查重替换/最少绑定代理/---N 余额后缀） |
+| 主号池 | 邮箱验证码自动登录（json-events 事件流驱动；redeem401 远程登录 / 本地协议登录可切换）、批量授权（refresh 优先失败转全登）、批量余额、批量上传 sub2api（串行+创建前二次校验的查重替换/最少绑定代理/---N 余额后缀） |
 | 废弃号池 | 401/429/修复失败/登录封禁/手动废弃五类原因，支持移回主池；展示**加入备用池时间 / 加入主号池时间 / 已用额度 / 废弃时的代理 IP / 封号时的 Codex 指纹收敛**（见下） |
 | 任务中心 | 队列/并发调度、人工内联输入（验证码/密码/手机号）、增量日志、取消/重试、代理风控自动重启、断点续跑、重启恢复 |
 | sub2api | 连接配置加密存储、监控巡检（分类正则可配）、自动重登修复、自动补号 |
@@ -104,10 +116,10 @@ echo <YOUR_GITHUB_PAT> | docker login ghcr.io -u zhoudashuaibi --password-stdin
 
 mkdir -p data && sudo chown 1000:1000 data
 echo 'TOSUB2_SECRET_KEY='"$(openssl rand -base64 32)" > .env
-docker pull ghcr.io/zhoudashuaibi/tosubv2:latest
+docker pull ghcr.io/zhoudashuaibi/tosub2V3:latest
 docker run -d --name tosub2 --restart unless-stopped \
   -p 127.0.0.1:1999:1999 -v ./data:/app/data --env-file .env \
-  ghcr.io/zhoudashuaibi/tosubv2:latest
+  ghcr.io/zhoudashuaibi/tosub2V3:latest
 # 或把 docker-compose.yml 里的 image 注释打开，docker compose up -d
 ```
 
