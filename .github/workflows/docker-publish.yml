@@ -24,8 +24,15 @@ jobs:
           node-version: 22
           cache: npm
 
+      # redeem401 登录测试需要 python + curl_cffi（Chrome TLS 指纹 HTTP 层）
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Install dependencies
-        run: npm ci
+        run: |
+          python -m pip install --quiet curl_cffi==0.15.0
+          npm ci
 
       - name: Syntax check
         run: npm run check

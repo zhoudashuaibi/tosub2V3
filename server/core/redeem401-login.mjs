@@ -18,6 +18,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import zlib from "node:zlib";
+import { spawn, spawnSync } from "node:child_process";
 
 const DEFAULT_BASE = "https://redeem.lazmeow.com";
 const DEFAULT_TIMEOUT_MINUTES = 15;
@@ -83,7 +84,7 @@ function enableJsonEvents() {
   // 子进程在流程结束后永不退出（Windows 实测），任务就会卡到超时
   process.stdin.setEncoding("utf8");
   process.stdin.resume();
-  process.stdin.unref();
+  process.stdin.unref?.();
   process.stdin.on("data", (chunk) => {
     for (const line of String(chunk).split(/\r?\n/)) {
       if (!line.trim()) continue;
@@ -197,7 +198,137 @@ function readZipEntries(buffer) {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP
+// HTTP：必须经 curl_cffi（Chrome TLS 指纹）+ 常驻 Session 访问
+//
+// 2026-09-16 实测，redeem 服务有两个绕不开的访问约束：
+// 1. TLS 指纹分流：Node fetch / curl 的握手特征被路由到「照单全收但从不
+//    执行」的后端（run 返回 200 且确认入队，任务随后静默消失）；
+//    curl_cffi impersonate=chrome 的指纹进真实后端正常处理。
+// 2. 连接粘滞：负载均衡按 TCP 连接固定后端，任务队列在各后端进程内存里。
+//    逐请求新建连接会让 run 与 status 落到不同后端（同样表现为任务凭空
+//    消失）。因此这里保持一个常驻 python worker + curl_cffi Session，
+//    整个登录周期复用同一条连接（与 tls-transport 同一套环境约定）。
+// ---------------------------------------------------------------------------
+const HTTP_WORKER_SCRIPT = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "redeem401-http.py");
+
+let cachedPython = undefined; // undefined=未探测，null=不可用，{command,args}=可用
+
+function findPythonCommand() {
+  if (cachedPython !== undefined) return cachedPython;
+  const configured = String(process.env.TOSUB2_PYTHON || "").trim();
+  const candidates = configured
+    ? [{ command: configured, args: [] }]
+    : process.platform === "win32"
+      ? [{ command: "python", args: [] }, { command: "py", args: ["-3"] }]
+      : [{ command: "python3", args: [] }, { command: "python", args: [] }];
+  for (const candidate of candidates) {
+    try {
+      const check = spawnSync(candidate.command, [...candidate.args, "-c", "import curl_cffi"], {
+        stdio: "ignore",
+        timeout: 15_000,
+        windowsHide: true,
+      });
+      if (check.status === 0) {
+        cachedPython = candidate;
+        return cachedPython;
+      }
+    } catch {}
+  }
+  cachedPython = null;
+  return cachedPython;
+}
+
+/** 常驻 curl_cffi worker：行协议 {id,method,url,body,timeoutMs} → {id,ok,...}。 */
+function createHttpWorker({ verbose, log }) {
+  const python = findPythonCommand();
+  if (!python) {
+    throw new Error(
+      "未找到可用的 Python curl_cffi 环境（redeem 服务要求浏览器 TLS 指纹）。请先运行 python -m pip install -r requirements.txt；也可以设置 TOSUB2_PYTHON 指定 Python 路径",
+    );
+  }
+  const child = spawn(python.command, [...python.args, HTTP_WORKER_SCRIPT], {
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  const pending = new Map(); // id -> {resolve, reject, timer}
+  let nextId = 1;
+  let stdoutBuffer = "";
+  let closed = false;
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    stdoutBuffer += chunk;
+    let newline;
+    while ((newline = stdoutBuffer.indexOf("\n")) >= 0) {
+      const line = stdoutBuffer.slice(0, newline).trim();
+      stdoutBuffer = stdoutBuffer.slice(newline + 1);
+      if (!line) continue;
+      let message;
+      try {
+        message = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const waiter = pending.get(message.id);
+      if (!waiter) continue;
+      pending.delete(message.id);
+      clearTimeout(waiter.timer);
+      if (message.ok) waiter.resolve({ status: Number(message.status), text: String(message.body ?? "") });
+      else waiter.reject(new Error(String(message.error || "worker 请求失败")));
+    }
+  });
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => {
+    if (verbose) log(`[http-worker] ${chunk.trimEnd()}`);
+  });
+  const failAll = (error) => {
+    closed = true;
+    for (const [, waiter] of pending) {
+      clearTimeout(waiter.timer);
+      waiter.reject(error);
+    }
+    pending.clear();
+  };
+  child.on("error", (error) => failAll(new Error(`curl_cffi worker 启动失败：${error.message}`)));
+  child.on("close", (code) => failAll(new Error(`curl_cffi worker 退出（code=${code}）`)));
+
+  return {
+    request({ method, url, body, timeoutMs }) {
+      if (closed) return Promise.reject(new Error("curl_cffi worker 已关闭"));
+      const id = nextId++;
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pending.delete(id);
+          reject(new Error(`请求超时（${Math.round(timeoutMs / 1000)}s）`));
+        }, timeoutMs + 10_000);
+        pending.set(id, { resolve, reject, timer });
+        child.stdin.write(`${JSON.stringify({ id, method, url, body, timeoutMs })}\n`, (error) => {
+          if (error) {
+            pending.delete(id);
+            clearTimeout(timer);
+            reject(new Error(`curl_cffi worker 写入失败：${error.message}`));
+          }
+        });
+      });
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      try {
+        child.stdin.end();
+      } catch {}
+      const killer = setTimeout(() => {
+        try {
+          child.kill();
+        } catch {}
+      }, 3_000);
+      killer.unref?.();
+      child.once("close", () => clearTimeout(killer));
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// API 客户端
 // ---------------------------------------------------------------------------
 class Redeem401Error extends Error {
   constructor(message, code = "REDEEM401_UNAVAILABLE") {
@@ -212,35 +343,26 @@ function createClient({ baseUrl, verbose }) {
     throw new Redeem401Error(`redeem 服务地址不合法：${base}`, "REDEEM401_UNAVAILABLE");
   }
   const apiRoot = `${base}/401processing/api`;
+  const worker = createHttpWorker({ verbose, log });
 
   async function request(pathname, { method = "GET", body = null } = {}) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     try {
-      const response = await fetch(`${apiRoot}${pathname}`, {
+      const { status, text } = await worker.request({
         method,
-        signal: controller.signal,
-        redirect: "manual",
-        // connection: close 关闭 undici 连接池 keep-alive：轮询结束后无残留 socket 挂住事件循环，
-        // 子进程可在发完 exit 事件后自然退出
-        headers: {
-          accept: "application/json",
-          connection: "close",
-          ...(body ? { "content-type": "application/json" } : {}),
-        },
-        ...(body ? { body: JSON.stringify(body) } : {}),
+        url: `${apiRoot}${pathname}`,
+        body,
+        timeoutMs: REQUEST_TIMEOUT_MS,
       });
-      if (verbose) log(`HTTP ${method} ${pathname} -> ${response.status}`);
-      const text = await response.text();
+      if (verbose) log(`HTTP ${method} ${pathname} -> ${status}`);
       let payload = null;
       try {
         payload = text ? JSON.parse(text) : null;
       } catch {
         payload = null;
       }
-      if (!response.ok) {
+      if (status < 200 || status >= 300) {
         const detail = String(payload?.error || payload?.message || text || "").trim().slice(0, 300);
-        throw new Redeem401Error(`redeem 服务 ${pathname} 返回 HTTP ${response.status}${detail ? `：${detail}` : ""}`);
+        throw new Redeem401Error(`redeem 服务 ${pathname} 返回 HTTP ${status}${detail ? `：${detail}` : ""}`);
       }
       if (payload && typeof payload === "object" && payload.ok === false) {
         const detail = String(payload?.error || payload?.message || "未知错误").trim().slice(0, 300);
@@ -249,12 +371,7 @@ function createClient({ baseUrl, verbose }) {
       return payload;
     } catch (error) {
       if (error instanceof Redeem401Error) throw error;
-      if (error?.name === "AbortError") {
-        throw new Redeem401Error(`redeem 服务 ${pathname} 请求超时（${REQUEST_TIMEOUT_MS / 1000}s）`);
-      }
       throw new Redeem401Error(`无法连接 redeem 服务：${String(error?.message || error)}`);
-    } finally {
-      clearTimeout(timer);
     }
   }
 
@@ -268,6 +385,7 @@ function createClient({ baseUrl, verbose }) {
       method: "POST",
       body: { format: "sub2", emails: [email] },
     }),
+    close: () => worker.close(),
   };
 }
 
@@ -327,7 +445,7 @@ async function run() {
   const sub2apiOutPath = path.resolve(args.sub2apiOut);
   const deadline = Date.now() + timeoutMinutes * 60_000;
   const client = createClient({ baseUrl, verbose: args.verbose });
-
+  try {
   emitEvent("starting", { mode: "redeem401", email });
   log(`remote login via ${baseUrl}/401processing (timeout ${timeoutMinutes}m)`);
 
@@ -432,6 +550,9 @@ async function run() {
       chatgpt_account_id: target.credentials.chatgpt_account_id || "",
     },
   });
+  } finally {
+    client.close();
+  }
 }
 
 async function pollUntilTerminal(client, email, { deadline, startedAt, pollIntervalMs, isEnqueueConfirmed = () => false, onProgress, onMissing }) {
@@ -478,18 +599,18 @@ async function pollUntilTerminal(client, email, { deadline, startedAt, pollInter
       if (exportable.includes(email.toLowerCase())) return { ok: true, state };
       const queueEmpty = !state?.totals || Number(state.totals.queue) === 0;
       if (sawTrack || queueEmpty) {
-        // 从未见过本账号且队列已空：服务闪断重启会清空内存队列（实测 run 确认入队后
-        // 1 秒内队列即被清空、tracks 无痕），也可能是 run 提交被拒（忙碌窗口）——补提交重试
-        if (!sawTrack && queueEmpty && onMissing && (await onMissing())) {
+        // 队列已空且无成功痕迹：要么提交被清（服务重启/被替换），要么中途轮询连接
+        // 被负载均衡切到了别的后端（见过 track 后也凭空消失）——都先走补提交
+        if (queueEmpty && onMissing && (await onMissing())) {
           await sleep(pollIntervalMs);
           continue;
         }
-        // 曾确认入队却始终无处理痕迹：闪断窗口内多次补提交仍被清空
-        if (!sawTrack && queueEmpty && isEnqueueConfirmed()) {
+        // 补提交预算耗尽仍无成功痕迹：入队曾被确认 → 归因服务端丢弃/连接漂移
+        if (queueEmpty && isEnqueueConfirmed()) {
           return {
             ok: false,
             state,
-            detail: "服务接受了请求但队列随即被清空（服务闪断/重启丢弃任务，且无失败记录），多次补提交仍未处理",
+            detail: "服务接受了请求但任务未被执行（队列被清空或轮询连接漂移到无状态后端），补提交预算耗尽",
           };
         }
         return {

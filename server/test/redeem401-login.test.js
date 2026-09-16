@@ -386,8 +386,8 @@ test('服务持续闪断：补提交耗尽 → 错误明确指出队列被清空
     assert.equal(mock.calls.run.length, 7, '初始 + 6 次补提交后放弃');
     const error = events.find((e) => e.type === 'error');
     assert.equal(error.code, 'REDEEM401_FAILED');
-    assert.match(error.message, /队列随即被清空/);
-    assert.match(error.message, /闪断/);
+    assert.match(error.message, /队列被清空/);
+    assert.match(error.message, /补提交预算耗尽/);
   } finally {
     mock.server.close();
     cleanupDir(dataDir);
