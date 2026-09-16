@@ -3,18 +3,15 @@
  * secret key 的值整体加密（encrypted=1），读取时解密。
  */
 
-const SECRET_KEYS = new Set(['console.password', 'sub2api.config', 'sms.providers']);
+const SECRET_KEYS = new Set(['console.password', 'sub2api.config']);
 
 export const DEFAULT_SETTINGS = {
-  // 登录方式：protocol=本地协议登录（网页登录+Codex OAuth）；redeem401=redeem 服务 /401processing
-  // 远程登录（run→轮询→export，产物同 sub2api JSON）。refresh / totp_setup 任务不受此开关影响。
-  'login.provider': {
-    mode: 'redeem401',
-    redeem401_base_url: 'https://redeem.lazmeow.com',
-    redeem401_timeout_minutes: 15,
+  // 登录唯一方式：redeem401 远程登录（/401processing 三端点，服务端完成登录与收码）。
+  // 本地协议登录已整体移除，这里只剩服务地址与超时配置。
+  'login.redeem401': {
+    base_url: 'https://redeem.lazmeow.com',
+    timeout_minutes: 15,
   },
-  // 2FA 在线取件（2fa.show 风格）：{code} 占位符替换为账号取件码
-  'twofa.fetch': { template: 'https://2fa.show/2fa/{code}' },
   'engine.config': {
     max_concurrent_jobs: 20,
     job_timeout_minutes: 30,
@@ -60,16 +57,10 @@ export const DEFAULT_SETTINGS = {
       replenish_upload_order: 'balance_asc',
       replenish_join_order: 'balance_desc',
       pause_on_discard: true,
-      // 401 只代表会话过期（走自动修复：refresh 失败转完整登录），不得作为封禁特征
+      // 401 只代表会话过期（走自动修复：redeem401 远程登录重新取授权），不得作为封禁特征
       banned_patterns: ['account_deactivated', 'deactivated', 'suspended', 'banned', 'permanently deleted'],
       rate_limit_patterns: ['429', 'rate limit', 'too many requests'],
     },
-  },
-  'sms.providers': {
-    active: 'custom',
-    luban: {},
-    smsbower: {},
-    custom: { entries: '' },
   },
   // Team 号池：兑换服务地址 + 独立的上传默认配置（不与 sub2api.config 的共用）
   'team.config': {

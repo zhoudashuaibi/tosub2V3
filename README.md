@@ -4,29 +4,29 @@ ChatGPT 账号池管理系统（模块化重写版）：代理池 + 三级号池
 
 > 设计文档见 `docs/v2/`（架构、数据库、协议、API、前端、安全、部署、迁移、路线图全套规范）。
 
-## 登录方式（v3 新增）
+## 登录方式（v3）
 
-登录任务支持两种可在设置页随时切换的方式（默认 redeem401）：
+登录**只**通过 redeem401 远程登录完成，本机不执行任何登录逻辑（v2 的本地协议登录栈——
+网页登录/Codex OAuth/Sentinel/Cloudflare 求解/接码平台/2FA 取件——已整体移除）：
 
-- **redeem401 远程登录**：把登录交给远程 401 处理服务（`/401processing`，提交邮箱 →
-  服务端完成网页登录并自动收取邮箱验证码 → 导出授权文件），本机零代理占用。导出的 ZIP
-  在内存中解包为标准 sub2api-data JSON，与本地登录产物同构，后续 tokens 入库与上传链路不变。
-  账号已被停用/删除时（`phase=delete`）自动判定为永久失败并移入废弃池，不会反复重试。
-- **本地协议登录**（v2 原有）：本机完成网页登录 + Codex OAuth 全流程，需要可用代理。
-
-`refresh` / `totp_setup` / `balance` 任务始终走本地协议登录，不受该开关影响。
+- 提交邮箱 → 远程 401 处理服务（`/401processing`）完成网页登录并自动收取邮箱验证码 →
+  导出授权文件；导出的 ZIP 在内存中解包为标准 sub2api-data JSON，tokens 入库与上传链路照旧。
+- **导入即持有登录态**：sub2api / redeem 导出 JSON 里的 OAuth tokens 随账号直入主号池；
+  无凭据的纯邮箱账号可导入备用池，加入主号池时由远程登录重新授权。
+- 账号已被停用/删除时（`phase=delete`）自动判定为永久失败并移入废弃池，不会反复重试。
+- 服务地址与超时在设置页配置；余额查询 / 代理测活仍走本机（TLS 指纹），不受影响。
 
 ## 功能总览
 
 | 模块 | 能力 |
 |---|---|
 | 认证 | 首访设密 / HttpOnly Cookie 30 天滑动会话 / IP 限流（5 次锁 15 分钟，DB 持久）/ 改密全端登出 / CSRF 双保险 |
-| 代理池 | 批量导入去重、一键测活（curl_cffi 过 CF 口径）、随机选路、失败降级本机直连 |
-| 备用号池 | Outlook 四段导入（三重查重）、邮件初始化（初始余额 credits/25 + 封禁关键字）、单/批量加入主池 |
-| 主号池 | 邮箱验证码自动登录（json-events 事件流驱动；redeem401 远程登录 / 本地协议登录可切换）、批量授权（refresh 优先失败转全登）、批量余额、批量上传 sub2api（串行+创建前二次校验的查重替换/最少绑定代理/---N 余额后缀） |
+| 代理池 | 批量导入去重、一键测活（curl_cffi 过 CF 口径）、随机选路、失败降级本机直连（服务余额查询） |
+| 备用号池 | Outlook 四段导入（三重查重）/ sub2api·redeem 导出导入（带 tokens 直入主池，纯邮箱进备用池）、邮件初始化（初始余额 credits/25 + 封禁关键字）、单/批量加入主池（远程登录授权） |
+| 主号池 | redeem401 远程登录授权（json-events 事件流驱动）、批量授权、批量余额、批量上传 sub2api（串行+创建前二次校验的查重替换/最少绑定代理/---N 余额后缀） |
 | 废弃号池 | 401/429/修复失败/登录封禁/手动废弃五类原因，支持移回主池；展示**加入备用池时间 / 加入主号池时间 / 已用额度 / 废弃时的代理 IP / 封号时的 Codex 指纹收敛**（见下） |
-| 任务中心 | 队列/并发调度、人工内联输入（验证码/密码/手机号）、增量日志、取消/重试、代理风控自动重启、断点续跑、重启恢复 |
-| sub2api | 连接配置加密存储、监控巡检（分类正则可配）、自动重登修复、自动补号 |
+| 任务中心 | 队列/并发调度、增量日志、取消/重试、重启恢复 |
+| sub2api | 连接配置加密存储、监控巡检（分类正则可配）、自动重登修复（远程登录）、自动补号 |
 | 安全 | 凭据/token/代理 URL AES-256-GCM 入库、日志脱敏、敏感字段只写不读 |
 
 ## 废弃号池的「已用额度」
@@ -89,9 +89,9 @@ ChatGPT 账号池管理系统（模块化重写版）：代理池 + 三级号池
 
 邮箱验证码、备用号池余额初始化和封禁邮件检查均直接访问微软官方接口：先通过 `login.microsoftonline.com/consumers/oauth2/v2.0/token` 换取访问令牌，再从 `outlook.office.com/api/v2.0/me/messages` 读取邮件。
 
-沿用已导入的 Outlook `client_id` 和 `refresh_token`，邮箱密码不参与取件请求。授权范围与参考取件项目一致，为 Outlook `IMAP.AccessAsUser.All`、`Mail.ReadWrite` 和 `offline_access`。登录收码读取最近 5 封，余额和封禁检查默认读取最近 10 封。
+沿用已导入的 Outlook `client_id` 和 `refresh_token`，邮箱密码不参与取件请求。授权范围与参考取件项目一致，为 Outlook `IMAP.AccessAsUser.All`、`Mail.ReadWrite` 和 `offline_access`。余额和封禁检查默认读取最近 10 封（登录收码已随本地登录移除，由 redeem401 服务端完成）。
 
-设置页取件方式固定为“微软官方直连”。旧 `outlook.fetch` 中转地址不再生效，提交 `outlook_fetch_endpoint` 会返回 422；已有账号无须重新导入。授权失效或微软接口失败会明确报错，不回退第三方取件。2FA 取码模板属于独立功能，保持原有行为。
+设置页取件方式固定为“微软官方直连”。旧 `outlook.fetch` 中转地址不再生效，提交 `outlook_fetch_endpoint` 会返回 422；已有账号无须重新导入。授权失效或微软接口失败会明确报错，不回退第三方取件。
 
 ## 快速开始
 
@@ -178,7 +178,7 @@ npm run check     # 语法检查
 ```
 tosubV2/
 ├── server/               # Fastify 后端
-│   ├── core/             # v1 协议复用（登录/Sentinel/TLS 指纹/取件/接码，含 --json-events 改造）
+│   ├── core/             # redeem401 远程登录 / TLS 指纹（余额·代理测活）/ Outlook 取件
 │   ├── lib/              # db/crypto/config/settings/sanitize/totp
 │   ├── migrations/       # SQLite 迁移（PRAGMA user_version）
 │   └── modules/          # auth proxies accounts jobs sub2api settings dashboard static

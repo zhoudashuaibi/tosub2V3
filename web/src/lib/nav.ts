@@ -12,7 +12,6 @@ export interface NavRoute {
   /** 精确匹配（仅概览页需要，否则 / 会匹配所有路由） */
   exact?: boolean;
   /** 侧边栏角标：awaiting = 显示待输入任务数 */
-  badge?: 'awaiting';
   /** 是否出现在手机端底部「更多」菜单 */
   mobile?: boolean;
 }
@@ -23,7 +22,7 @@ export const NAV_ROUTES: readonly NavRoute[] = [
   { to: '/pools/main', label: '主号池', section: '账号号池', mobile: true },
   { to: '/pools/discard', label: '废弃号池', section: '账号号池', mobile: true },
   { to: '/pools/team', label: 'Team号池', section: 'TEAM号池', mobile: true },
-  { to: '/jobs', label: '任务中心', section: '系统管理', badge: 'awaiting', mobile: true },
+  { to: '/jobs', label: '任务中心', section: '系统管理', mobile: true },
   { to: '/proxies', label: '代理列表', section: '系统管理', mobile: true },
   { to: '/sub2api', label: 'Sub2API', section: '系统管理', mobile: true },
   { to: '/settings', label: '设置', section: '系统管理', mobile: true },

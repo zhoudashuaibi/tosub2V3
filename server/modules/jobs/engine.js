@@ -3,22 +3,19 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { applyEvent, isPermanentAccountFailure, isUserQuit } from './events.js';
 import { createLauncher } from './launcher.js';
-import { createAutoInput, readSub2apiExport } from './auto-input.js';
 import { fetchChatgptCredits } from '../../core/chatgpt-credits.mjs';
 import { fetchWithTls } from '../../lib/openai-fetch.js';
 import { sanitizeText } from '../../lib/sanitize.js';
 import { errors } from '../../lib/http-errors.js';
 
 const ACTIVE_STATUSES = ['queued', 'running', 'awaiting_input'];
-const MAX_PROXY_SESSIONS = 10;
-const MAX_CONNECTION_FAILURES = 20;
 const BALANCE_CONCURRENCY = 5;
 const BALANCE_PROXY_ATTEMPTS = 3;
+const DEFAULT_REDEEM401_BASE_URL = 'https://redeem.lazmeow.com';
 
 export function createJobsEngine({ config, db, logger }) {
   const launcher = createLauncher({ config, logger });
-  const autoInput = createAutoInput({ config: { settingsGet: (k) => config.settingsGet?.(k) }, logger });
-  const running = new Map(); // jobId -> runtime { childHandle, account, proxyUrl, restarting, stageStartedAt, deferredTimers }
+  const running = new Map(); // jobId -> runtime { childHandle, account, restarting, closed }
   let tickTimer = null;
   let stopped = false;
   let balanceActive = 0;
@@ -288,12 +285,11 @@ export function createJobsEngine({ config, db, logger }) {
   }
 
   // ------------------------------------------------------------------
-  // 启动子进程任务
+  // 启动子进程任务（login 一律 redeem401 远程登录：服务端完成登录与收码，
+  // 本机不执行任何登录逻辑，也不占本机出口代理）
   // ------------------------------------------------------------------
-  function redeemLoginEnabled(job) {
-    if (job.type !== 'login') return false;
-    const provider = config.settingsGet?.('login.provider') || {};
-    return provider.mode !== 'protocol'; // 默认 redeem401（缺省视为开启）
+  function redeem401Config() {
+    return config.settingsGet?.('login.redeem401') || {};
   }
 
   function launchJob(job, { preserveAttempt = false } = {}) {
@@ -301,44 +297,26 @@ export function createJobsEngine({ config, db, logger }) {
     const credentials = config.cryptoTryDecryptJson(account?.credentials_enc, 'accounts.credentials_enc') || {};
     const accountView = { ...account, credentials };
 
-    // redeem401 远程登录由服务端完成登录与收码，本机不需要出口代理，
-    // 也不受 strict_proxy（禁止直连）约束——这里根本没有到上游的直连请求
-    const redeemLogin = redeemLoginEnabled(job);
-    const provider = redeemLogin ? config.settingsGet?.('login.provider') || {} : null;
-    const proxy = redeemLogin ? { id: null, url: '' } : selectProxyForJob(job, credentials);
-    if (!redeemLogin && !proxy.url && strictProxyEnabled()) {
-      // 服务器 IP 一旦被上游拉黑，本机直连登录即封号：无可用代理时直接失败，绝不直连
-      const message = '无可用代理（已开启禁止直连），任务未启动';
-      appendJobLog(job, 'no alive proxy and strict_proxy on, refuse direct connection');
-      logger.warn({ jobId: job.id, accountId: job.account_id }, 'no alive proxy, strict_proxy on');
-      patchJob(job.id, { status: 'failed', error: message, finished_at: new Date().toISOString() });
-      hooks.onLoginFinished?.(stmt.getJob.get(job.id), accountView, { ok: false, code: 'NO_ALIVE_PROXY', message });
-      return stmt.getJob.get(job.id);
-    }
+    const redeem = redeem401Config();
     patchJob(job.id, {
       status: 'running',
-      proxy_id: redeemLogin ? null : proxy.id,
+      proxy_id: null,
       ...(preserveAttempt ? {} : {}),
     });
-    if (redeemLogin) {
-      appendJobLog(job, `redeem401 remote login (base=${provider.redeem401_base_url || 'https://redeem.lazmeow.com'})`);
-    }
+    appendJobLog(job, `redeem401 remote login (base=${redeem.base_url || DEFAULT_REDEEM401_BASE_URL})`);
 
     const runtime = {
       jobId: job.id,
       account: accountView,
-      proxyUrl: proxy.url,
       restarting: false,
       closed: false,
-      stageStartedAt: {},
-      connectionFailures: 0,
     };
     running.set(job.id, runtime);
 
     const fresh = stmt.getJob.get(job.id);
     const handle = launcher.launch(
       fresh,
-      { account: accountView, proxyUrl: proxy.url, attempt: fresh.attempt },
+      { account: accountView, proxyUrl: '', attempt: fresh.attempt },
       {
         onEvent: (event) => handleEvent(fresh, runtime, event),
         onExited: (code, signal, spawnError) => handleExit(fresh, runtime, code, signal, spawnError),
@@ -362,9 +340,6 @@ export function createJobsEngine({ config, db, logger }) {
     if (runtime.restarting) return;
 
     const transition = applyEvent(fresh, event);
-    if (event.type === 'stage') {
-      runtime.stageStartedAt[event.stage] = Date.now();
-    }
     if (transition.jobPatch && Object.keys(transition.jobPatch).length) {
       patchJob(fresh.id, transition.jobPatch);
     }
@@ -387,51 +362,15 @@ export function createJobsEngine({ config, db, logger }) {
 
   function dispatchAction(job, runtime, action) {
     switch (action.kind) {
-      case 'auto_input':
-        handleAutoInput(job, runtime, action.event);
-        break;
       case 'save_tokens':
         handleSaveTokens(job, runtime, action.event);
-        break;
-      case 'save_totp':
-        handleSaveTotp(job, runtime, action.event);
         break;
       case 'classify_error':
         handleClassifyError(job, runtime, action.event);
         break;
-      case 'note_risk_retry':
-        logger.info({ jobId: job.id, reason: action.event.reason }, 'child risk retry');
-        break;
       default:
         break;
     }
-  }
-
-  function handleAutoInput(job, runtime, promptEvent) {
-    const stageStartedAt =
-      promptEvent.kind === 'email_otp' ? runtime.stageStartedAt.email_otp || Date.now() : undefined;
-    autoInput
-      .attempt(job, runtime.account, promptEvent, { stageStartedAt })
-      .then((result) => {
-        if (runtime.closed || runtime.restarting) return;
-        if (result.submit) {
-          runtime.childHandle?.sendCommand(result.submit).catch(() => {});
-          return;
-        }
-        if (result.defer) {
-          const timer = setTimeout(() => {
-            const fresh = stmt.getJob.get(job.id);
-            if (!fresh || fresh.status !== 'awaiting_input' || runtime.closed || runtime.restarting) return;
-            handleAutoInput(fresh, runtime, promptEvent);
-          }, result.defer);
-          timer.unref?.();
-          return;
-        }
-        // 无自动源：保持 awaiting_input 等人工
-      })
-      .catch((error) => {
-        logger.warn({ jobId: job.id, err: String(error.message || error) }, 'auto input failed');
-      });
   }
 
   function handleSaveTokens(job, runtime, event) {
@@ -470,22 +409,6 @@ export function createJobsEngine({ config, db, logger }) {
       patchJob(job.id, { error: `产物解析失败：${sanitizeText(error.message).slice(0, 300)}` });
     }
   }
-  function handleSaveTotp(job, runtime, event) {
-    if (!job.account_id) return;
-    const account = stmt.getAccount.get(job.account_id);
-    if (!account) return;
-    const credentials = config.cryptoTryDecryptJson(account.credentials_enc, 'accounts.credentials_enc') || {};
-    if (event.secret) {
-      credentials.totp_secret = event.secret;
-      db.prepare('UPDATE accounts SET credentials_enc = ?, updated_at = ? WHERE id = ?').run(
-        config.cryptoEncryptJson(credentials, 'accounts.credentials_enc'),
-        new Date().toISOString(),
-        job.account_id,
-      );
-      recordAccountEvent(job.account_id, 'totp_setup', { source: 'job' });
-    }
-  }
-
   function handleClassifyError(job, runtime, event) {
     const code = event.code || 'INTERNAL';
     const message = String(event.message || '');
@@ -506,28 +429,6 @@ export function createJobsEngine({ config, db, logger }) {
       return;
     }
 
-    // REFRESH_TOKEN_INVALID → 自动转完整登录
-    if (code === 'REFRESH_TOKEN_INVALID' && job.type === 'refresh') {
-      const followUp = submitJob({
-        accountId: job.account_id,
-        type: 'login',
-        resumeJobId: job.id,
-        note: 'refresh 失败自动转完整登录',
-      });
-      if (followUp && job.account_id) {
-        casAccountStatus(job.account_id, 'authorizing');
-      }
-      finishRuntime(job.id);
-      hooks.onLoginFinished?.(stmt.getJob.get(job.id), runtime.account, { ok: false, code, message, followUpJobId: followUp?.id });
-      return;
-    }
-
-    // 代理风控/连接类错误 → 杀进程换会话/换代理重启
-    if (event.retry_proxy && code !== 'REFRESH_TOKEN_INVALID') {
-      scheduleProxyRestart(job, runtime, code);
-      return;
-    }
-
     finishRuntime(job.id);
     hooks.onLoginFinished?.(stmt.getJob.get(job.id), runtime.account, {
       ok: false,
@@ -535,51 +436,6 @@ export function createJobsEngine({ config, db, logger }) {
       message,
       canceled: isUserQuit(message),
     });
-  }
-
-  function scheduleProxyRestart(job, runtime, code) {
-    const fresh = stmt.getJob.get(job.id);
-    if (!fresh || !['failed', 'canceled'].includes(fresh.status) || runtime.restarting) return;
-    if ((fresh.proxy_attempts || 0) >= MAX_PROXY_SESSIONS) {
-      logger.warn({ jobId: job.id }, 'proxy session budget exhausted');
-      finishRuntime(job.id);
-      hooks.onLoginFinished?.(fresh, runtime.account, { ok: false, code, message: '代理会话预算已耗尽' });
-      return;
-    }
-    if (code === 'PROXY_CONNECTION_RETRY') {
-      runtime.connectionFailures += 1;
-      if (fresh.proxy_id) config.recordProxyFailure?.(fresh.proxy_id);
-      if (runtime.connectionFailures >= MAX_CONNECTION_FAILURES) {
-        logger.warn({ jobId: job.id, failures: runtime.connectionFailures }, 'connection failures exceeded');
-        finishRuntime(job.id);
-        hooks.onLoginFinished?.(fresh, runtime.account, { ok: false, code, message: '代理连接连续失败过多' });
-        return;
-      }
-    }
-
-    runtime.restarting = true;
-    const backoff = Math.min(15_000, 1000 * 2 ** Math.min(4, runtime.connectionFailures));
-    const attempt = (fresh.attempt || 1) + 1;
-    patchJob(job.id, {
-      status: 'queued',
-      attempt,
-      error: `代理风控重启（${code}），第 ${attempt} 次尝试`,
-      prompt_kind: null,
-      stage: null,
-    });
-    const timer = setTimeout(async () => {
-      try {
-        await runtime.childHandle?.kill();
-      } catch {}
-      running.delete(job.id);
-      const requeued = stmt.getJob.get(job.id);
-      if (requeued && requeued.status === 'queued') {
-        const active = stmt.activeCount.get().n;
-        const maxJobs = Number(engineConfig().max_concurrent_jobs) || 20;
-        if (active < maxJobs) launchJob(requeued);
-      }
-    }, backoff);
-    timer.unref?.();
   }
 
   function handleExit(jobRow, runtime, code, signal, spawnError) {
@@ -603,7 +459,6 @@ export function createJobsEngine({ config, db, logger }) {
     const runtime = running.get(jobId);
     if (runtime) {
       runtime.closed = true;
-      autoInput.reset(jobId);
     }
     running.delete(jobId);
   }
@@ -611,32 +466,6 @@ export function createJobsEngine({ config, db, logger }) {
   // ------------------------------------------------------------------
   // 人工输入 / 取消 / 重试
   // ------------------------------------------------------------------
-  async function submitInput(jobId, action, value) {
-    const job = stmt.getJob.get(jobId);
-    if (!job) throw errors.notFound('任务不存在');
-    if (job.status !== 'awaiting_input') throw errors.jobNotAwaitingInput();
-    const runtime = running.get(jobId);
-    if (!runtime?.childHandle) throw errors.jobNotAwaitingInput();
-
-    if (action === 'input') {
-      if (value === undefined || value === null || String(value) === '') {
-        throw errors.validation('输入值不能为空');
-      }
-      await runtime.childHandle.sendCommand({ action: 'input', value: String(value) });
-      patchJob(jobId, { status: 'running', prompt_kind: null });
-      return { ok: true };
-    }
-    if (action === 'resend') {
-      await runtime.childHandle.sendCommand({ action: 'resend' });
-      return { ok: true };
-    }
-    if (action === 'quit') {
-      await runtime.childHandle.sendCommand({ action: 'quit' });
-      return { ok: true };
-    }
-    throw errors.validation('action 必须是 input / resend / quit');
-  }
-
   async function cancel(jobId, reason = '用户取消') {
     const job = stmt.getJob.get(jobId);
     if (!job) throw errors.notFound('任务不存在');
@@ -757,7 +586,6 @@ export function createJobsEngine({ config, db, logger }) {
     start,
     shutdown,
     submitJob,
-    submitInput,
     cancel,
     cancelAll,
     retry,
@@ -768,6 +596,13 @@ export function createJobsEngine({ config, db, logger }) {
       balanceProxyResolver = typeof resolver === 'function' ? resolver : null;
     },
   };
+}
+
+/** 读取子进程写出的 sub2api 导出产物（redeem401-login 的 --sub2api-out）。 */
+function readSub2apiExport(dataDir, relativePath) {
+  const resolved = path.resolve(dataDir, relativePath);
+  if (!resolved.startsWith(path.resolve(dataDir))) throw new Error('产物路径越界');
+  return JSON.parse(fs.readFileSync(resolved, 'utf8'));
 }
 
 function toSnake(key) {

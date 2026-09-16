@@ -1,22 +1,9 @@
-import { extractMailboxOtpCandidates } from "./mail-otp.mjs";
-
 export const OUTLOOK_TOKEN_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token";
 export const OUTLOOK_MESSAGES_URL = "https://outlook.office.com/api/v2.0/me/messages";
 // 与现有邮箱凭据授权保持一致；仅 IMAP scope 的令牌可能无法读取 REST 邮件。
 export const OUTLOOK_SCOPE = "https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/Mail.ReadWrite offline_access";
 
-// 与 ChatGPT/OpenAI 登录相关的发件域。只有这些域的邮件才会被提取验证码，
-// 避免把邮箱里其他服务的验证码误当作 ChatGPT 登录码提交。
-const OPENAI_SENDER_DOMAINS = [
-  "openai.com",
-  "tm.openai.com",
-  "email.openai.com",
-  "chatgpt.com",
-  "codex.chatgpt.com",
-];
-
 const DEFAULT_TIMEOUT_MS = 60_000;
-const MAX_MESSAGES = 5;
 const RESERVE_MAIL_MAX_MESSAGES = 10;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -157,73 +144,10 @@ export async function fetchOutlookMessages(params, options = {}) {
   }
 }
 
-/**
- * 提取登录验证码候选；baselineTime 之前的邮件和非 OpenAI 发件人保持过滤。
- * baselineTime=null 用于记录已有旧验证码，senderFilter=false 可关闭发件人过滤。
- */
-export async function fetchOutlookOtpCandidates(params, options = {}) {
-  const messages = await fetchOutlookMessages(params, { ...options, maxMessages: MAX_MESSAGES });
-  return extractCandidatesFromMessages(messages, {
-    baselineTime: options.baselineTime ?? null,
-    useSenderFilter: options.senderFilter !== false,
-  });
-}
-
-function isOpenAiSender(message) {
-  const from = message?.from || message?.sender || {};
-  const address = String(
-    (from.emailAddress && (from.emailAddress.address || from.emailAddress)) ||
-      from.address ||
-      from ||
-      "",
-  )
-    .trim()
-    .toLowerCase();
-  if (!address) return false;
-  return OPENAI_SENDER_DOMAINS.some(
-    (domain) => address === domain || address.endsWith(`@${domain}`) || address.endsWith(`.${domain}`),
-  );
-}
-
-function getMessageTime(message) {
-  const raw = message?.receivedDateTime || message?.sentDateTime || message?.createdDateTime;
-  if (!raw) return null;
-  const ms = Date.parse(String(raw).replace(/^(\d{4}-\d{2}-\d{2})\s/, "$1T"));
-  return Number.isFinite(ms) ? ms : null;
-}
-
-function extractCandidatesFromMessages(messages, { baselineTime, useSenderFilter }) {
-  const candidates = [];
-  messages.forEach((message) => {
-    if (useSenderFilter && !isOpenAiSender(message)) return;
-    const receivedAt = getMessageTime(message);
-    // 时间门槛：基准时间之前的邮件一律视为旧邮件，不产生候选。
-    // baseline 阶段 baselineTime 为 null，不做时间过滤，全部记入 baseline key。
-    if (baselineTime !== null && receivedAt !== null && receivedAt < baselineTime) return;
-
-    const text = [
-      message?.subject,
-      message?.bodyPreview,
-      message?.body?.content,
-      message?.uniqueBody?.content,
-    ]
-      .map((value) => String(value ?? ""))
-      .join("\n");
-    const extracted = extractMailboxOtpCandidates(text);
-    extracted.forEach((candidate) => {
-      candidates.push({
-        ...candidate,
-        receivedAt: candidate.receivedAt || receivedAt,
-      });
-    });
-  });
-  return candidates;
-}
-
 // ---------------------------------------------------------------------------
 // 备用号池（reserve pool）专用：拉取邮件列表并提取余额 / 封禁信息。
-// 与收码场景不同，这里不做发件人过滤（封禁邮件、余额邮件都要看），
-// 并且扫描最近 RESERVE_MAIL_MAX_MESSAGES 封。
+// 不做发件人过滤（封禁邮件、余额邮件都要看），扫描最近 RESERVE_MAIL_MAX_MESSAGES 封。
+// （登录收码已改为 redeem401 远程登录，本文件不再承担验证码提取职责。）
 // ---------------------------------------------------------------------------
 
 /**

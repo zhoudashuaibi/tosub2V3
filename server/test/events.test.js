@@ -26,39 +26,6 @@ test('stage 事件更新 stage（合法枚举）', () => {
   assert.deepEqual(unknown, {});
 });
 
-test('input_required → awaiting_input + auto_input 动作', () => {
-  const t = applyEvent({ ...baseJob(), status: 'running' }, {
-    type: 'input_required',
-    kind: 'email_otp',
-    detail: '请输入验证码',
-    can_resend: true,
-  });
-  assert.equal(t.jobPatch.status, 'awaiting_input');
-  assert.equal(t.jobPatch.prompt_kind, 'email_otp');
-  assert.equal(t.actions[0].kind, 'auto_input');
-});
-
-test('input_accepted → running + 清空 prompt_kind', () => {
-  const t = applyEvent({ ...baseJob(), status: 'awaiting_input', prompt_kind: 'email_otp' }, {
-    type: 'input_accepted',
-    kind: 'email_otp',
-  });
-  assert.equal(t.jobPatch.status, 'running');
-  assert.equal(t.jobPatch.prompt_kind, null);
-});
-
-test('proxy_session_attempt 取最大会话数', () => {
-  let t = applyEvent({ ...baseJob(), proxy_attempts: 2 }, { type: 'proxy_session_attempt', n: 3, session_id: 'x' });
-  assert.equal(t.jobPatch.proxy_attempts, 3);
-  t = applyEvent({ ...baseJob(), proxy_attempts: 5 }, { type: 'proxy_session_attempt', n: 2, session_id: 'y' });
-  assert.equal(t.jobPatch.proxy_attempts, 5);
-});
-
-test('checkpoint_saved 记录路径', () => {
-  const t = applyEvent(baseJob(), { type: 'checkpoint_saved', stage: 'phone_otp', path: '/x/login.json' });
-  assert.equal(t.jobPatch.checkpoint_path, '/x/login.json');
-});
-
 test('result_saved → save_tokens 动作', () => {
   const t = applyEvent(baseJob(), {
     type: 'result_saved',

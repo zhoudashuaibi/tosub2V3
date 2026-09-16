@@ -46,7 +46,6 @@ export function createJobsModule({ engine }) {
         has_result: Boolean(row.result_path),
         can_cancel: active,
         can_retry: !active,
-        can_input: row.status === 'awaiting_input',
       };
     }
 
@@ -134,8 +133,6 @@ export function createJobsModule({ engine }) {
         fs.existsSync(path.resolve(app.config.dataDir, 'results', `${row.id}.json`));
       view.can_download = view.has_result && row.status === 'completed';
       if (view.can_download) view.result_path = row.result_path || `results/${row.id}.json`;
-      view.checkpoint_path = row.checkpoint_path;
-      view.totp_result_path = row.totp_result_path;
       return view;
     });
 
@@ -182,26 +179,6 @@ export function createJobsModule({ engine }) {
       reply.header('content-disposition', `attachment; filename="${row.id}.json"`);
       return reply.send(fs.createReadStream(found));
     });
-
-    app.post(
-      '/api/v1/jobs/:id/input',
-      {
-        schema: {
-          body: {
-            type: 'object',
-            required: ['action'],
-            additionalProperties: false,
-            properties: {
-              action: { type: 'string', enum: ['input', 'resend', 'quit'] },
-              value: { type: 'string', maxLength: 512 },
-            },
-          },
-        },
-      },
-      async (request) => {
-        return engine.submitInput(request.params.id, request.body.action, request.body.value);
-      },
-    );
 
     app.post('/api/v1/jobs/:id/cancel', async (request) => {
       const job = await engine.cancel(request.params.id);

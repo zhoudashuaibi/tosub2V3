@@ -6,42 +6,19 @@ export function createSettingsModule({ logger }) {
     const db = app.db;
 
     function view() {
-      const loginProvider = app.settings.get('login.provider') || {};
-      const twofa = app.settings.get('twofa.fetch') || {};
+      const redeem = app.settings.get('login.redeem401') || {};
       const engineConfig = app.settings.get('engine.config');
-      const sms = app.settings.get('sms.providers') || {};
       const sub2api = app.settings.get('sub2api.config') || {};
       return {
-        login_provider_mode: loginProvider.mode === 'protocol' ? 'protocol' : 'redeem401',
-        redeem401_base_url: loginProvider.redeem401_base_url || 'https://redeem.lazmeow.com',
-        redeem401_timeout_minutes: loginProvider.redeem401_timeout_minutes ?? 15,
+        redeem401_base_url: redeem.base_url || 'https://redeem.lazmeow.com',
+        redeem401_timeout_minutes: redeem.timeout_minutes ?? 15,
         outlook_fetch_mode: 'microsoft_direct',
-        twofa_fetch_template: twofa.template || 'https://2fa.show/2fa/{code}',
         max_concurrent_jobs: engineConfig.max_concurrent_jobs,
         job_timeout_minutes: engineConfig.job_timeout_minutes,
         proxy_fail_threshold: engineConfig.proxy_fail_threshold,
         strict_proxy: engineConfig.strict_proxy !== false,
         join_auto_upload: Boolean(sub2api.join_auto_upload),
-        sms: {
-          active: sms.active || 'custom',
-          providers: {
-            luban: { configured: Boolean(sms.luban?.apiKey), service_id: sms.luban?.serviceId ?? '' },
-            smsbower: {
-              configured: Boolean(sms.smsbower?.apiKey),
-              country: sms.smsbower?.country ?? '',
-              country_label: sms.smsbower?.countryLabel ?? '',
-            },
-            custom: { configured: Boolean(sms.custom?.entries), count: countCustomEntries(sms.custom?.entries) },
-          },
-        },
       };
-    }
-
-    function countCustomEntries(text) {
-      return String(text || '')
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter(Boolean).length;
     }
 
     app.get('/api/v1/settings', async () => view());
@@ -51,19 +28,27 @@ export function createSettingsModule({ logger }) {
       if (body.outlook_fetch_endpoint !== undefined) {
         throw errors.validation('Outlook 已改为微软官方直连，不再支持自定义取件地址');
       }
-      if (body.twofa_fetch_template !== undefined) {
-        const template = String(body.twofa_fetch_template || '').trim();
-        if (template) {
-          // 校验占位符替换后的完整 URL 合法（{code} / 结尾 xxx 均为占位写法）
-          const probe = template.includes('{code}') ? template.replaceAll('{code}', 'A1B2C3D4') : template.replace(/xxx$/i, 'A1B2C3D4');
+      if (body.redeem401_base_url !== undefined || body.redeem401_timeout_minutes !== undefined) {
+        const current = app.settings.get('login.redeem401');
+        const baseUrlInput =
+          body.redeem401_base_url !== undefined ? String(body.redeem401_base_url || '').trim() : current.base_url;
+        if (baseUrlInput) {
           try {
-            const parsed = new URL(probe);
+            const parsed = new URL(baseUrlInput);
             if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('bad');
           } catch {
-            throw errors.validation('2FA 取码地址模板必须是有效的 HTTP/HTTPS 地址（含 {code} 占位符）');
+            throw errors.validation('redeem 服务地址必须是有效的 HTTP/HTTPS 地址');
           }
         }
-        app.settings.set('twofa.fetch', { template: template || 'https://2fa.show/2fa/{code}' });
+        app.settings.set('login.redeem401', {
+          base_url: baseUrlInput || 'https://redeem.lazmeow.com',
+          timeout_minutes: clampInt(
+            body.redeem401_timeout_minutes !== undefined ? body.redeem401_timeout_minutes : current.timeout_minutes,
+            current.timeout_minutes ?? 15,
+            1,
+            120,
+          ),
+        });
       }
       if (
         body.max_concurrent_jobs !== undefined ||
@@ -81,80 +66,11 @@ export function createSettingsModule({ logger }) {
         };
         app.settings.set('engine.config', next);
       }
-      if (
-        body.login_provider_mode !== undefined ||
-        body.redeem401_base_url !== undefined ||
-        body.redeem401_timeout_minutes !== undefined
-      ) {
-        const current = app.settings.get('login.provider') || {};
-        const mode = body.login_provider_mode !== undefined ? String(body.login_provider_mode) : current.mode;
-        if (!['protocol', 'redeem401'].includes(mode)) {
-          throw errors.validation('登录方式只支持 protocol / redeem401');
-        }
-        const baseUrlInput = body.redeem401_base_url !== undefined
-          ? String(body.redeem401_base_url || '').trim()
-          : current.redeem401_base_url;
-        if (baseUrlInput) {
-          try {
-            const parsed = new URL(baseUrlInput);
-            if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('bad');
-          } catch {
-            throw errors.validation('redeem 服务地址必须是有效的 HTTP/HTTPS 地址');
-          }
-        }
-        app.settings.set('login.provider', {
-          mode,
-          redeem401_base_url: baseUrlInput || 'https://redeem.lazmeow.com',
-          redeem401_timeout_minutes: clampInt(
-            body.redeem401_timeout_minutes !== undefined ? body.redeem401_timeout_minutes : current.redeem401_timeout_minutes,
-            current.redeem401_timeout_minutes ?? 15,
-            1,
-            120,
-          ),
-        });
-      }
       if (body.join_auto_upload !== undefined) {
         const current = app.settings.get('sub2api.config');
         app.settings.set('sub2api.config', { ...current, join_auto_upload: Boolean(body.join_auto_upload) });
       }
-      if (body.sms_active !== undefined) {
-        const current = app.settings.get('sms.providers');
-        app.settings.set('sms.providers', { ...current, active: String(body.sms_active) });
-        app.jobsEngine?.autoInput?.invalidateSmsProvider?.();
-      }
       return view();
-    });
-
-    app.post('/api/v1/settings/sms-provider', async (request) => {
-      const body = request.body || {};
-      const providerId = String(body.id || '').trim();
-      if (!['luban', 'smsbower', 'custom'].includes(providerId)) {
-        throw errors.validation('不支持的接码平台');
-      }
-      const current = app.settings.get('sms.providers') || {};
-      const next = { ...current, active: body.active !== undefined ? String(body.active) : current.active };
-      const config = { ...(current[providerId] || {}) };
-      if (providerId === 'custom') {
-        if (body.entries !== undefined) config.entries = String(body.entries || '');
-      } else {
-        const apiKeyInput = String(body.api_key ?? '').trim();
-        if (apiKeyInput && apiKeyInput !== '****') config.apiKey = apiKeyInput;
-        if (providerId === 'luban' && body.service_id !== undefined) config.serviceId = String(body.service_id);
-        if (providerId === 'smsbower') {
-          if (body.country !== undefined) config.country = String(body.country);
-          if (body.country_label !== undefined) config.countryLabel = String(body.country_label);
-          if (body.max_price !== undefined) config.maxPrice = String(body.max_price);
-        }
-      }
-      next[providerId] = config;
-      app.settings.set('sms.providers', next);
-      app.jobsEngine?.autoInput?.invalidateSmsProvider?.();
-      return view();
-    });
-
-    app.get('/api/v1/settings/sms-providers', async () => {
-      const { publicSmsProviderDefinitions } = await import('../../core/sms-providers.mjs');
-      return { items: publicSmsProviderDefinitions() };
     });
   };
 }

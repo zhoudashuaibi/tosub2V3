@@ -3,12 +3,14 @@ import crypto from 'node:crypto';
 /**
  * 备用号池导入：四段格式解析（邮箱----密码----clientId----refreshToken）+ 校验。
  * 与 v1 parseOutlookEntries 语义一致，但逐行返回结果（不因单行失败中断）。
+ * allowBareEmail（redeem401 远程登录模式恒开）：允许整行只有一个邮箱——
+ * 登录由远端服务完成，本地无需任何凭据。
  */
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-export function parseImportLines(text) {
+export function parseImportLines(text, { allowBareEmail = false } = {}) {
   const lines = String(text || '').split(/\r?\n/);
   const results = [];
   const seenInBatch = new Map(); // email -> line
@@ -19,19 +21,28 @@ export function parseImportLines(text) {
     if (!line || line.startsWith('#')) return;
 
     const parts = line.split('----');
-    if (parts.length < 4) {
-      results.push({ line: lineNo, ok: false, reason: '格式错误，需要 4 段：邮箱----密码----clientId----refreshToken' });
-      return;
-    }
     const email = parts[0].trim().toLowerCase();
-    const password = parts[1].trim();
-    const clientId = parts[2].trim();
-    const refreshToken = parts.slice(3).join('----').trim();
-
     if (!EMAIL_PATTERN.test(email)) {
       results.push({ line: lineNo, ok: false, reason: '邮箱格式错误', raw: maskRaw(parts[0]) });
       return;
     }
+    if (parts.length === 1 && allowBareEmail) {
+      if (seenInBatch.has(email)) {
+        results.push({ line: lineNo, ok: false, duplicateInBatch: true, email, reason: '与第 ' + seenInBatch.get(email) + ' 行重复' });
+        return;
+      }
+      seenInBatch.set(email, lineNo);
+      results.push({ line: lineNo, ok: true, email });
+      return;
+    }
+    if (parts.length < 4) {
+      results.push({ line: lineNo, ok: false, reason: '格式错误，需要 4 段：邮箱----密码----clientId----refreshToken（或整行仅一个邮箱）' });
+      return;
+    }
+    const password = parts[1].trim();
+    const clientId = parts[2].trim();
+    const refreshToken = parts.slice(3).join('----').trim();
+
     if (!password) {
       results.push({ line: lineNo, ok: false, reason: '邮箱密码不能为空' });
       return;
@@ -58,49 +69,6 @@ export function parseImportLines(text) {
 function maskRaw(value) {
   const text = String(value || '');
   return text.length > 12 ? `${text.slice(0, 6)}...` : '***';
-}
-
-/**
- * 2FA 取件码导入：两段格式解析（邮箱----2FA取件码）。
- * 返回逐行结果；ok 行带 { email, pickupCode }，供路由按邮箱关联到账号。
- */
-const PICKUP_CODE_PATTERN = /^[A-Za-z0-9_-]{8,128}$/;
-
-export function parseTwofaLines(text) {
-  const lines = String(text || '').split(/\r?\n/);
-  const results = [];
-  const seenInBatch = new Map(); // email -> line
-
-  lines.forEach((rawLine, index) => {
-    const lineNo = index + 1;
-    const line = rawLine.trim();
-    if (!line || line.startsWith('#')) return;
-
-    const parts = line.split('----');
-    if (parts.length !== 2) {
-      results.push({ line: lineNo, ok: false, reason: '格式错误，需要 2 段：邮箱----2FA取件码' });
-      return;
-    }
-    const email = parts[0].trim().toLowerCase();
-    const pickupCode = parts[1].trim();
-
-    if (!EMAIL_PATTERN.test(email)) {
-      results.push({ line: lineNo, ok: false, reason: '邮箱格式错误', raw: maskRaw(parts[0]) });
-      return;
-    }
-    if (!PICKUP_CODE_PATTERN.test(pickupCode)) {
-      results.push({ line: lineNo, ok: false, reason: '2FA 取件码应为 8-128 位字母数字', raw: maskRaw(parts[1]) });
-      return;
-    }
-    if (seenInBatch.has(email)) {
-      results.push({ line: lineNo, ok: false, duplicateInBatch: true, email, reason: '与第 ' + seenInBatch.get(email) + ' 行重复' });
-      return;
-    }
-    seenInBatch.set(email, lineNo);
-    results.push({ line: lineNo, ok: true, email, pickupCode });
-  });
-
-  return results;
 }
 
 export function credentialsForImport(entry) {
@@ -196,16 +164,17 @@ export function parseTosub2Export(text) {
 }
 
 /**
- * sub2api 账号导出文件解析（{ accounts: [...] } 或裸数组，注册号交付格式）。
- * accounts[].notes 是 JSON 字符串，携带账号全部凭据：
+ * sub2api 账号导出文件解析（{ accounts: [...] } 或裸数组，注册号交付 / redeem 导出格式）。
+ * accounts[].notes 是 JSON 字符串，携带账号凭据：
  *  - mailbox：邮箱四段（bind_email / password 邮箱密码 / client_id / refresh_token）
  *  - gpt.password：ChatGPT 登录密码（勿与 mailbox.password 邮箱密码混淆）
  *  - two_factor.enabled + secret：两步验证开关与密钥（同时作为本地 TOTP 密钥与在线取件码）
- * accounts[].credentials 的 access/refresh token 一律忽略：加入主号池必须走本系统
- * 自己的登录授权（join-main），原登录态不带入；credentials.email 仅作邮箱兜底。
- * 返回结构同 parseTosub2Export（tokens 恒为空），entries 直接复用导入路由的入库逻辑。
+ * accounts[].credentials 的 OAuth tokens 随账号直接入主号池（与 tosubV2 导出同机制，
+ * 导入即持有可用登录态）；allowBareEmail 时无凭据的纯邮箱账号放行进备用池
+ * （登录走 redeem401 远程服务，本地无需凭据）。
+ * 返回结构同 parseTosub2Export，entries 直接复用导入路由的入库逻辑。
  */
-export function parseSub2apiAccountsExport(text) {
+export function parseSub2apiAccountsExport(text, { allowBareEmail = false } = {}) {
   const raw = String(text || '').trim();
   if (!raw) return { ok: false, error: '内容为空', entries: [], invalid: [] };
   let data;
@@ -267,9 +236,24 @@ export function parseSub2apiAccountsExport(text) {
       invalid.push({ line: lineNo, reason: `账号 ${email} 的两步验证密钥不是合法 Base32` });
       return;
     }
+    // OAuth tokens 随账号带入主号池：redeem 导出 / sub2api 导出里的现成登录态直接复用
+    const creds = account.credentials && typeof account.credentials === 'object' ? account.credentials : {};
+    const tokens = creds.access_token || creds.refresh_token
+      ? {
+          access_token: String(creds.access_token || ''),
+          refresh_token: String(creds.refresh_token || ''),
+          id_token: String(creds.id_token || ''),
+          chatgpt_account_id: String(creds.chatgpt_account_id || ''),
+          chatgpt_user_id: String(account.extra?.chatgpt_user_id || ''),
+          client_id: String(creds.client_id || account.extra?.client_id || 'app_EMoamEEZ73f0CkXaXp7hrann'),
+          email: String(creds.email || email),
+          obtained_at: new Date().toISOString(),
+        }
+      : null;
+
     const hasAnyCredential = password || clientId || refreshToken || totpSecret || chatgptPassword;
-    if (!hasAnyCredential) {
-      invalid.push({ line: lineNo, reason: `账号 ${email} 没有任何凭据字段（credentials 里的 OAuth tokens 不导入）` });
+    if (!hasAnyCredential && !tokens && !allowBareEmail) {
+      invalid.push({ line: lineNo, reason: `账号 ${email} 没有任何凭据字段` });
       return;
     }
     if (seenInBatch.has(email)) {
@@ -279,7 +263,8 @@ export function parseSub2apiAccountsExport(text) {
     seenInBatch.set(email, lineNo);
     entries.push({
       email,
-      tokens: null,
+      tokens,
+      mainStatus: tokens ? 'active' : undefined,
       password,
       clientId,
       refreshToken,
@@ -298,43 +283,6 @@ export function parseSub2apiAccountsExport(text) {
   });
 
   return { ok: true, error: null, entries, invalid };
-}
-
-/**
- * ChatGPT 会话导出文件解析：密码在 meta.label 的第 3 段（label 形如 "email----xxxx----密码"）。
- * 只有邮箱或不足 3 段的条目视为无密码账号，跳过；也兼容直接粘贴 label 行。
- * 返回 { ok, passwords: Map<email, password>, error }。
- */
-export function parsePasswordFileText(text) {
-  const raw = String(text || '').trim();
-  const passwords = new Map();
-  if (!raw) return { ok: true, passwords, error: null };
-
-  const addLabel = (label) => {
-    const parts = String(label || '').split('----').map((p) => p.trim());
-    if (parts.length < 3) return;
-    const email = parts[0].toLowerCase();
-    const password = parts[2];
-    if (!EMAIL_PATTERN.test(email) || !password) return;
-    if (!passwords.has(email)) passwords.set(email, password);
-  };
-
-  if (raw.startsWith('[') || raw.startsWith('{')) {
-    let data;
-    try {
-      data = JSON.parse(raw);
-    } catch {
-      return { ok: false, passwords, error: '密码文件不是合法的 JSON' };
-    }
-    for (const item of Array.isArray(data) ? data : [data]) addLabel(item?.meta?.label);
-    return { ok: true, passwords, error: null };
-  }
-  for (const line of raw.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    addLabel(trimmed);
-  }
-  return { ok: true, passwords, error: null };
 }
 
 export function proxyUrlHash(url) {

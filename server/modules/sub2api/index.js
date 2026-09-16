@@ -58,13 +58,13 @@ export function createSub2apiModule({ engine, logger }) {
     // 余额查询选路注入：号已上传 sub2api 时优先用其在远端绑定的代理（未上传仍走本机代理/直连）
     engine.setBalanceProxyResolver?.((accountId) => remoteSync.resolveSub2apiProxy(accountId));
 
-    // 引擎 hook：修复链路产物回传远端（refresh 成功，或 refresh 失败自动转的完整登录成功）；
+    // 引擎 hook：修复链路产物回传远端（自动修复的登录成功）；
     // 主池已上架号的手动完整登录重授也回传（新凭证 + 清错误 + 恢复调度，修复失败暂停保留的号由此复活）
     const previousHandler = engine.hooks.onTokensSaved;
     engine.hooks.onTokensSaved = async (job, runtime, tokens) => {
       await previousHandler?.(job, runtime, tokens);
       if (!job.account_id) return;
-      const isRepairChain = job.type === 'refresh' || (job.type === 'login' && job.resume_job_id);
+      const isRepairChain = job.type === 'login' && job.resume_job_id;
       const row = db.prepare('SELECT pool, sub2api_account_id FROM accounts WHERE id = ?').get(job.account_id);
       const mainReauth =
         row?.pool === 'main' && row?.sub2api_account_id != null && Number.isInteger(Number(row.sub2api_account_id));

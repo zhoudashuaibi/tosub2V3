@@ -179,8 +179,6 @@ export const jobsApi = {
   get: (id: string) => api<Job & { can_download?: boolean }>(`/jobs/${id}`),
   logs: (id: string, after: number, limit = 65536) =>
     api<{ chunk: string; next_offset: number; eof: boolean }>(`/jobs/${id}/logs?after=${after}&limit=${limit}`),
-  input: (id: string, action: string, value?: string) =>
-    api<{ ok: boolean }>(`/jobs/${id}/input`, { json: { action, value } }),
   cancel: (id: string) => api<{ job: Job }>(`/jobs/${id}/cancel`, { json: {} }),
   retry: (id: string, proxy_id?: number) => api<{ job: Job }>(`/jobs/${id}/retry`, { json: { proxy_id } }),
   cancelAll: () => api<{ canceled: number }>('/jobs/cancel-all', { json: {} }),
@@ -215,7 +213,6 @@ export const sub2apiApi = {
 export const settingsApi = {
   get: () => api<SettingsView>('/settings'),
   update: (body: Record<string, unknown>) => api<SettingsView>('/settings', { method: 'PUT', json: body }),
-  saveSmsProvider: (body: Record<string, unknown>) => api<SettingsView>('/settings/sms-provider', { json: body }),
 };
 
 export const dashboardApi = {

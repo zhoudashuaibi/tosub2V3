@@ -239,7 +239,7 @@ test('401 只代表会话过期：不废弃，修复关闭时保留主池观察'
   assert.equal(account.banned, 0);
 });
 
-test('401 error + 自动修复：有 refresh_token 发刷新任务（失败由引擎转完整登录）', async () => {
+test('401 error + 自动修复：发起远程登录任务（redeem401，无需本地凭据）', async () => {
   insertAccount(ctx.db, ctx.crypto, { email: 'expired@test.local', tokens: { refresh_token: 'rt' } });
   const monitor = buildMonitor({
     autoRepair: true,
@@ -250,16 +250,16 @@ test('401 error + 自动修复：有 refresh_token 发刷新任务（失败由�
 
   assert.equal(view.last_result.repairing, 1);
   assert.equal(ctx.submitted.length, 1);
-  assert.equal(ctx.submitted[0].type, 'refresh');
+  assert.equal(ctx.submitted[0].type, 'login');
   const account = ctx.db.prepare(`SELECT status FROM accounts WHERE email='expired@test.local'`).get();
   assert.equal(account.status, 'authorizing');
 });
 
-test('401 error + 自动修复：无 refresh_token 但有密码 → 直接发完整登录', async () => {
-  insertAccount(ctx.db, ctx.crypto, { email: 'expired@test.local', credentials: { password: 'pw' } });
+test('401 error + 自动修复：无任何凭据同样发起远程登录', async () => {
+  insertAccount(ctx.db, ctx.crypto, { email: 'bare@test.local' });
   const monitor = buildMonitor({
     autoRepair: true,
-    remoteAccounts: [remoteAccount({ id: 1, email: 'expired@test.local', status: 'error' })],
+    remoteAccounts: [remoteAccount({ id: 1, email: 'bare@test.local', status: 'error' })],
   });
 
   const view = await monitor.runCheck();
@@ -902,7 +902,7 @@ test('修复回执：401 发起修复，任务成功 → 同一行明细回执 o
   assert.equal(item.action, 'repairing');
   assert.equal(item.outcome, null);
 
-  monitor.noteRepairOutcome({ id: 'job-1', account_id: id, type: 'refresh' }, { ok: true });
+  monitor.noteRepairOutcome({ id: 'job-1', account_id: id, type: 'login' }, { ok: true });
 
   const [done] = monitor.recentLogs(1)[0].items;
   assert.equal(done.outcome, 'ok');
@@ -910,7 +910,7 @@ test('修复回执：401 发起修复，任务成功 → 同一行明细回执 o
   assert.match(done.outcome_detail, /修复成功/);
 });
 
-test('修复回执：refresh 失败转登录 → followup（仍算在途），派生登录失败 → failed', async () => {
+test('修复回执：登录失败直接落 failed（refresh 转登录链路已移除）', async () => {
   const id = insertAccount(ctx.db, ctx.crypto, { email: 'expired@test.local', tokens: { refresh_token: 'rt' } });
   const monitor = buildMonitor({
     autoRepair: true,
@@ -918,18 +918,11 @@ test('修复回执：refresh 失败转登录 → followup（仍算在途），�
   });
 
   await monitor.runCheck();
-  monitor.noteRepairOutcome(
-    { id: 'job-1', account_id: id, type: 'refresh' },
-    { ok: false, followUpJobId: 'job-2', message: 'REFRESH_TOKEN_INVALID' },
-  );
-  assert.equal(monitor.recentLogs(1)[0].items[0].outcome, 'followup');
-  assert.match(monitor.recentLogs(1)[0].items[0].outcome_detail, /已自动转完整登录/);
-
-  monitor.noteRepairOutcome({ id: 'job-2', account_id: id, type: 'login' }, { ok: false, message: 'MFA 403' });
+  monitor.noteRepairOutcome({ id: 'job-1', account_id: id, type: 'login' }, { ok: false, message: 'REDEEM401_FAILED' });
   const [item] = monitor.recentLogs(1)[0].items;
   assert.equal(item.outcome, 'failed');
   assert.match(item.outcome_detail, /第 1\/2 次/);
-  assert.match(item.outcome_detail, /MFA 403/);
+  assert.match(item.outcome_detail, /REDEEM401_FAILED/);
 });
 
 test('修复回执：连败达上限 → parked（暂停保留待重授）', async () => {
@@ -970,7 +963,7 @@ test('修复在途：同账号已有活跃任务 → 动作标为「修复任务
   assert.match(item.detail, /修复任务在途（login/);
 });
 
-test('修复未发起的原因分类：冷却中 / 缺凭据 / 自动修复关闭', async () => {
+test('修复未发起的原因分类：冷却中 / 纯邮箱也可修复 / 自动修复关闭', async () => {
   insertAccount(ctx.db, ctx.crypto, { email: 'cooling@test.local', tokens: { refresh_token: 'rt' } });
   const coolingId = ctx.db.prepare(`SELECT id FROM accounts WHERE email='cooling@test.local'`).get().id;
   ctx.db.prepare(`UPDATE accounts SET last_auto_repair_at=? WHERE id=?`).run(new Date().toISOString(), coolingId);
@@ -986,7 +979,8 @@ test('修复未发起的原因分类：冷却中 / 缺凭据 / 自动修复关�
   await monitor.runCheck();
   const byEmail = new Map(monitor.recentLogs(1)[0].items.map((item) => [item.email, item]));
   assert.equal(byEmail.get('cooling@test.local').action, 'repair_cooldown');
-  assert.equal(byEmail.get('bare@test.local').action, 'repair_no_credentials');
+  // redeem401 远程登录无需本地凭据：纯邮箱账号照常发起修复
+  assert.equal(byEmail.get('bare@test.local').action, 'repairing');
 
   const off = buildMonitor({
     autoRepair: false,
@@ -1011,7 +1005,7 @@ test('修复回执计数：上一轮之后落地的成败进入本轮动作量',
   });
 
   await monitor.runCheck();
-  monitor.noteRepairOutcome({ id: 'job-1', account_id: healed, type: 'refresh' }, { ok: true });
+  monitor.noteRepairOutcome({ id: 'job-1', account_id: healed, type: 'login' }, { ok: true });
   monitor.noteRepairOutcome({ id: 'job-2', account_id: broken, type: 'login' }, { ok: false, message: 'boom' });
 
   const view = await monitor.runCheck();

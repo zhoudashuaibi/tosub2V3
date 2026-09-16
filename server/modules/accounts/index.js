@@ -3,7 +3,7 @@ import path from 'node:path';
 import { parsePagination } from '../../lib/db.js';
 import { errors } from '../../lib/http-errors.js';
 import { createPools } from './pools.js';
-import { parseImportLines, parseTwofaLines, parsePasswordFileText, parseTosub2Export, parseSub2apiAccountsExport, credentialsForImport } from './import.js';
+import { parseImportLines, parseTosub2Export, parseSub2apiAccountsExport, credentialsForImport } from './import.js';
 import { buildTosub2ExportPayload, tosub2ExportFilename } from './export.js';
 import { buildExportFromTokens } from '../sub2api/upload.js';
 import { createMailInit } from './mail-init.js';
@@ -630,8 +630,6 @@ export function createAccountsModule({ engine, logger }) {
             additionalProperties: false,
             properties: {
               text: { type: 'string', maxLength: 32_000_000 },
-              twofa_text: { type: 'string', maxLength: 500_000 },
-              passwords_text: { type: 'string', maxLength: 2_000_000 },
               force_discard: { type: 'boolean' },
               force_remote: { type: 'boolean' },
               // 远端已有账号收编进主号池：直接关联远端账号（导入时不登录、不上传），
@@ -643,20 +641,14 @@ export function createAccountsModule({ engine, logger }) {
         },
       },
       async (request, reply) => {
-        const {
-          text = '',
-          twofa_text = '',
-          passwords_text = '',
-          force_discard = false,
-          force_remote = false,
-          adopt_remote = false,
-        } = request.body;
-        if (!String(text).trim() && !String(twofa_text).trim() && !String(passwords_text).trim()) {
+        const { text = '', force_discard = false, force_remote = false, adopt_remote = false } = request.body;
+        if (!String(text).trim()) {
           throw errors.validation('导入内容不能为空');
         }
         // JSON 文件统一入口：tosubV2 跨实例导出（type: tosub2-accounts）或
-        // sub2api 账号导出（accounts 数组，notes 携带邮箱四段/GPT 密码/两步验证；
-        // credentials 里的 OAuth tokens 忽略，全部进备用池，加入主号池走 join-main 登录授权）
+        // sub2api 账号导出（accounts 数组）。sub2api 导出的 OAuth tokens 直接随账号
+        // 入主号池（与 tosubV2 导出同机制）；无凭据的纯邮箱账号进备用池，
+        // 加入主号池走 join-main（redeem401 远程登录，无需本地凭据）
         let parsed;
         let invalidLines;
         let duplicatesInBatch;
@@ -677,7 +669,7 @@ export function createAccountsModule({ engine, logger }) {
           invalidLines = tosub2.invalid;
           duplicatesInBatch = [];
         } else if (jsonData && (Array.isArray(jsonData) || Array.isArray(jsonData.accounts))) {
-          const sub2api = parseSub2apiAccountsExport(text);
+          const sub2api = parseSub2apiAccountsExport(text, { allowBareEmail: true });
           if (!sub2api.ok) throw errors.validation(`账号导出文件解析失败：${sub2api.error}`);
           parsed = sub2api.entries.map((entry) => ({ ok: true, ...entry }));
           invalidLines = sub2api.invalid;
@@ -687,19 +679,10 @@ export function createAccountsModule({ engine, logger }) {
             'JSON 文件无法识别：需要 tosubV2 账号导出（type: tosub2-accounts）或 sub2api 账号导出（accounts 数组）',
           );
         } else {
-          parsed = parseImportLines(text);
+          parsed = parseImportLines(text, { allowBareEmail: true });
           invalidLines = parsed.filter((r) => !r.ok && !r.duplicateInBatch).map(({ line, reason }) => ({ line, reason }));
           duplicatesInBatch = [...new Set(parsed.filter((r) => r.duplicateInBatch).map((r) => r.email))];
         }
-        const twofaParsed = parseTwofaLines(twofa_text);
-        // 邮箱 -> 2FA 取件码；随导入逐个绑定并从 Map 移除，剩余的兜底关联到已有账号
-        const twofaByEmail = new Map(twofaParsed.filter((r) => r.ok).map((r) => [r.email, r.pickupCode]));
-        const twofaTotal = twofaByEmail.size;
-        const twofaInvalidLines = twofaParsed.filter((r) => !r.ok).map(({ line, reason }) => ({ line, reason }));
-        // ChatGPT 会话导出文件：邮箱 -> ChatGPT 登录密码
-        const passwordFile = parsePasswordFileText(passwords_text);
-        const passwordByEmail = passwordFile.passwords;
-        const passwordTotal = passwordByEmail.size;
 
         const good = parsed.filter((r) => r.ok);
         const duplicatesInReserve = [];
@@ -824,17 +807,12 @@ export function createAccountsModule({ engine, logger }) {
 
         const insertTx = db.transaction(() => {
           for (const entry of good) {
-            // 显式粘贴的 2FA / 密码文本优先，否则保留 tosubV2 文件里已带的值
-            entry.pickupCode = twofaByEmail.get(entry.email) || entry.pickupCode || null;
-            entry.chatgptPassword = passwordByEmail.get(entry.email) || entry.chatgptPassword || null;
             const existing = db
               .prepare('SELECT id, pool, status, discard_reason FROM accounts WHERE email = ? COLLATE NOCASE')
               .get(entry.email);
             if (entry.tokens) {
               const imported = importMainEntry(entry, existing, new Date().toISOString());
               if (imported) created.push(imported);
-              if (entry.pickupCode) twofaByEmail.delete(entry.email);
-              if (entry.chatgptPassword) passwordByEmail.delete(entry.email);
               continue;
             }
             if (existing) {
@@ -872,8 +850,6 @@ export function createAccountsModule({ engine, logger }) {
                       pools.recordEvent(existing.id, 'sub2api_linked', { remote_id: remote.id, source: 'import_adopt' });
                       created.push({ id: existing.id, email: entry.email, status: 'active', pool: 'main' });
                       adoptedRemote.push(entry.email);
-                      if (entry.pickupCode) twofaByEmail.delete(entry.email);
-                      if (entry.chatgptPassword) passwordByEmail.delete(entry.email);
                       continue;
                     }
                   }
@@ -886,8 +862,6 @@ export function createAccountsModule({ engine, logger }) {
                   new Date().toISOString(),
                   existing.id,
                 );
-                if (entry.pickupCode) twofaByEmail.delete(entry.email);
-                if (entry.chatgptPassword) passwordByEmail.delete(entry.email);
                 continue;
               }
               if (existing.pool === 'main') {
@@ -897,8 +871,6 @@ export function createAccountsModule({ engine, logger }) {
                 if (entry.pickupCode) patch.totp_pickup_code = entry.pickupCode;
                 if (entry.chatgptPassword) patch.password = entry.chatgptPassword;
                 if (Object.keys(patch).length && mergeCredentials(existing.id, patch)) {
-                  if (entry.pickupCode) twofaByEmail.delete(entry.email);
-                  if (entry.chatgptPassword) passwordByEmail.delete(entry.email);
                 }
                 continue;
               }
@@ -927,8 +899,6 @@ export function createAccountsModule({ engine, logger }) {
                 );
                 pools.recordEvent(existing.id, 'imported', { source: 'manual', force: 'discard' });
                 created.push({ id: existing.id, email: entry.email, status: 'mail_pending' });
-                if (entry.pickupCode) twofaByEmail.delete(entry.email);
-                if (entry.chatgptPassword) passwordByEmail.delete(entry.email);
                 continue;
               }
             }
@@ -963,8 +933,6 @@ export function createAccountsModule({ engine, logger }) {
               pools.recordEvent(id, 'sub2api_linked', { remote_id: remote.id, source: 'import_adopt' });
               created.push({ id, email: entry.email, status: 'active', pool: 'main' });
               adoptedRemote.push(entry.email);
-              if (entry.pickupCode) twofaByEmail.delete(entry.email);
-              if (entry.chatgptPassword) passwordByEmail.delete(entry.email);
               continue;
             }
             if (remoteByEmail?.has(entry.email) && !force_remote) {
@@ -998,30 +966,22 @@ export function createAccountsModule({ engine, logger }) {
             if (result.changes === 0) continue;
             const id = Number(result.lastInsertRowid);
             pools.recordEvent(id, 'imported', { source: 'manual' });
-            created.push({ id, email: entry.email, status: 'mail_pending' });
-            if (entry.pickupCode) twofaByEmail.delete(entry.email);
-            if (entry.chatgptPassword) passwordByEmail.delete(entry.email);
+            created.push({ id, email: entry.email, status: 'mail_pending', mailInitEligible: Boolean(entry.clientId && entry.refreshToken) });
           }
         });
         insertTx();
 
-        // 兜底：未随导入文本绑定的 2FA 取件码 / ChatGPT 密码，按邮箱更新任意池的已有账号
-        const twofaUnmatched = [];
-        for (const [email, pickupCode] of twofaByEmail) {
-          const existing = db.prepare('SELECT id FROM accounts WHERE email = ? COLLATE NOCASE').get(email);
-          if (existing) mergeCredentials(existing.id, { totp_pickup_code: pickupCode });
-          else twofaUnmatched.push(email);
-        }
-        const passwordsUnmatched = [];
-        for (const [email, chatgptPassword] of passwordByEmail) {
-          const existing = db.prepare('SELECT id FROM accounts WHERE email = ? COLLATE NOCASE').get(email);
-          if (existing) mergeCredentials(existing.id, { password: chatgptPassword });
-          else passwordsUnmatched.push(email);
-        }
-
-        // 异步邮件初始化（主号池直入的账号不需要）
-        const reserveCreated = created.filter((c) => c.pool !== 'main');
+        // 异步邮件初始化（主号池直入与无 Outlook 凭据的纯邮箱账号不排队，避免整批 fetch_failed）
+        const reserveCreated = created.filter((c) => c.pool !== 'main' && c.mailInitEligible);
         if (reserveCreated.length) mailInit.enqueue(reserveCreated.map((c) => c.id), { source: 'import' });
+        // 纯邮箱账号（redeem401 远程登录）没有可初始化的邮箱，直接置为跳过态
+        const bareIds = created.filter((c) => c.pool !== 'main' && !c.mailInitEligible).map((c) => c.id);
+        if (bareIds.length) {
+          const skip = db.prepare(`UPDATE accounts SET mail_status='skipped', mail_error=NULL, updated_at=? WHERE id=?`);
+          const nowSkip = new Date().toISOString();
+          const txSkip = db.transaction(() => bareIds.forEach((id) => skip.run(nowSkip, id)));
+          txSkip();
+        }
 
         reply.code(201);
         return {
@@ -1035,12 +995,6 @@ export function createAccountsModule({ engine, logger }) {
           duplicates_remote: duplicatesRemote,
           adopted_remote: adoptedRemote,
           invalid_lines: invalidLines,
-          twofa_bound: twofaTotal - twofaUnmatched.length,
-          twofa_unmatched: twofaUnmatched,
-          twofa_invalid_lines: twofaInvalidLines,
-          passwords_bound: passwordTotal - passwordsUnmatched.length,
-          passwords_unmatched: passwordsUnmatched,
-          passwords_error: passwordFile.error,
         };
       },
     );
@@ -1334,17 +1288,8 @@ export function createAccountsModule({ engine, logger }) {
             skipped.push({ id, reason: 'ACCOUNT_STATE_INVALID' });
             continue;
           }
-          const tokens = account.tokens_enc
-            ? crypto.tryDecryptJson(account.tokens_enc, 'accounts.tokens_enc')
-            : null;
-          const credentials = decryptCredentials(account);
-          let type = null;
-          if (tokens?.refresh_token) type = 'refresh';
-          else if (credentials.password || credentials.outlook?.refresh_token || credentials.mail_api_url) type = 'login';
-          if (!type) {
-            skipped.push({ id, reason: '凭据不全' });
-            continue;
-          }
+          // 登录一律 redeem401 远程完成：不再区分 refresh/凭据条件，任何账号都可发起
+          const type = 'login';
           const now = new Date().toISOString();
           const tx = db.transaction(() => {
             const cas = db

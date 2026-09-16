@@ -224,7 +224,7 @@ export function createMonitor({ db, crypto, client, getConfig, pools, engine, up
         `SELECT COUNT(*) AS n FROM accounts a
          WHERE a.pool='main' AND a.status='authorizing' AND a.last_auto_repair_at IS NOT NULL
            AND EXISTS (
-             SELECT 1 FROM jobs j WHERE j.account_id=a.id AND j.type IN ('login','refresh')
+             SELECT 1 FROM jobs j WHERE j.account_id=a.id AND j.type = 'login'
                AND j.status IN ('queued','running','awaiting_input')
            )`,
       )
@@ -411,7 +411,7 @@ export function createMonitor({ db, crypto, client, getConfig, pools, engine, up
             remote_id: remote?.id,
             action: 'repairing',
             reason: 'auto_repair',
-            detail: `${errorMessage}｜已发起${repair.repairType === 'login' ? '完整登录' : '令牌刷新'}修复，结果落地后回写本行`,
+            detail: `${errorMessage}｜已发起远程登录修复，结果落地后回写本行`,
           });
         } else {
           // 没发起也要说清为什么：在途/冷却/熔断/缺凭据，避免日志只写「未处理」让人以为修复没下文
@@ -582,13 +582,12 @@ export function createMonitor({ db, crypto, client, getConfig, pools, engine, up
 
   /**
    * 自动修复资格：未关闭、无活跃任务、未封禁、不在冷却期、修复失败次数未达上限。
-   * 修复方式：有 refresh_token 先刷新（401 失败由引擎自动转完整登录）；
-   * 没有 refresh_token 但凭据支持完整登录（密码/Outlook 取件/邮箱 API）→ 直接发完整登录。
+   * 修复方式：redeem401 远程登录重新获取授权文件（登录由远端服务完成，本地无需凭据）。
    * 修复连败达上限不再废弃：暂停保留待重授（见 parkForReauth）。
    *
    * 返回结构化结果：{ ok: true, repairType } 或 { ok: false, code }
    * code ∈ auto_repair_off | blocked | ineligible | active | parked | cooldown |
-   *        no_credentials | state_changed
+   *        state_changed
    * —— 让巡检日志能写明「这轮为什么没发起修复」，而不是笼统的「未处理」。
    */
   async function tryAutoRepair(local, monitor, remote = null) {
@@ -596,7 +595,7 @@ export function createMonitor({ db, crypto, client, getConfig, pools, engine, up
     if (local.auto_repair_blocked) return { ok: false, code: 'blocked' };
     if (local.pool !== 'main') return { ok: false, code: 'ineligible' };
     // 收编保险门：远端健康的收编号绝不自动登录（自动修复本就只对 error 号触发，双保险）；
-    // 远端 error（如 token 撤销 401）时收编号照常修复——无本地 tokens 直接走完整登录
+    // 远端 error（如 token 撤销 401）时收编号照常修复（远程登录重新取授权）
     if (local.adopted_remote && remote && String(remote.status || '') !== 'error') return { ok: false, code: 'ineligible' };
     const active = db
       .prepare(`SELECT type, status, stage FROM jobs WHERE account_id=? AND status IN ('queued','running','awaiting_input')`)
@@ -611,14 +610,7 @@ export function createMonitor({ db, crypto, client, getConfig, pools, engine, up
     if (local.last_auto_repair_at && Date.now() - Date.parse(local.last_auto_repair_at) < cooldownMs) {
       return { ok: false, code: 'cooldown' };
     }
-    const tokens = local.tokens_enc ? crypto.tryDecryptJson(local.tokens_enc, 'accounts.tokens_enc') : null;
-    const credentials = local.credentials_enc
-      ? crypto.tryDecryptJson(local.credentials_enc, 'accounts.credentials_enc')
-      : null;
-    let repairType = null;
-    if (tokens?.refresh_token) repairType = 'refresh';
-    else if (credentials?.password || credentials?.outlook?.refresh_token || credentials?.mail_api_url) repairType = 'login';
-    if (!repairType) return { ok: false, code: 'no_credentials' };
+    const repairType = 'login';
 
     const now = new Date().toISOString();
     const previousStatus = ['active', 'needs_reauth'].includes(local.status) ? local.status : 'active';
@@ -647,11 +639,10 @@ export function createMonitor({ db, crypto, client, getConfig, pools, engine, up
    * 自动修复任务终态回写（由引擎 onLoginFinished 钩子调用）：
    *  - 成功 → repair_fail_count 清零 + 巡检日志回执 ok
    *  - 失败 → 计数 +1，达到 max_repair_attempts 暂停保留待重授（不再直接废弃）；回执 failed / parked
-   *  - refresh 失败已自动转完整登录的（followUpJobId）不计数，回执 followup，等派生登录任务的终态
    */
-  function noteRepairOutcome(job, { ok, followUpJobId = null, message = '' } = {}) {
+  function noteRepairOutcome(job, { ok, message = '' } = {}) {
     try {
-      if (!job?.account_id || !['refresh', 'login'].includes(job.type)) return;
+      if (!job?.account_id || job.type !== 'login') return;
       const row = db
         .prepare(`SELECT email, pool, last_auto_repair_at, repair_fail_count, sub2api_account_id FROM accounts WHERE id=?`)
         .get(job.account_id);
@@ -664,11 +655,6 @@ export function createMonitor({ db, crypto, client, getConfig, pools, engine, up
           db.prepare('UPDATE accounts SET repair_fail_count=0, updated_at=? WHERE id=?').run(now, job.account_id);
         }
         markRepairOutcome(row.email, 'ok', '修复成功：新凭据已回推远端并恢复调度');
-        return;
-      }
-      if (followUpJobId) {
-        // 已转完整登录，本链路未结束：回执成「在途」，派生任务的终态会再写回这一行
-        markRepairOutcome(row.email, 'followup', `令牌刷新失败${message ? `（${message}）` : ''}，已自动转完整登录`);
         return;
       }
       const maxAttempts = Number(monitorConfig().max_repair_attempts) || 2;
@@ -1024,11 +1010,6 @@ const REPAIR_SKIP_META = {
   cooldown: { action: 'repair_cooldown', reason: 'repair_cooldown', note: '修复冷却期内，下轮再试' },
   parked: { action: 'repair_parked', reason: 'repair_parked', note: '修复连败达上限，已暂停保留待重授' },
   blocked: { action: 'repair_parked', reason: 'repair_parked', note: '自动修复已封锁，待重新授权解锁' },
-  no_credentials: {
-    action: 'repair_no_credentials',
-    reason: 'repair_no_credentials',
-    note: '无 refresh_token／密码／邮箱凭据，无法自动修复',
-  },
   auto_repair_off: { action: 'ignored', reason: 'auto_repair_off', note: '自动修复未开启，仅记录不处理' },
   state_changed: { action: 'ignored', reason: 'state_changed', note: '账号状态已变化，本轮跳过' },
   ineligible: { action: 'ignored', reason: 'temp_error', note: '不符合自动修复条件' },

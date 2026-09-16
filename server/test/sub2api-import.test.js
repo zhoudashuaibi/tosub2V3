@@ -34,7 +34,7 @@ function sub2apiAccount(overrides = {}) {
   };
 }
 
-test('sub2api 导出解析：notes 四段 / GPT 密码 / 两步验证全量映射，OAuth tokens 忽略', () => {
+test('sub2api 导出解析：notes 四段 / GPT 密码 / 两步验证全量映射，OAuth tokens 随账号入主号池', () => {
   const parsed = parseSub2apiAccountsExport(JSON.stringify({ exported_at: 'x', proxies: [], accounts: [sub2apiAccount()] }));
   assert.equal(parsed.ok, true);
   assert.equal(parsed.entries.length, 1);
@@ -48,8 +48,11 @@ test('sub2api 导出解析：notes 四段 / GPT 密码 / 两步验证全量映�
   assert.equal(entry.totpSecret, SECRET);
   // 两步验证密钥同时作为在线取件码（模板 URL 拼接取码）
   assert.equal(entry.pickupCode, SECRET);
-  // credentials 里的 OAuth tokens 一律忽略：全部进备用池，主号池走 join-main 登录授权
-  assert.equal(entry.tokens, null);
+  // credentials 里的 OAuth tokens 随账号直入主号池（active）
+  assert.equal(entry.tokens.access_token, 'at-123');
+  assert.equal(entry.tokens.refresh_token, 'rt-456');
+  assert.equal(entry.tokens.email, 'a@b.com');
+  assert.equal(entry.mainStatus, 'active');
   assert.equal(entry.hasBalance, false);
 
   const credentials = credentialsForImport(entry);
@@ -90,7 +93,7 @@ test('sub2api 导出解析：two_factor 未开启时忽略 secret', () => {
   assert.equal(entry.pickupCode, '');
 });
 
-test('sub2api 导出解析：notes 缺失时按 name/credentials.email 兜底', () => {
+test('sub2api 导出解析：notes 缺失时按 name/credentials.email 兜底（tokens 一并提取）', () => {
   const parsed = parseSub2apiAccountsExport(
     JSON.stringify({
       accounts: [
@@ -106,12 +109,54 @@ test('sub2api 导出解析：notes 缺失时按 name/credentials.email 兜底', 
   assert.equal(entry.email, 'e@f.com');
   assert.equal(entry.chatgptPassword, 'GptPw1!');
   assert.equal(entry.password, '');
-  assert.equal(entry.tokens, null);
+  assert.equal(entry.tokens.access_token, 'at');
+  assert.equal(entry.tokens.refresh_token, 'rt-only');
   // credentials.email 大写时归一到小写
   const [upper] = parseSub2apiAccountsExport(
     JSON.stringify({ accounts: [{ name: 'G@H.com----x----p', credentials: { refresh_token: 'rt', email: 'G@H.com' } }] }),
   ).entries;
   assert.equal(upper.email, 'g@h.com');
+});
+
+test('sub2api 导出解析：redeem 导出（纯 OAuth 凭据，无 notes）整批直入主号池', () => {
+  const parsed = parseSub2apiAccountsExport(
+    JSON.stringify({
+      type: 'sub2api-data',
+      accounts: [
+        { name: 'x@duck.com', credentials: { email: 'x@duck.com', access_token: 'at-1', refresh_token: 'rt-1', chatgpt_account_id: 'us-1' } },
+        { name: 'y@duck.com', extra: { email: 'y@duck.com' }, credentials: { access_token: 'at-2', refresh_token: 'rt-2' } },
+      ],
+    }),
+  );
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.entries.length, 2);
+  const [first, second] = parsed.entries;
+  assert.equal(first.email, 'x@duck.com');
+  assert.equal(first.tokens.refresh_token, 'rt-1');
+  assert.equal(first.tokens.chatgpt_account_id, 'us-1');
+  assert.equal(first.mainStatus, 'active');
+  assert.equal(second.email, 'y@duck.com');
+  assert.equal(second.tokens.access_token, 'at-2');
+});
+
+test('sub2api 导出解析：allowBareEmail（redeem401 模式）放行纯邮箱账号', () => {
+  const payload = JSON.stringify({
+    accounts: [
+      { name: 'bare@duck.com', credentials: {} },
+      { name: 'cred@duck.com', credentials: {}, notes: JSON.stringify({ mailbox: { bind_email: 'cred@duck.com', password: 'p', client_id: UUID, refresh_token: RT } }) },
+    ],
+  });
+  // 不开 allowBareEmail：纯邮箱条目被拒（保持旧校验语义）
+  const strict = parseSub2apiAccountsExport(payload);
+  assert.equal(strict.entries.length, 1);
+  assert.equal(strict.entries[0].email, 'cred@duck.com');
+  assert.match(strict.invalid[0].reason, /没有任何凭据字段/);
+  // 开 allowBareEmail：纯邮箱进备用池（tokens 为空，走 join-main 远程登录）
+  const relaxed = parseSub2apiAccountsExport(payload, { allowBareEmail: true });
+  assert.equal(relaxed.entries.length, 2);
+  assert.equal(relaxed.entries[0].email, 'bare@duck.com');
+  assert.equal(relaxed.entries[0].tokens, null);
+  assert.equal(relaxed.entries[0].mainStatus, undefined);
 });
 
 test('sub2api 导出解析：裸数组与密钥归一化', () => {
@@ -130,7 +175,7 @@ test('sub2api 导出解析：裸数组与密钥归一化', () => {
   );
   assert.equal(parsed.ok, true);
   const [expired, normalized] = parsed.entries;
-  assert.equal(expired.tokens, null);
+  assert.equal(expired.tokens.access_token, 'at-123');
   assert.equal(normalized.totpSecret, 'JBSWY3DPEHPK3PXP');
   assert.equal(normalized.pickupCode, 'JBSWY3DPEHPK3PXP');
 });

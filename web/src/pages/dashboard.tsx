@@ -25,7 +25,6 @@ const EVENT_LABELS: Record<string, string> = {
   moved_to_discard: '移入废弃池',
   restored: '移回主池',
   auto_repair_started: '自动修复启动',
-  totp_setup: '设置 2FA',
   deleted: '删除',
 };
 
@@ -66,7 +65,7 @@ export function DashboardPage() {
         <StatCard
           title="任务进行中"
           value={data.jobs.running}
-          sub={`排队 ${data.jobs.queued} · 待输入 ${data.jobs.awaiting_input}`}
+          sub={`排队 ${data.jobs.queued}`}
           icon={Activity}
           tone="warning"
         />

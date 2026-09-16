@@ -1,7 +1,10 @@
 /**
  * json-events 事件 → 状态迁移（纯函数表，重点单测对象）。
  * 输入 (job 视图, event) → 输出 { jobPatch, accountPatch, accountEvents[], actions[] }
- * 不做任何 IO；副作用（落库 / 自动输入 / 杀进程重启 / 产物解析）由 engine 执行。
+ * 不做任何 IO；副作用（落库 / 产物解析）由 engine 执行。
+ *
+ * 登录由 redeem401 子进程完成（无人工交互），事件面收敛为：
+ * starting / stage / log / balance / result_saved / error / exit。
  */
 
 const TERMINAL = new Set(['completed', 'failed', 'canceled']);
@@ -22,16 +25,7 @@ export function isUserQuit(errorMessage) {
 const STAGES = new Set([
   'web_login',
   'email_otp',
-  'password',
-  'mfa_otp',
-  'totp_setup_otp',
-  'about_you',
-  'add_phone',
-  'phone_otp',
-  'oauth',
-  'workspace',
   'finalizing',
-  'refreshing',
 ]);
 
 export const HANDLERS = {
@@ -41,30 +35,7 @@ export const HANDLERS = {
 
   stage: (job, event) => (STAGES.has(event.stage) ? { jobPatch: { stage: event.stage } } : {}),
 
-  input_required: (job, event) => ({
-    jobPatch: { status: 'awaiting_input', prompt_kind: event.kind ?? null },
-    actions: [{ kind: 'auto_input', event }],
-  }),
-
-  input_accepted: (job) => ({
-    jobPatch: { status: 'running', prompt_kind: null },
-  }),
-
   log: () => ({}),
-
-  proxy_session_attempt: (job, event) => ({
-    jobPatch: { proxy_attempts: Math.max(job.proxy_attempts || 0, Number(event.n) || 0) },
-  }),
-
-  risk_retry: (job, event) => ({
-    actions: [{ kind: 'note_risk_retry', event }],
-  }),
-
-  checkpoint_saved: (job, event) => ({
-    jobPatch: { checkpoint_path: event.path || job.checkpoint_path },
-  }),
-
-  resume_used: () => ({}),
 
   balance: (job, event) =>
     Number.isFinite(Number(event.value))
@@ -74,10 +45,6 @@ export const HANDLERS = {
   result_saved: (job, event) => ({
     jobPatch: { result_path: event.path || job.result_path },
     actions: [{ kind: 'save_tokens', event }],
-  }),
-
-  totp_secret: (job, event) => ({
-    actions: [{ kind: 'save_totp', event }],
   }),
 
   error: (job, event) => ({

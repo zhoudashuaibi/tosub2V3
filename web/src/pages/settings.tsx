@@ -6,10 +6,8 @@ import { authApi, settingsApi } from '@/api';
 import { errorMessage } from '@/api/client';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import { Input, Textarea } from '@/components/ui/input';
+import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Switch } from '@/components/ui/switch';
 import { formatDateTime, formatRelativeTime } from '@/lib/utils';
 
@@ -48,73 +46,36 @@ export function SettingsPage() {
     onError: (error) => toast.error(errorMessage(error)),
   });
 
-  // 邮箱取件 / 引擎
-  const [twofaTemplate, setTwofaTemplate] = useState('');
+  // 登录（redeem401 远程登录）/ 引擎
+  const [redeemBaseUrl, setRedeemBaseUrl] = useState('');
+  const [redeemTimeout, setRedeemTimeout] = useState('');
   const [maxJobs, setMaxJobs] = useState('');
   const [timeoutMin, setTimeoutMin] = useState('');
   const [failThreshold, setFailThreshold] = useState('');
   const [strictProxy, setStrictProxy] = useState(true);
-  const [loginProvider, setLoginProvider] = useState<'protocol' | 'redeem401'>('redeem401');
-  const [redeemBaseUrl, setRedeemBaseUrl] = useState('');
-  const [redeemTimeout, setRedeemTimeout] = useState('');
   useEffect(() => {
     if (settings) {
-      setTwofaTemplate(settings.twofa_fetch_template);
+      setRedeemBaseUrl(settings.redeem401_base_url || 'https://redeem.lazmeow.com');
+      setRedeemTimeout(String(settings.redeem401_timeout_minutes ?? 15));
       setMaxJobs(String(settings.max_concurrent_jobs));
       setTimeoutMin(String(settings.job_timeout_minutes));
       setFailThreshold(String(settings.proxy_fail_threshold));
       setStrictProxy(settings.strict_proxy !== false);
-      setLoginProvider(settings.login_provider_mode === 'protocol' ? 'protocol' : 'redeem401');
-      setRedeemBaseUrl(settings.redeem401_base_url || 'https://redeem.lazmeow.com');
-      setRedeemTimeout(String(settings.redeem401_timeout_minutes ?? 15));
     }
   }, [settings]);
 
   const saveSettings = useMutation({
     mutationFn: () =>
       settingsApi.update({
-        twofa_fetch_template: twofaTemplate,
+        redeem401_base_url: redeemBaseUrl,
+        redeem401_timeout_minutes: Number(redeemTimeout),
         max_concurrent_jobs: Number(maxJobs),
         job_timeout_minutes: Number(timeoutMin),
         proxy_fail_threshold: Number(failThreshold),
         strict_proxy: strictProxy,
-        login_provider_mode: loginProvider,
-        redeem401_base_url: redeemBaseUrl,
-        redeem401_timeout_minutes: Number(redeemTimeout),
       }),
     onSuccess: () => {
       toast.success('设置已保存');
-      queryClient.invalidateQueries({ queryKey: ['settings'] });
-    },
-    onError: (error) => toast.error(errorMessage(error)),
-  });
-
-  // 接码平台
-  const [smsTab, setSmsTab] = useState('custom');
-  const [lubanKey, setLubanKey] = useState('');
-  const [lubanService, setLubanService] = useState('');
-  const [smsbowerKey, setSmsbowerKey] = useState('');
-  const [smsbowerCountry, setSmsbowerCountry] = useState('');
-  const [customEntries, setCustomEntries] = useState('');
-  const saveSms = useMutation({
-    mutationFn: () => {
-      if (smsTab === 'custom') return settingsApi.saveSmsProvider({ id: 'custom', entries: customEntries, active: 'custom' });
-      if (smsTab === 'luban')
-        return settingsApi.saveSmsProvider({
-          id: 'luban',
-          api_key: lubanKey || undefined,
-          service_id: lubanService,
-          active: 'luban',
-        });
-      return settingsApi.saveSmsProvider({
-        id: 'smsbower',
-        api_key: smsbowerKey || undefined,
-        country: smsbowerCountry,
-        active: 'smsbower',
-      });
-    },
-    onSuccess: () => {
-      toast.success('接码平台配置已保存');
       queryClient.invalidateQueries({ queryKey: ['settings'] });
     },
     onError: (error) => toast.error(errorMessage(error)),
@@ -180,59 +141,31 @@ export function SettingsPage() {
 
       <Card>
         <CardHeader>
-          <CardTitle>邮箱取件与引擎参数</CardTitle>
+          <CardTitle>登录与引擎参数</CardTitle>
+          <CardDescription>
+            登录方式固定为 redeem401 远程登录：提交邮箱 → 服务端完成网页登录并自动收取验证码 → 导出授权文件，
+            本机不执行登录逻辑、不占用代理
+          </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="space-y-1.5">
             <Label>Outlook 取件方式</Label>
             <div className="text-sm">微软官方直连</div>
           </div>
-          <div className="space-y-1.5">
-            <Label>2FA 取码地址模板</Label>
-            <Input
-              value={twofaTemplate}
-              onChange={(e) => setTwofaTemplate(e.target.value)}
-              placeholder="https://2fa.show/2fa/{code}"
-            />
-            <p className="text-xs text-muted-foreground">
-              登录遇到两步验证时，按此地址获取 6 位验证码；{`{code}`} 会替换为账号的 2FA 取件码（也支持以 xxx 结尾），留空恢复默认
-            </p>
-          </div>
-          <div className="space-y-1.5">
-            <Label>登录方式</Label>
-            <Select value={loginProvider} onValueChange={(value) => setLoginProvider(value === 'protocol' ? 'protocol' : 'redeem401')}>
-              <SelectTrigger className="w-full md:w-[280px]">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectGroup>
-                  <SelectItem value="redeem401">redeem401 远程登录（401 处理服务）</SelectItem>
-                  <SelectItem value="protocol">本地协议登录（网页登录 + Codex OAuth）</SelectItem>
-                </SelectGroup>
-              </SelectContent>
-            </Select>
-            <p className="text-xs text-muted-foreground">
-              redeem401：把登录交给远程 401 处理服务（提交邮箱 → 服务端网页登录并自动收验证码 →
-              导出授权文件），不占用本机代理；本地协议登录：在本机完成完整登录流程，需要可用代理。刷新 /
-              2FA 设置任务始终走本地协议登录
-            </p>
-          </div>
-          {loginProvider === 'redeem401' && (
-            <div className="grid grid-cols-2 gap-4">
-              <div className="space-y-1.5">
-                <Label>redeem 服务地址</Label>
-                <Input
-                  value={redeemBaseUrl}
-                  onChange={(e) => setRedeemBaseUrl(e.target.value)}
-                  placeholder="https://redeem.lazmeow.com"
-                />
-              </div>
-              <div className="space-y-1.5">
-                <Label>远程登录超时（分钟）</Label>
-                <Input value={redeemTimeout} onChange={(e) => setRedeemTimeout(e.target.value)} />
-              </div>
+          <div className="grid grid-cols-2 gap-4">
+            <div className="space-y-1.5">
+              <Label>redeem 服务地址</Label>
+              <Input
+                value={redeemBaseUrl}
+                onChange={(e) => setRedeemBaseUrl(e.target.value)}
+                placeholder="https://redeem.lazmeow.com"
+              />
             </div>
-          )}
+            <div className="space-y-1.5">
+              <Label>远程登录超时（分钟）</Label>
+              <Input value={redeemTimeout} onChange={(e) => setRedeemTimeout(e.target.value)} />
+            </div>
+          </div>
           <div className="grid grid-cols-3 gap-4">
             <div className="space-y-1.5">
               <Label>最大并发任务数</Label>
@@ -252,8 +185,8 @@ export function SettingsPage() {
             <span className="space-y-1 text-sm">
               <span className="block font-medium">禁止无代理直连</span>
               <span className="block text-xs text-muted-foreground">
-                开启后，代理池无可用代理时登录/查余额任务直接失败，绝不以本机 IP
-                直连上游（服务器 IP 已被上游拉黑时必须开启，否则一登录就封号）
+                开启后，代理池无可用代理时余额查询任务直接失败，绝不以本机 IP
+                直连上游（服务器 IP 已被上游拉黑时必须开启）。远程登录不受此开关影响
               </span>
             </span>
           </label>
@@ -261,67 +194,6 @@ export function SettingsPage() {
             {saveSettings.isPending && <Loader2 className="animate-spin" />}
             <Save className="h-4 w-4" />
             保存设置
-          </Button>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>接码平台</CardTitle>
-          <CardDescription>
-            当前激活：{settings?.sms.active ?? 'custom'}；api_key 加密存储，保存后不回显
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <Tabs value={smsTab} onValueChange={setSmsTab}>
-            <TabsList>
-              <TabsTrigger value="custom">自定义号池</TabsTrigger>
-              <TabsTrigger value="luban">LubanSMS</TabsTrigger>
-              <TabsTrigger value="smsbower">SMSBower</TabsTrigger>
-            </TabsList>
-            <TabsContent value="custom" className="space-y-3 pt-3">
-              <div className="space-y-1.5">
-                <Label>手机号与接码 API（每行：+86xxx----https://…）</Label>
-                <Textarea
-                  value={customEntries}
-                  onChange={(e) => setCustomEntries(e.target.value)}
-                  placeholder={'+861871291167----https://example.com/messages/1871291167'}
-                  className="min-h-[120px] font-mono text-xs"
-                />
-              </div>
-            </TabsContent>
-            <TabsContent value="luban" className="space-y-3 pt-3">
-              <div className="space-y-1.5">
-                <Label>API Key{settings?.sms.providers.luban.configured ? '（已配置，留空不修改）' : ''}</Label>
-                <Input type="password" value={lubanKey} onChange={(e) => setLubanKey(e.target.value)} />
-              </div>
-              <div className="space-y-1.5">
-                <Label>供应商编号</Label>
-                <Input
-                  value={lubanService || settings?.sms.providers.luban.service_id || ''}
-                  onChange={(e) => setLubanService(e.target.value)}
-                  placeholder="例如 121949"
-                />
-              </div>
-            </TabsContent>
-            <TabsContent value="smsbower" className="space-y-3 pt-3">
-              <div className="space-y-1.5">
-                <Label>API Key{settings?.sms.providers.smsbower.configured ? '（已配置，留空不修改）' : ''}</Label>
-                <Input type="password" value={smsbowerKey} onChange={(e) => setSmsbowerKey(e.target.value)} />
-              </div>
-              <div className="space-y-1.5">
-                <Label>国家 ID</Label>
-                <Input
-                  value={smsbowerCountry || settings?.sms.providers.smsbower.country || ''}
-                  onChange={(e) => setSmsbowerCountry(e.target.value)}
-                  placeholder="例如 1001"
-                />
-              </div>
-            </TabsContent>
-          </Tabs>
-          <Button className="mt-4" onClick={() => saveSms.mutate()} disabled={saveSms.isPending}>
-            {saveSms.isPending && <Loader2 className="animate-spin" />}
-            保存并激活该平台
           </Button>
         </CardContent>
       </Card>

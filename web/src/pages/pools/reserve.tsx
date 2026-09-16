@@ -525,6 +525,7 @@ function MailStatusBadge({ account }: { account: ReserveAccount }) {
     );
   }
   if (account.mail_status === 'ok') return <Badge variant="success">正常</Badge>;
+  if (account.mail_status === 'skipped') return <Badge variant="muted">跳过</Badge>;
   if (account.mail_status === 'fetch_failed') {
     return (
       <Tooltip>

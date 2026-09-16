@@ -4,7 +4,7 @@ import { ChevronDown, ChevronRight, Download, ListChecks, Loader2, RotateCcw, Se
 import { toast } from 'sonner';
 import { jobsApi, proxiesApi } from '@/api';
 import { download, errorMessage } from '@/api/client';
-import { PROMPT_LABELS, STAGE_LABELS, isBannedJobError } from '@/api/types';
+import { STAGE_LABELS, isBannedJobError } from '@/api/types';
 import type { Job } from '@/api/types';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -23,9 +23,7 @@ import { formatDateTime, formatRelativeTime } from '@/lib/utils';
 
 const TYPE_LABELS: Record<string, string> = {
   login: '登录',
-  refresh: '刷新',
   balance: '余额',
-  totp_setup: '2FA',
 };
 
 const STATUS_TABS: Array<{ value: string; label: string }> = [
@@ -126,21 +124,13 @@ export function JobsPage() {
   });
 
   const items = useMemo(() => data?.items ?? [], [data]);
-  const stats = data?.stats ?? { queued: 0, running: 0, awaiting_input: 0 };
+  const stats = data?.stats ?? { queued: 0, running: 0, awaiting_input: 0 }; // awaiting_input 仅历史任务
 
   return (
     <div className="space-y-4">
       <ListToolbar>
         <ToolbarChip label="排队" count={stats.queued} variant="muted" active={statusTab === 'queued'} onClick={() => set({ status: statusTab === 'queued' ? '' : 'queued', page: 1 })} />
         <ToolbarChip label="进行中" count={stats.running} variant="info" active={statusTab === 'running'} onClick={() => set({ status: statusTab === 'running' ? '' : 'running', page: 1 })} />
-        <ToolbarChip
-          label="待输入"
-          count={stats.awaiting_input}
-          variant="warning"
-          active={statusTab === 'awaiting_input'}
-          onClick={() => set({ status: statusTab === 'awaiting_input' ? '' : 'awaiting_input', page: 1 })}
-        />
-
         <ToolbarSpacer />
 
         <ToolbarSearch value={search.value} onChange={search.setValue} placeholder="搜索邮箱…" className="w-52" />
@@ -151,9 +141,7 @@ export function JobsPage() {
           className="w-[124px]"
           options={[
             { value: 'login', label: '登录' },
-            { value: 'refresh', label: '刷新' },
             { value: 'balance', label: '余额' },
-            { value: 'totp_setup', label: '2FA' },
           ]}
         />
         <Button variant="ghost" size="sm" onClick={reset} disabled={!hasActiveFilters}>
@@ -308,48 +296,9 @@ function JobRow({
     staleTime: 60_000,
   });
 
-  const [inputValue, setInputValue] = useState('');
-  // 草稿：误关展开/切页后不用重新输入验证码
-  const draftKey = `tosub2-job-input-${job.id}`;
-
-  useEffect(() => {
-    if (!expanded) return;
-    try {
-      const saved = localStorage.getItem(draftKey);
-      if (saved) setInputValue(saved);
-    } catch {
-      /* 忽略 */
-    }
-  }, [expanded, draftKey]);
-
-  const inputMutation = useMutation({
-    mutationFn: ({ action, value }: { action: string; value?: string }) => jobsApi.input(job.id, action, value),
-    onSuccess: (_, variables) => {
-      toast.success(variables.action === 'input' ? '输入已提交' : '指令已发送');
-      setInputValue('');
-      try {
-        localStorage.removeItem(draftKey);
-      } catch {
-        /* 忽略 */
-      }
-      queryClient.invalidateQueries({ queryKey: ['jobs'] });
-    },
-    onError: (error) => toast.error(errorMessage(error)),
-  });
-
-  const isOtp = job.prompt_kind?.includes('otp') ?? false;
-  const submitInput = () => {
-    const value = inputValue.trim();
-    if (!value) return;
-    inputMutation.mutate({ action: 'input', value });
-  };
-
-  const awaiting = job.status === 'awaiting_input';
-  const needsInput = awaiting && Boolean(job.prompt_kind);
-
   return (
     <>
-      <TableRow data-state={awaiting ? 'selected' : undefined} className={awaiting ? 'bg-[var(--warning)]/5' : undefined}>
+      <TableRow>
         <TableCell>
           <button
             type="button"
@@ -365,7 +314,6 @@ function JobRow({
         <TableCell className="text-xs">{TYPE_LABELS[job.type] ?? job.type}</TableCell>
         <TableCell>
           <div className="flex items-center gap-1.5">
-            {awaiting && <span className="size-1.5 animate-pulse rounded-full bg-[var(--warning)]" aria-hidden />}
             <StatusBadge domain="job" value={job.status} />
             {job.status === 'failed' && isBannedJobError(job.error ?? job.error_summary) ? (
               <Badge variant="danger">账号封禁/停用</Badge>
@@ -412,45 +360,6 @@ function JobRow({
                 <div className="rounded-md bg-destructive/10 p-3 text-sm text-destructive">
                   错误：{detail.data?.error ?? job.error_summary}
                   {!detail.data && detail.isLoading && <span className="ml-1 text-muted-foreground">（加载完整错误…）</span>}
-                </div>
-              )}
-
-              {needsInput && (
-                <div className="flex flex-wrap items-center gap-2 rounded-md border border-[var(--warning)]/40 bg-card p-3">
-                  <span className="text-sm font-medium">{PROMPT_LABELS[job.prompt_kind!] ?? job.prompt_kind}：</span>
-                  <Input
-                    value={inputValue}
-                    onChange={(event) => {
-                      const next = isOtp ? event.target.value.replace(/\D/g, '').slice(0, 6) : event.target.value;
-                      setInputValue(next);
-                      try {
-                        localStorage.setItem(draftKey, next);
-                      } catch {
-                        /* 忽略 */
-                      }
-                      // 6 位验证码自动提交：少一次点击
-                      if (isOtp && next.length === 6) inputMutation.mutate({ action: 'input', value: next });
-                    }}
-                    inputMode={isOtp ? 'numeric' : undefined}
-                    maxLength={isOtp ? 6 : undefined}
-                    placeholder={isOtp ? '6 位验证码' : job.prompt_kind === 'phone' ? '+8613800000000' : '输入内容'}
-                    className="w-56 font-mono"
-                    onKeyDown={(event) => {
-                      if (event.key === 'Enter') submitInput();
-                    }}
-                  />
-                  <Button size="sm" onClick={submitInput} disabled={inputMutation.isPending || !inputValue.trim()}>
-                    {inputMutation.isPending ? <Loader2 className="animate-spin" /> : <Send />}
-                    提交
-                  </Button>
-                  {(job.prompt_kind === 'email_otp' || job.prompt_kind === 'phone_otp') && (
-                    <Button size="sm" variant="outline" onClick={() => inputMutation.mutate({ action: 'resend' })}>
-                      重发验证码
-                    </Button>
-                  )}
-                  <Button size="sm" variant="ghost" className="text-destructive" onClick={() => inputMutation.mutate({ action: 'quit' })}>
-                    放弃
-                  </Button>
                 </div>
               )}
 

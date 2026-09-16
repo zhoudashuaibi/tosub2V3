@@ -17,7 +17,7 @@ const EMAIL = 'engine-redeem@test.local';
 
 function setup() {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tosub2-redeem-engine-'));
-  for (const sub of ['logs', 'results', 'checkpoints']) fs.mkdirSync(path.join(dataDir, sub), { recursive: true });
+  for (const sub of ['logs', 'results']) fs.mkdirSync(path.join(dataDir, sub), { recursive: true });
   const db = openDatabase(dataDir, { logger });
   const crypto = createCrypto({ dataDir, secretKeyEnv: 'test-secret', logger });
   const settings = createSettingsService(db, crypto, { logger });
@@ -167,7 +167,7 @@ test('redeem401 引擎全链路：strict_proxy 开启仍可登录 → completed 
   process.env.REDEEM401_POLL_INTERVAL_MS = '50';
   const mock = createRedeemMock({ email: EMAIL });
   const baseUrl = await mock.ready;
-  settings.set('login.provider', { ...settings.get('login.provider'), redeem401_base_url: baseUrl });
+  settings.set('login.redeem401', { ...settings.get('login.redeem401'), base_url: baseUrl });
   try {
     const engine = createJobsEngine({ config, db, logger });
     engine.hooks.onTokensSaved = (job, runtime, tokens) => {
@@ -206,23 +206,6 @@ test('redeem401 引擎全链路：strict_proxy 开启仍可登录 → completed 
   } finally {
     delete process.env.REDEEM401_POLL_INTERVAL_MS;
     mock.server.close();
-    db.close();
-    cleanupDir(dataDir);
-  }
-});
-
-test('mode=protocol 时登录任务不受 redeem 开关影响：无代理 + strict_proxy → NO_ALIVE_PROXY', async () => {
-  const { dataDir, db, settings, config } = setup();
-  settings.set('login.provider', { ...settings.get('login.provider'), mode: 'protocol' });
-  try {
-    const engine = createJobsEngine({ config, db, logger });
-    const accountId = createAccount(db);
-    engine.start();
-    const job = engine.submitJob({ accountId, type: 'login' });
-    const row = await waitFor(db, job.id, 'failed', 5000);
-    assert.match(row.error, /无可用代理/);
-    await engine.shutdown();
-  } finally {
     db.close();
     cleanupDir(dataDir);
   }

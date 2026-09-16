@@ -3,7 +3,6 @@ import { LogOut, Moon, RefreshCw, Sun } from 'lucide-react';
 import { toast } from 'sonner';
 import { authApi } from '@/api';
 import { errorMessage } from '@/api/client';
-import { AwaitingInputAlert } from '@/components/awaiting-input-alert';
 import { Button } from '@/components/ui/button';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useUiStore } from '@/stores/ui';
@@ -40,7 +39,6 @@ export function Header({ title }: { title: string }) {
         </div>
 
         <div className="flex items-center gap-1">
-          <AwaitingInputAlert />
           <Tooltip>
             <TooltipTrigger asChild>
               <Button

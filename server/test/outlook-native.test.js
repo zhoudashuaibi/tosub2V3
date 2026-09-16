@@ -3,9 +3,8 @@ import assert from 'node:assert/strict';
 import Fastify from 'fastify';
 import {
   OUTLOOK_TOKEN_URL, OUTLOOK_MESSAGES_URL, OUTLOOK_SCOPE,
-  fetchOutlookMessages, fetchOutlookOtpCandidates, fetchReserveAccountMessages,
+  fetchOutlookMessages, fetchReserveAccountMessages,
 } from '../core/outlook-mail.mjs';
-import { createAutoInput } from '../modules/jobs/auto-input.js';
 import { createSettingsModule } from '../modules/settings/index.js';
 import { DEFAULT_SETTINGS } from '../lib/settings.js';
 import { registerErrorHandler } from '../lib/http-errors.js';
@@ -59,20 +58,6 @@ test('原生取件：仅请求微软，密码和旧中转地址不发送，邮�
     from: { emailAddress: { name: 'OpenAI', address: 'noreply@openai.com' } },
     body: { content: message.Body.Content, contentType: 'html' },
   });
-});
-
-test('原生验证码：保留发件人过滤、时间过滤和最近 5 封限制', async () => {
-  const { calls, fetchImpl } = nativeFetch([
-    nativeMessage('111111', '2026-09-09T09:00:00Z'),
-    nativeMessage('222222', '2026-09-09T11:00:00Z', 'other@example.test'),
-    nativeMessage('333333', '2026-09-09T11:00:00Z'),
-  ]);
-  const result = await fetchOutlookOtpCandidates(credentials, {
-    fetchImpl, baselineTime: Date.parse('2026-09-09T10:00:00Z'),
-  });
-  assert.ok(result.length > 0);
-  assert.deepEqual([...new Set(result.map((item) => item.code))], ['333333']);
-  assert.equal(new URL(calls[1].url).searchParams.get('$top'), '5');
 });
 
 test('原生取件：数量限制和空邮箱正常返回', async () => {
@@ -130,19 +115,6 @@ test('原生取件：超时覆盖授权请求及邮件请求', async () => {
       return new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
     } }), failStage === 'token' ? /微软授权请求超时/ : /Outlook 邮件读取请求超时/);
   }
-});
-
-test('登录自动收码：使用官方邮件，重复验证码不再次提交', async (t) => {
-  const { fetchImpl } = nativeFetch([nativeMessage('345678', new Date().toISOString())]);
-  t.mock.method(globalThis, 'fetch', fetchImpl);
-  const autoInput = createAutoInput({ config: { settingsGet: () => assert.fail('不应读取中转配置') } });
-  const account = { email: credentials.email, credentials: { outlook: {
-    client_id: credentials.clientId, refresh_token: credentials.refreshToken,
-  } } };
-  const first = await autoInput.attempt({ id: 'job' }, account, { kind: 'email_otp' });
-  assert.equal(first.submit.value, '345678');
-  const second = await autoInput.attempt({ id: 'job' }, account, { kind: 'email_otp' });
-  assert.ok(second.defer > 0);
 });
 
 test('设置：旧中转配置不再暴露或修改，其他参数仍可保存', async (t) => {

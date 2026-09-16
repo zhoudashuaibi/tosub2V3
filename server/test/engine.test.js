@@ -14,15 +14,11 @@ const logger = createLogger('silent');
 
 function setup() {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tosub2-engine-'));
-  for (const sub of ['logs', 'results', 'checkpoints']) fs.mkdirSync(path.join(dataDir, sub), { recursive: true });
+  for (const sub of ['logs', 'results']) fs.mkdirSync(path.join(dataDir, sub), { recursive: true });
   const db = openDatabase(dataDir, { logger });
   const crypto = createCrypto({ dataDir, secretKeyEnv: 'test-secret', logger });
   const settings = createSettingsService(db, crypto, { logger });
   settings.ensureDefaults();
-  // 引擎流程测试沿用无代理直连；strict_proxy 拦截行为由专门用例覆盖
-  settings.set('engine.config', { ...settings.get('engine.config'), strict_proxy: false });
-  // 本文件测本地协议登录流程；redeem401 远程登录路径由 redeem401-engine.test.js 覆盖
-  settings.set('login.provider', { ...settings.get('login.provider'), mode: 'protocol' });
   const config = {
     dataDir,
     serverRoot: path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..'),
@@ -42,7 +38,20 @@ function writeScript(dataDir, events) {
   return scriptPath;
 }
 
-function createAccount(db, { email = 'mock@test.local', credentials = null } = {}) {
+function useMockLogin(dataDir, events) {
+  process.env.TOSUB2_REDEEM_SCRIPT = path.resolve('test/mock-login-child.mjs');
+  process.env.TOSUB2_MOCK_RESULT_PATH = '1';
+  process.env.TOSUB2_MOCK_SCRIPT = writeScript(dataDir, events);
+}
+
+function clearMockLogin() {
+  delete process.env.TOSUB2_REDEEM_SCRIPT;
+  delete process.env.TOSUB2_MOCK_SCRIPT;
+  delete process.env.TOSUB2_MOCK_RESULT_PATH;
+  delete process.env.TOSUB2_MOCK_EMAIL;
+}
+
+function createAccount(db, { email = 'mock@test.local' } = {}) {
   const now = new Date().toISOString();
   const result = db
     .prepare(
@@ -63,20 +72,21 @@ async function waitFor(db, jobId, status, timeoutMs = 20000) {
   }
 }
 
-test('引擎全链路：login 任务 → 人工输入（错→对）→ completed → 移入主号池 + tokens 入库', async () => {
+test('引擎全链路：login 任务（redeem401）→ completed → 移入主号池 + tokens 入库', async () => {
   const { dataDir, db, crypto, config, pools } = setup();
-  process.env.TOSUB2_PROTOCOL_SCRIPT = path.resolve('test/mock-protocol-login.mjs');
-  process.env.TOSUB2_MOCK_RESULT_PATH = '1';
+  useMockLogin(dataDir, [
+    { type: 'stage', stage: 'web_login' },
+    { type: 'log', message: '正在网页登录' },
+    { type: 'stage', stage: 'email_otp' },
+    { type: 'stage', stage: 'finalizing' },
+  ]);
   try {
     const resultPath = path.join(dataDir, 'results', 'will-be-set-by-event.json');
-    const scriptPath = writeScript(dataDir, [
-      { type: 'stage', stage: 'web_login' },
-      { type: 'stage', stage: 'email_otp' },
-      { type: 'input_required', kind: 'email_otp', detail: '请输入验证码', can_resend: true, expect: '123456', path: resultPath },
-      { type: 'stage', stage: 'oauth' },
-      { type: 'result_saved', path: resultPath, account: { email: 'mock@test.local' } },
-    ]);
-    process.env.TOSUB2_MOCK_SCRIPT = scriptPath;
+    // mock 按 result_saved 事件携带的 path 写产物
+    const scriptPath = process.env.TOSUB2_MOCK_SCRIPT;
+    const script = JSON.parse(fs.readFileSync(scriptPath, 'utf8'));
+    script.events.push({ type: 'result_saved', path: resultPath, account: { email: 'mock@test.local' } });
+    fs.writeFileSync(scriptPath, JSON.stringify(script));
 
     const engine = createJobsEngine({ config, db, logger });
     // accounts 模块的引擎回调（与生产装配一致）
@@ -96,20 +106,9 @@ test('引擎全链路：login 任务 → 人工输入（错→对）→ complete
     engine.start();
     const job = engine.submitJob({ accountId, type: 'login' });
 
-    // 无自动输入源 → awaiting_input
-    await waitFor(db, job.id, 'awaiting_input');
-    let row = db.prepare('SELECT * FROM jobs WHERE id = ?').get(job.id);
-    assert.equal(row.prompt_kind, 'email_otp');
-
-    // 输错一次 → mock 重新要求输入（仍 awaiting_input）
-    await engine.submitInput(job.id, 'input', '999999');
-    await new Promise((r) => setTimeout(r, 600));
-    row = db.prepare('SELECT * FROM jobs WHERE id = ?').get(job.id);
-    assert.equal(row.status, 'awaiting_input', '输错后应回到待输入');
-
-    // 输对 → completed
-    await engine.submitInput(job.id, 'input', '123456');
     await waitFor(db, job.id, 'completed');
+    const row = db.prepare('SELECT * FROM jobs WHERE id = ?').get(job.id);
+    assert.equal(row.stage, 'finalizing');
 
     // 账号移入主号池 + tokens 密文入库
     const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(accountId);
@@ -119,14 +118,45 @@ test('引擎全链路：login 任务 → 人工输入（错→对）→ complete
     assert.equal(tokens.access_token, 'mock-access-token');
     assert.equal(tokens.refresh_token, 'mock-refresh-token');
 
-    // 日志文件已落盘
-    assert.ok(fs.existsSync(path.resolve(dataDir, row.log_path)));
+    // 日志文件已落盘且标注 redeem401
+    const logText = fs.readFileSync(path.resolve(dataDir, row.log_path), 'utf8');
+    assert.match(logText, /provider=redeem401/);
 
     await engine.shutdown();
   } finally {
-    delete process.env.TOSUB2_PROTOCOL_SCRIPT;
-    delete process.env.TOSUB2_MOCK_SCRIPT;
-    delete process.env.TOSUB2_MOCK_RESULT_PATH;
+    clearMockLogin();
+    db.close();
+    cleanupDir(dataDir);
+  }
+});
+
+test('失败路径：error 事件 → failed + 账号回滚 joining', async () => {
+  const { dataDir, db, config, pools } = setup();
+  useMockLogin(dataDir, [
+    { type: 'stage', stage: 'web_login' },
+    { type: 'error', code: 'REDEEM401_FAILED', message: '账号已停用或删除 (account_deactivated)', fatal: true },
+  ]);
+  try {
+    const engine = createJobsEngine({ config, db, logger });
+    engine.hooks.onLoginFinished = (job, account, { ok, canceled }) => {
+      if (!ok && canceled) return;
+      if (!ok) pools.joinFailed(job.account_id, { error: '登录失败' });
+    };
+
+    const accountId = createAccount(db, { email: 'fail@test.local' });
+    process.env.TOSUB2_MOCK_EMAIL = 'fail@test.local';
+    engine.start();
+    const job = engine.submitJob({ accountId, type: 'login' });
+    const row = await waitFor(db, job.id, 'failed');
+
+    // 封禁类失败被识别为永久失败：错误带前缀，账号标记 auto_repair_blocked
+    assert.match(row.error, /【账号已停用\/封禁】/);
+    const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(accountId);
+    assert.equal(account.auto_repair_blocked, 1);
+
+    await engine.shutdown();
+  } finally {
+    clearMockLogin();
     db.close();
     cleanupDir(dataDir);
   }
@@ -134,10 +164,8 @@ test('引擎全链路：login 任务 → 人工输入（错→对）→ complete
 
 test('取消进行中任务 → canceled', async () => {
   const { dataDir, db, config } = setup();
-  process.env.TOSUB2_PROTOCOL_SCRIPT = path.resolve('test/mock-protocol-login.mjs');
+  useMockLogin(dataDir, [{ type: '__sleep', ms: 15000 }]);
   try {
-    const scriptPath = writeScript(dataDir, [{ type: '__sleep', ms: 15000 }]);
-    process.env.TOSUB2_MOCK_SCRIPT = scriptPath;
     const engine = createJobsEngine({ config, db, logger });
     const accountId = createAccount(db);
     engine.start();
@@ -147,8 +175,7 @@ test('取消进行中任务 → canceled', async () => {
     assert.equal(canceled.status, 'canceled');
     await engine.shutdown();
   } finally {
-    delete process.env.TOSUB2_PROTOCOL_SCRIPT;
-    delete process.env.TOSUB2_MOCK_SCRIPT;
+    clearMockLogin();
     db.close();
     cleanupDir(dataDir);
   }
@@ -174,39 +201,7 @@ test('重启恢复：running 任务回 queued（attempt 保留）', async () => 
   }
 });
 
-test('strict_proxy 开启：无可用代理时登录任务不 spawn 直接失败', async () => {
-  const { dataDir, db, config, settings, pools } = setup();
-  settings.set('engine.config', { ...settings.get('engine.config'), strict_proxy: true });
-  try {
-    const engine = createJobsEngine({ config, db, logger });
-    const finished = [];
-    engine.hooks.onLoginFinished = (job, account, payload) => {
-      finished.push(payload);
-      if (!payload.ok) pools.joinFailed(job.account_id, { error: payload.message });
-    };
-
-    const accountId = createAccount(db);
-    engine.start();
-    const job = engine.submitJob({ accountId, type: 'login' });
-    const row = await waitFor(db, job.id, 'failed', 5000);
-
-    assert.match(row.error, /无可用代理/);
-    assert.ok(row.finished_at, '任务应有完成时间');
-    assert.equal(finished.length, 1);
-    assert.equal(finished[0].ok, false);
-    assert.equal(finished[0].code, 'NO_ALIVE_PROXY');
-    // 账号状态机按登录失败流转（reserve joining → mail_failed）
-    const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(accountId);
-    assert.equal(account.status, 'mail_failed');
-
-    await engine.shutdown();
-  } finally {
-    db.close();
-    cleanupDir(dataDir);
-  }
-});
-
-test('strict_proxy 开启：无可用代理时余额任务失败并记录 balance_error', async () => {
+test('strict_proxy 开启：无可用代理时余额任务失败并记录 balance_error（login 不受影响）', async () => {
   const { dataDir, db, crypto, config, settings } = setup();
   settings.set('engine.config', { ...settings.get('engine.config'), strict_proxy: true });
   try {

@@ -13,16 +13,13 @@ import {
   UsersRound,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
-import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Separator } from '@/components/ui/separator';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { cn } from '@/lib/utils';
 import { useUiStore } from '@/stores/ui';
-import { useLiveList } from '@/hooks/use-live-list';
 import { hotkeyHint, navSections } from '@/lib/nav';
-import { jobsApi } from '@/api';
 
 /** 路由 → 图标。nav.ts 保持纯数据（无 React 依赖），图标映射放在这里。 */
 const ICONS: Record<string, LucideIcon> = {
@@ -40,14 +37,6 @@ const ICONS: Record<string, LucideIcon> = {
 export function Sidebar() {
   const { sidebarCollapsed, toggleSidebar } = useUiStore();
   const matchRoute = useMatchRoute();
-  // 待输入角标：轻量计数接口（不拉任务行）
-  const { data: jobStats } = useLiveList({
-    queryKey: ['jobs', 'awaiting-stats'],
-    queryFn: () => jobsApi.stats(),
-    interval: 10_000,
-  });
-  const awaiting = jobStats?.stats.awaiting_input ?? 0;
-
   return (
     <aside
       className={cn(
@@ -78,7 +67,6 @@ export function Sidebar() {
                 const active = matchRoute({ to: item.to, fuzzy: !item.exact });
                 const Icon = ICONS[item.to] ?? Globe;
                 const hint = hotkeyHint(item.to);
-                const showBadge = item.badge === 'awaiting' && awaiting > 0;
 
                 const link = (
                   <Link
@@ -93,12 +81,7 @@ export function Sidebar() {
                   >
                     <Icon className="size-4 shrink-0" />
                     {!sidebarCollapsed && <span className="truncate">{item.label}</span>}
-                    {!sidebarCollapsed && showBadge && (
-                      <Badge variant="warning" className="tabular-nums ml-auto px-1.5">
-                        {awaiting}
-                      </Badge>
-                    )}
-                    {!sidebarCollapsed && !showBadge && hint && (
+                    {!sidebarCollapsed && hint && (
                       <kbd className="ml-auto hidden text-[10px] text-sidebar-foreground/40 group-hover:inline">{hint}</kbd>
                     )}
                   </Link>

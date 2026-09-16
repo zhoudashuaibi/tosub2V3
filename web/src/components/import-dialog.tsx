@@ -176,49 +176,6 @@ function ImportResultView({ result }: { result: ImportResult | ProxyImportResult
           <span>已收编进主号池（关联远端账号，不重新登录）：{joinEmails(result.adopted_remote ?? [])}</span>
         </div>
       )}
-      {isAccountResult(result) && result.twofa_bound ? (
-        <div className="flex items-start gap-2 text-[var(--info)]">
-          <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
-          <span>已绑定 2FA 取件码 {result.twofa_bound} 条</span>
-        </div>
-      ) : null}
-      {isAccountResult(result) && (result.twofa_unmatched?.length ?? 0) > 0 && (
-        <div className="flex items-start gap-2 text-[var(--warning)]">
-          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-          <span>2FA 取件码未匹配到账号：{joinEmails(result.twofa_unmatched ?? [])}</span>
-        </div>
-      )}
-      {isAccountResult(result) && (result.twofa_invalid_lines?.length ?? 0) > 0 && (
-        <div className="flex items-start gap-2 text-destructive">
-          <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
-          <div className="space-y-1">
-            {(result.twofa_invalid_lines ?? []).slice(0, 8).map((line) => (
-              <div key={line.line}>
-                2FA 第 {line.line} 行：{line.reason}
-              </div>
-            ))}
-            {(result.twofa_invalid_lines?.length ?? 0) > 8 && <div>…共 {result.twofa_invalid_lines?.length} 行非法</div>}
-          </div>
-        </div>
-      )}
-      {isAccountResult(result) && result.passwords_error && (
-        <div className="flex items-start gap-2 text-destructive">
-          <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
-          <span>密码文件解析失败：{result.passwords_error}</span>
-        </div>
-      )}
-      {isAccountResult(result) && result.passwords_bound ? (
-        <div className="flex items-start gap-2 text-[var(--info)]">
-          <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
-          <span>已绑定 ChatGPT 密码 {result.passwords_bound} 条</span>
-        </div>
-      ) : null}
-      {isAccountResult(result) && (result.passwords_unmatched?.length ?? 0) > 0 && (
-        <div className="flex items-start gap-2 text-[var(--warning)]">
-          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-          <span>ChatGPT 密码未匹配到账号：{joinEmails(result.passwords_unmatched ?? [])}</span>
-        </div>
-      )}
       {!isAccountResult(result) && result.duplicates.length > 0 && (
         <div className="flex items-start gap-2 text-muted-foreground">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />

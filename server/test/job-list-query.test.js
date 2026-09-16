@@ -93,7 +93,6 @@ async function setup(t, { rows = 5 } = {}) {
   app.decorate('config', { dataDir: process.cwd() });
   registerErrorHandler(app);
   await createJobsModule({ engine: {
-    submitInput: async () => ({ ok: true }),
     cancel: async () => {
       throw new Error('not used');
     },

@@ -4,7 +4,6 @@ export type Pool = 'reserve' | 'main' | 'discard';
 export type JobStatus = 'queued' | 'running' | 'awaiting_input' | 'completed' | 'failed' | 'canceled';
 export type JobType = 'login' | 'refresh' | 'balance' | 'totp_setup';
 export type ProxyStatus = 'unknown' | 'alive' | 'cf_challenge' | 'dead' | 'testing';
-export type PromptKind = 'password' | 'email_otp' | 'mfa_otp' | 'totp_setup_otp' | 'phone' | 'phone_otp';
 
 export interface ApiErrorBody {
   error: { code: string; message: string; [k: string]: unknown };
@@ -57,7 +56,7 @@ export interface ReserveAccount {
   has_balance: boolean;
   banned: boolean;
   banned_reason: string | null;
-  mail_status: 'pending' | 'checking' | 'ok' | 'fetch_failed' | null;
+  mail_status: 'pending' | 'checking' | 'ok' | 'skipped' | 'fetch_failed' | null;
   mail_error: string | null;
   imported_at: string | null;
   last_checked_at: string | null;
@@ -214,12 +213,6 @@ export interface ImportResult {
   /** adopt_remote 收编进主号池的远端账号（直接关联远端，不重新登录） */
   adopted_remote?: string[];
   invalid_lines: { line: number; reason: string }[];
-  twofa_bound?: number;
-  twofa_unmatched?: string[];
-  twofa_invalid_lines?: { line: number; reason: string }[];
-  passwords_bound?: number;
-  passwords_unmatched?: string[];
-  passwords_error?: string | null;
 }
 
 export interface ProxyImportResult {
@@ -235,7 +228,6 @@ export interface Job {
   type: JobType;
   status: JobStatus;
   stage: string | null;
-  prompt_kind: PromptKind | null;
   attempt: number;
   proxy_id: number | null;
   proxy_display: string | null;
@@ -540,24 +532,14 @@ export interface TeamConfigView {
 }
 
 export interface SettingsView {
-  login_provider_mode: 'protocol' | 'redeem401';
   redeem401_base_url: string;
   redeem401_timeout_minutes: number;
   outlook_fetch_mode: 'microsoft_direct';
-  twofa_fetch_template: string;
   max_concurrent_jobs: number;
   job_timeout_minutes: number;
   proxy_fail_threshold: number;
   strict_proxy: boolean;
   join_auto_upload: boolean;
-  sms: {
-    active: string;
-    providers: {
-      luban: { configured: boolean; service_id: string };
-      smsbower: { configured: boolean; country: string; country_label: string };
-      custom: { configured: boolean; count: number };
-    };
-  };
 }
 
 /** 废弃池的 reason → 中文文案（与主池预估余额的未知原因词表同源） */
@@ -581,15 +563,6 @@ export const STAGE_LABELS: Record<string, string> = {
   workspace: '选择工作区',
   finalizing: '生成导入文件',
   refreshing: '刷新令牌',
-};
-
-export const PROMPT_LABELS: Record<string, string> = {
-  password: '登录密码',
-  email_otp: '邮箱验证码',
-  mfa_otp: '两步验证码',
-  totp_setup_otp: '2FA 设置验证码',
-  phone: '手机号',
-  phone_otp: '短信验证码',
 };
 
 /** 与服务端永久失败判定保持一致（含中文封禁文案），用于失败任务的封禁标注。 */

@@ -88,7 +88,7 @@ function createReserveAccount(db, email, status = 'joining') {
 }
 
 function mockSleepingJob(dataDir, ms = 30000) {
-  process.env.TOSUB2_PROTOCOL_SCRIPT = path.resolve('test/mock-protocol-login.mjs');
+  process.env.TOSUB2_REDEEM_SCRIPT = path.resolve('test/mock-login-child.mjs');
   const scriptPath = path.join(dataDir, `script-sleep-${Date.now()}.json`);
   fs.writeFileSync(scriptPath, JSON.stringify({ events: [{ type: '__sleep', ms }] }));
   process.env.TOSUB2_MOCK_SCRIPT = scriptPath;
@@ -96,7 +96,7 @@ function mockSleepingJob(dataDir, ms = 30000) {
 }
 
 function cleanup({ db, dataDir }) {
-  delete process.env.TOSUB2_PROTOCOL_SCRIPT;
+  delete process.env.TOSUB2_REDEEM_SCRIPT;
   delete process.env.TOSUB2_MOCK_SCRIPT;
   db.close();
   for (let i = 0; i < 10; i += 1) {
