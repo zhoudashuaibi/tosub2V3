@@ -256,7 +256,7 @@ export function ReservePoolPage() {
         isLoading={isLoading}
         emptyIcon={Inbox}
         emptyTitle="备用号池为空"
-        emptyDescription="支持四段式、六段式或账号导出 JSON；六段式可同时导入邮箱凭据、ChatGPT 密码和 2FA 密钥"
+        emptyDescription="导入 sub2api 账号导出 JSON（notes 含邮箱四段信息、ChatGPT 密码、两步验证），系统将自动补全凭据并初始化余额与封禁状态"
         emptyActionLabel="导入第一批账号"
         onEmptyAction={() => setImportOpen(true)}
         filtersActive={hasActiveFilters}
@@ -426,12 +426,8 @@ export function ReservePoolPage() {
         open={importOpen}
         onOpenChange={setImportOpen}
         title="导入账号"
-        description="支持四段式、六段式（每行一个账号）或 sub2api / tosubV2 导出 JSON。六段式最后两段依次为 ChatGPT 密码、2FA 密钥（Base32）"
+        description="导入 sub2api 账号导出 JSON：邮箱四段信息、ChatGPT 密码、两步验证密钥一次性补全，全部进入备用号池"
         placeholder={[
-          '六段式：邮箱----邮箱密码----clientId----refreshToken----ChatGPT密码----2FA密钥',
-          '四段式：邮箱----邮箱密码----clientId----refreshToken',
-          '每行一个账号，可混用四段 / 六段，支持 # 注释行。字段含 ---- 时请使用 JSON。',
-          '',
           'sub2api 账号导出 JSON（accounts[].notes 携带全部凭据）：',
           '{ "accounts": [{ "name": "a@b.com----…----GPT密码",',
           '    "notes": "{\\"mailbox\\":{\\"password\\":\\"邮箱密码\\",\\"client_id\\":\\"…\\",\\"refresh_token\\":\\"…\\"},',
@@ -441,7 +437,7 @@ export function ReservePoolPage() {
           'notes.mailbox → 邮箱----密码----clientId----refreshToken（四段）',
           'notes.gpt.password → ChatGPT 登录密码（勿与邮箱密码混淆）',
           'notes.two_factor.enabled + secret → 两步验证',
-          'JSON 带 OAuth tokens 的账号直接进入主号池，其余进入备用号池',
+          'credentials 里的 OAuth tokens 忽略：加入主号池走本系统登录授权',
         ].join('\n')}
         initialText={lastImportText}
         result={importResult}

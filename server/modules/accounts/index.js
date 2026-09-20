@@ -866,12 +866,12 @@ export function createAccountsModule({ engine, logger }) {
               }
               if (existing.pool === 'main') {
                 duplicatesInMain.push(entry.email);
-                // 重复账号不重新导入，但 2FA 密钥 / 取件码 / ChatGPT 密码仍补全
+                // 重复账号不重新导入，但 2FA 取件码 / ChatGPT 密码仍写入，供后续重新授权/自动修复使用
                 const patch = {};
                 if (entry.pickupCode) patch.totp_pickup_code = entry.pickupCode;
-                if (entry.totpSecret) patch.totp_secret = entry.totpSecret;
                 if (entry.chatgptPassword) patch.password = entry.chatgptPassword;
-                if (Object.keys(patch).length) mergeCredentials(existing.id, patch);
+                if (Object.keys(patch).length && mergeCredentials(existing.id, patch)) {
+                }
                 continue;
               }
               if (existing.pool === 'discard') {
