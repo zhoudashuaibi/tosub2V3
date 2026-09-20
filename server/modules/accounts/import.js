@@ -1,8 +1,9 @@
 import crypto from 'node:crypto';
 
 /**
- * 备用号池导入：四段格式解析（邮箱----密码----clientId----refreshToken）+ 校验。
- * 与 v1 parseOutlookEntries 语义一致，但逐行返回结果（不因单行失败中断）。
+ * 备用号池导入：四段格式（邮箱----邮箱密码----clientId----refreshToken），
+ * 或六段格式（四段后追加 ----ChatGPT密码----2FA密钥）。
+ * 逐行返回结果，不因单行失败中断。
  * allowBareEmail（redeem401 远程登录模式恒开）：允许整行只有一个邮箱——
  * 登录由远端服务完成，本地无需任何凭据。
  */
@@ -36,12 +37,21 @@ export function parseImportLines(text, { allowBareEmail = false } = {}) {
       return;
     }
     if (parts.length < 4) {
-      results.push({ line: lineNo, ok: false, reason: '格式错误，需要 4 段：邮箱----密码----clientId----refreshToken（或整行仅一个邮箱）' });
+      const bareEmailHint = allowBareEmail ? '（或整行仅一个邮箱）' : '';
+      results.push({
+        line: lineNo,
+        ok: false,
+        reason: `格式错误，需要 4 段：邮箱----邮箱密码----clientId----refreshToken；或 6 段：邮箱----邮箱密码----clientId----refreshToken----ChatGPT密码----2FA密钥${bareEmailHint}`,
+      });
       return;
     }
     const password = parts[1].trim();
     const clientId = parts[2].trim();
-    const refreshToken = parts.slice(3).join('----').trim();
+    // 六段式从末尾取登录凭据，保留 refreshToken 内的分隔符。
+    const hasLoginCredentials = parts.length >= 6;
+    const refreshToken = parts.slice(3, hasLoginCredentials ? -2 : undefined).join('----').trim();
+    const chatgptPassword = hasLoginCredentials ? parts.at(-2).trim() : '';
+    const totpSecret = hasLoginCredentials ? parts.at(-1).toUpperCase().replace(/[\s=]/g, '') : '';
 
     if (!password) {
       results.push({ line: lineNo, ok: false, reason: '邮箱密码不能为空' });
@@ -55,12 +65,23 @@ export function parseImportLines(text, { allowBareEmail = false } = {}) {
       results.push({ line: lineNo, ok: false, reason: 'refresh_token 长度不足', raw: maskRaw(parts[3]) });
       return;
     }
+    if (totpSecret && !/^[A-Z2-7]{16,128}$/.test(totpSecret)) {
+      results.push({ line: lineNo, ok: false, reason: '2FA 密钥不是合法 Base32（需 16-128 位 A-Z 或 2-7）' });
+      return;
+    }
     if (seenInBatch.has(email)) {
       results.push({ line: lineNo, ok: false, duplicateInBatch: true, email, reason: '与第 ' + seenInBatch.get(email) + ' 行重复' });
       return;
     }
     seenInBatch.set(email, lineNo);
-    results.push({ line: lineNo, ok: true, email, password, clientId, refreshToken });
+    const entry = { line: lineNo, ok: true, email, password, clientId, refreshToken };
+    if (hasLoginCredentials) {
+      entry.chatgptPassword = chatgptPassword;
+      entry.totpSecret = totpSecret;
+      // 与 sub2api JSON 导入一致，同时保存本地密钥与在线取件码。
+      entry.pickupCode = totpSecret;
+    }
+    results.push(entry);
   });
 
   return results;
