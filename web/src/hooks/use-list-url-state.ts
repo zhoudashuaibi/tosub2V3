@@ -28,7 +28,9 @@ function writeListParams(params: ListParamValues, defaults: ListParamValues) {
   if (typeof window === 'undefined') return;
   const next = new URLSearchParams(window.location.search);
   for (const [key, value] of Object.entries(params)) {
-    const isDefault = value === undefined || value === null || value === '' || String(value) === String(defaults[key] ?? '');
+    // 空串只有在默认值本身也为空时才算默认：默认值非空（如「废弃时间默认今天」）时，
+    // 用户主动清空必须以 `key=` 留在 URL 里，否则刷新后会被默认值顶回去
+    const isDefault = value === undefined || value === null || String(value) === String(defaults[key] ?? '');
     if (isDefault) next.delete(key);
     else next.set(key, String(value));
   }
@@ -38,7 +40,10 @@ function writeListParams(params: ListParamValues, defaults: ListParamValues) {
 }
 
 export interface ListUrlStateOptions<T extends ListParamValues> {
-  /** 默认值：等于默认值的参数不会写进 URL，保持链接干净 */
+  /**
+   * 默认值：等于默认值的参数不会写进 URL，保持链接干净。
+   * 默认值非空的参数被设为 '' 时会写成 `key=`，读回来仍是 ''（表示「用户清空了」而非「用默认」）。
+   */
   defaults: T;
 }
 

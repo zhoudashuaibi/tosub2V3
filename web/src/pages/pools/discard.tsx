@@ -1,6 +1,6 @@
 import { useCallback, useMemo, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { Archive, RotateCcw, Trash2 } from 'lucide-react';
+import { Archive, RotateCcw, Trash2, X } from 'lucide-react';
 import { toast } from 'sonner';
 import { accountsApi } from '@/api';
 import { download, errorMessage } from '@/api/client';
@@ -69,23 +69,40 @@ function localDateValue(date = new Date()) {
   return `${year}-${month}-${day}`;
 }
 
-function dateRangeForDay(value: string) {
-  if (!value) return { discarded_from: undefined, discarded_to: undefined };
-  const start = new Date(`${value}T00:00:00`);
-  if (Number.isNaN(start.getTime())) return { discarded_from: undefined, discarded_to: undefined };
-  const end = new Date(start);
-  end.setDate(end.getDate() + 1);
-  return { discarded_from: start.toISOString(), discarded_to: end.toISOString() };
+/** 'YYYY-MM-DD' → 本地当天 00:00；格式不对（如手改 URL）返回 null，按「不限」处理。 */
+function startOfLocalDay(value: string): Date | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  const date = new Date(`${value}T00:00:00`);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+/**
+ * 废弃时间区间（本地日期，两端都含当天）→ 接口的左闭右开 ISO 区间。
+ * 任一端为空即该侧不限；两端都空＝全部。起止颠倒（手改 URL）时自动对调，避免后端 422。
+ */
+function discardedRangeParams(fromDate: string, toDate: string) {
+  let start = startOfLocalDay(fromDate);
+  let endDay = startOfLocalDay(toDate);
+  if (start && endDay && start > endDay) [start, endDay] = [endDay, start];
+  let end: Date | null = null;
+  if (endDay) {
+    end = new Date(endDay);
+    end.setDate(end.getDate() + 1);
+  }
+  return { discarded_from: start?.toISOString(), discarded_to: end?.toISOString() };
 }
 
 export function DiscardPoolPage() {
   const queryClient = useQueryClient();
 
-  const { values, set, reset, hasActiveFilters } = useListUrlState({
+  const today = useMemo(() => localDateValue(), []);
+  const { values, set } = useListUrlState({
     defaults: {
       q: '',
       reason: '',
-      discardedDate: localDateValue(),
+      // 默认只看今天废弃的号；清除后两端都为空＝全部时间
+      discardedFrom: today,
+      discardedTo: today,
       sort: 'discarded_at:desc',
       page: 1,
       page_size: 50,
@@ -101,9 +118,19 @@ export function DiscardPoolPage() {
     return key ? { key, dir: dir === 'asc' ? 'asc' : 'desc' } : null;
   }, [values.sort]);
 
-  const discardedDate = String(values.discardedDate || '');
+  const discardedFrom = String(values.discardedFrom ?? '');
+  const discardedTo = String(values.discardedTo ?? '');
   const reason = String(values.reason || '');
-  const discardedRange = useMemo(() => dateRangeForDay(discardedDate), [discardedDate]);
+  const discardedRange = useMemo(() => discardedRangeParams(discardedFrom, discardedTo), [discardedFrom, discardedTo]);
+  const hasDateRange = Boolean(discardedRange.discarded_from || discardedRange.discarded_to);
+  const isTodayOnly = discardedFrom === today && discardedTo === today;
+
+  /** 改一端时若起止颠倒，把另一端拉到同一天，保证区间始终有效 */
+  const setDiscardedFrom = (next: string) =>
+    set({ discardedFrom: next, discardedTo: next && discardedTo && next > discardedTo ? next : discardedTo, page: 1 });
+  const setDiscardedTo = (next: string) =>
+    set({ discardedFrom: next && discardedFrom && next < discardedFrom ? next : discardedFrom, discardedTo: next, page: 1 });
+  const clearDateRange = () => set({ discardedFrom: '', discardedTo: '', page: 1 });
 
   const search = useSearchParam({
     value: String(values.q || ''),
@@ -111,7 +138,7 @@ export function DiscardPoolPage() {
   });
 
   const { data, isLoading, isRefreshing, refresh } = useLiveList({
-    queryKey: ['accounts', 'discard', { q: values.q, reason, discardedDate, sort, page, pageSize }],
+    queryKey: ['accounts', 'discard', { q: values.q, reason, discardedFrom, discardedTo, sort, page, pageSize }],
     queryFn: () =>
       accountsApi.list<DiscardAccount>('discard', {
         q: String(values.q || '') || undefined,
@@ -128,7 +155,7 @@ export function DiscardPoolPage() {
   const total = data?.total ?? 0;
   const stats = data?.stats ?? {};
 
-  const resetKey = JSON.stringify({ q: values.q, reason, discardedDate, sort, page, pageSize });
+  const resetKey = JSON.stringify({ q: values.q, reason, discardedFrom, discardedTo, sort, page, pageSize });
   const selection = useRowSelection({ items, total, resetKey });
 
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -188,7 +215,9 @@ export function DiscardPoolPage() {
     onError: (error) => toast.error(errorMessage(error)),
   });
 
-  const filtersActive = Boolean(String(values.q || '') || reason || discardedDate !== localDateValue());
+  // 时间区间有独立的清除按钮，这里只管搜索词与原因；两者分开，避免「清除筛选」顺手把时间也改掉
+  const filtersActive = Boolean(String(values.q || '') || reason);
+  const clearFilters = () => set({ reason: '', q: '', page: 1 });
 
   const filterForIds = useMemo(
     () => ({
@@ -202,7 +231,7 @@ export function DiscardPoolPage() {
   );
 
   /**
-   * 未选中时同步的范围＝当前列表筛选（q / 原因 / 废弃日期窗口）。
+   * 未选中时同步的范围＝当前列表筛选（q / 原因 / 废弃时间区间）。
    * 必须与徽章、按钮上那个「待同步 N」同一口径，否则按钮写 20、实际扫全池 1498。
    */
   const syncFilters = useMemo(
@@ -275,27 +304,42 @@ export function DiscardPoolPage() {
 
         <ToolbarSearch value={search.value} onChange={search.setValue} placeholder="搜索邮箱…" className="w-52" />
 
-        <label className="flex items-center gap-1.5 text-sm text-muted-foreground">
-          废弃日期
+        <div className="flex items-center gap-1.5 text-sm text-muted-foreground">
+          <span>废弃时间</span>
           <input
             type="date"
-            value={discardedDate}
-            onChange={(event) => set({ discardedDate: event.target.value, page: 1 })}
+            aria-label="废弃时间起"
+            value={discardedFrom}
+            onChange={(event) => setDiscardedFrom(event.target.value)}
             className="h-8 rounded-md border border-input bg-card/60 px-2 text-sm"
           />
-        </label>
-        {discardedDate && (
-          <Button variant="ghost" size="sm" onClick={() => set({ discardedDate: '', page: 1 })}>
-            全部日期
+          <span>至</span>
+          <input
+            type="date"
+            aria-label="废弃时间止"
+            value={discardedTo}
+            onChange={(event) => setDiscardedTo(event.target.value)}
+            className="h-8 rounded-md border border-input bg-card/60 px-2 text-sm"
+          />
+          {!hasDateRange && <span className="text-xs">（全部）</span>}
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={clearDateRange}
+            disabled={!hasDateRange}
+            title="清空时间筛选，查看全部废弃账号"
+          >
+            <X />
+            清除
           </Button>
-        )}
+          {!isTodayOnly && (
+            <Button variant="ghost" size="sm" onClick={() => set({ discardedFrom: today, discardedTo: today, page: 1 })}>
+              今天
+            </Button>
+          )}
+        </div>
 
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => set({ reason: '', q: '', page: 1 })}
-          disabled={!filtersActive}
-        >
+        <Button variant="outline" size="sm" onClick={clearFilters} disabled={!filtersActive}>
           清除筛选
         </Button>
         <Button variant="outline" size="sm" onClick={handleExport}>
@@ -348,14 +392,18 @@ export function DiscardPoolPage() {
         items={items}
         isLoading={isLoading}
         emptyIcon={Archive}
-        emptyTitle={reason ? `没有「${REASON_LABELS[reason] ?? reason}」的账号` : '废弃号池为空'}
+        emptyTitle={
+          hasDateRange ? (isTodayOnly ? '今天没有废弃的账号' : '所选时间段内没有废弃的账号') : '废弃号池为空'
+        }
         emptyDescription={
-          reason
-            ? '换个原因试试，或点击当前徽章取消筛选'
+          hasDateRange
+            ? '清除时间筛选可查看全部废弃账号'
             : '被 sub2api 监控判定 401/429 或手动废弃的账号会出现在这里'
         }
+        emptyActionLabel={hasDateRange ? '清除时间筛选' : undefined}
+        onEmptyAction={hasDateRange ? clearDateRange : undefined}
         filtersActive={filtersActive}
-        onClearFilters={reset}
+        onClearFilters={clearFilters}
         header={
           <>
             <TableHead className="w-10">
